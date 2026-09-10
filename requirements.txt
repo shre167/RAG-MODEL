@@ -1,0 +1,13 @@
+streamlit>=1.36.0
+langchain>=0.3.0
+chromadb>=0.3.31
+openai>=1.40.0
+python-dotenv>=1.0.1
+requests>=2.31.0
+numpy>=1.26.0
+pytest>=8.0.0
+rank_bm25>=0.2.2
+sentence-transformers>=2.2.2
+numpy>=1.26.0
+pytest>=8.0.0
+requests>=2.31.0
