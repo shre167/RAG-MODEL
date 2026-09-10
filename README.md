@@ -1,117 +1,184 @@
-This sounds less like a RAG issue and more like a Streamlit input state/UI issue.
+For the chunking itself, I actually think it's mostly fine.
 
-From what you're describing:
+The important part is this:
 
-when I press Enter, the query gets sent but the text stays in the input box
+chunk_id = f"{filename}_{section_index}_{idx}"
+
 
 and
 
-the screen dims and only the arrow is used
-
-that usually means the input field's value is being preserved in st.session_state and not cleared after submission.
-
-Check your chat input code
-
-If you're using something like:
-
-query = st.text_input(
-    "Ask a question",
-    key="query_input"
+RecursiveCharacterTextSplitter(
+    chunk_size=chunk_size,
+    chunk_overlap=chunk_overlap,
 )
 
 
-then after sending the message you need to clear it:
+Those are reasonable choices.
 
-st.session_state["query_input"] = ""
+Why JWST became 1 chunk
 
+The log:
 
-after processing the query.
-
-If you're using st.chat_input()
-
-Example:
-
-if prompt := st.chat_input("Ask something..."):
-    response = rag.answer_question(prompt)
+James Webb Space Telescope (JWST).txt → 1 new chunks
 
 
-st.chat_input() normally clears itself automatically.
+does not automatically mean a bug.
 
-If it doesn't, then you might be:
+It just means:
 
-storing the prompt back into session state
-calling st.rerun() at an odd time
-rendering a custom text input instead of st.chat_input
-Looking at your CSS
-
-I noticed a lot of aggressive overrides:
-
-[data-testid="stTextInput"] input {
-    ...
-}
-
-[data-testid="stHorizontalBlock"] {
-    align-items: center;
-}
+len(text_with_heading) <= CHUNK_SIZE
 
 
-and
+or only one segment was produced after splitting.
 
-[data-testid="stTextInput"] > div {
-    margin-bottom: 0 !important;
-}
+Add a temporary log:
 
-
-You're styling text_input, not specifically chat_input.
-
-If your composer is custom-built with:
-
-col1, col2, col3 = st.columns(...)
+logger.info(
+    "%s length=%d chars -> %d chunks",
+    filename,
+    len(text),
+    len(sec_chunks),
+)
 
 
-plus:
+inside chunk_documents().
 
-st.text_input(...)
-st.button(...)
+Then you'll see:
 
-
-then Enter may submit but the value remains because Streamlit is preserving the widget state.
-
-The dimming effect
-
-You mentioned:
-
-the light dims
-
-That usually happens when:
-
-with st.spinner("Thinking..."):
+JWST.txt length=523 chars -> 1 chunks
+Mars.txt length=8421 chars -> 14 chunks
 
 
-is running.
+which makes things much easier to validate.
 
-Example:
+What I'd improve
+1. Make chunk IDs independent of filename
 
-with st.spinner("Searching knowledge base..."):
-    answer = rag.answer_question(query)
+Currently:
+
+chunk_id = f"{filename}_{section_index}_{idx}"
 
 
-During that period Streamlit greys out parts of the interface.
+Then later:
 
-That's normal.
+_candidate_key(
+    filename,
+    chunk_id,
+)
 
-What I need to see
 
-Show me the section of app.py containing:
+becomes:
 
-st.chat_input(...)
+JWST.txt::chunk-JWST.txt_0_0
+
+
+The filename is duplicated.
+
+I'd simplify to:
+
+chunk_id = f"{section_index}_{idx}"
+
+
+because the filename is already part of the final key.
+
+2. Add chunk statistics after ingestion
+
+After:
+
+chunks = chunk_documents(...)
+
+
+log:
+
+from collections import Counter
+
+counts = Counter(
+    chunk["filename"]
+    for chunk in chunks
+)
+
+for fname, count in counts.items():
+    logger.info(
+        "%s -> %d chunks",
+        fname,
+        count,
+    )
+
+
+Then you'd immediately spot:
+
+JWST.txt -> 1 chunks
+Mars.txt -> 17 chunks
+Saturn.txt -> 22 chunks
+
+
+instead of guessing.
+
+3. Check your actual settings
+
+The biggest factor is still:
+
+CHUNK_SIZE
+CHUNK_OVERLAP
+
+
+If you currently have:
+
+CHUNK_SIZE = 800
+CHUNK_OVERLAP = 200
+
+
+that's pretty normal for a RAG.
+
+If it's:
+
+CHUNK_SIZE = 2000
 
 
 or
 
-st.text_input(...)
+CHUNK_SIZE = 4000
 
 
-and the send button logic.
+then one-chunk documents become very common.
 
-That's where the cause will be. Based on your symptoms, I'd bet there's a st.text_input whose session-state value isn't being cleared after submission.
+One thing that could cause problems later
+
+Your IDs depend on:
+
+section_index
+idx
+
+
+If someone inserts a new heading near the beginning of a document, all later section numbers may shift:
+
+old:
+0_0
+1_0
+2_0
+
+new:
+0_0
+1_0
+2_0
+3_0
+
+
+That can make chunk identities unstable.
+
+A more robust approach is:
+
+hash(filename + chunk_text)
+
+
+for chunk IDs.
+
+But that's an enhancement, not a bug.
+
+My overall assessment
+
+Chunker: ✅ mostly good
+ Heading detection: ✅ good
+ Chunk IDs: ⚠️ could be more robust
+ JWST generating 1 chunk: ✅ likely normal unless the file is large
+ Main issue in your system: still appears to be synchronization between Chroma, BM25, and deleted files, not the chunking algorithm itself.
