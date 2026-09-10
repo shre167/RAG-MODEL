@@ -1,184 +1,226 @@
-For the chunking itself, I actually think it's mostly fine.
-
-The important part is this:
-
-chunk_id = f"{filename}_{section_index}_{idx}"
-
-
-and
-
-RecursiveCharacterTextSplitter(
-    chunk_size=chunk_size,
-    chunk_overlap=chunk_overlap,
-)
-
-
-Those are reasonable choices.
-
-Why JWST became 1 chunk
-
-The log:
-
-James Webb Space Telescope (JWST).txt → 1 new chunks
-
-
-does not automatically mean a bug.
-
-It just means:
-
-len(text_with_heading) <= CHUNK_SIZE
-
-
-or only one segment was produced after splitting.
-
-Add a temporary log:
-
-logger.info(
-    "%s length=%d chars -> %d chunks",
-    filename,
-    len(text),
-    len(sec_chunks),
-)
-
-
-inside chunk_documents().
-
-Then you'll see:
-
-JWST.txt length=523 chars -> 1 chunks
-Mars.txt length=8421 chars -> 14 chunks
-
-
-which makes things much easier to validate.
-
-What I'd improve
-1. Make chunk IDs independent of filename
-
-Currently:
-
-chunk_id = f"{filename}_{section_index}_{idx}"
-
-
-Then later:
-
-_candidate_key(
-    filename,
-    chunk_id,
-)
-
-
-becomes:
-
-JWST.txt::chunk-JWST.txt_0_0
-
-
-The filename is duplicated.
-
-I'd simplify to:
-
-chunk_id = f"{section_index}_{idx}"
-
-
-because the filename is already part of the final key.
-
-2. Add chunk statistics after ingestion
-
-After:
-
-chunks = chunk_documents(...)
-
-
-log:
-
-from collections import Counter
-
-counts = Counter(
-    chunk["filename"]
-    for chunk in chunks
-)
-
-for fname, count in counts.items():
-    logger.info(
-        "%s -> %d chunks",
-        fname,
-        count,
-    )
-
-
-Then you'd immediately spot:
-
-JWST.txt -> 1 chunks
-Mars.txt -> 17 chunks
-Saturn.txt -> 22 chunks
-
-
-instead of guessing.
-
-3. Check your actual settings
-
-The biggest factor is still:
-
-CHUNK_SIZE
-CHUNK_OVERLAP
-
-
-If you currently have:
-
-CHUNK_SIZE = 800
-CHUNK_OVERLAP = 200
-
-
-that's pretty normal for a RAG.
-
-If it's:
-
-CHUNK_SIZE = 2000
-
-
-or
-
-CHUNK_SIZE = 4000
-
-
-then one-chunk documents become very common.
-
-One thing that could cause problems later
-
-Your IDs depend on:
-
-section_index
-idx
-
-
-If someone inserts a new heading near the beginning of a document, all later section numbers may shift:
-
-old:
-0_0
-1_0
-2_0
-
-new:
-0_0
-1_0
-2_0
-3_0
-
-
-That can make chunk identities unstable.
-
-A more robust approach is:
-
-hash(filename + chunk_text)
-
-
-for chunk IDs.
-
-But that's an enhancement, not a bug.
-
-My overall assessment
-
-Chunker: ✅ mostly good
- Heading detection: ✅ good
- Chunk IDs: ⚠️ could be more robust
- JWST generating 1 chunk: ✅ likely normal unless the file is large
- Main issue in your system: still appears to be synchronization between Chroma, BM25, and deleted files, not the chunking algorithm itself.
+from __future__ import annotations
+
+import logging
+import os
+import pickle
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+try:
+    from rank_bm25 import BM25Plus as BM25Model
+except ImportError:
+    from rank_bm25 import BM25Okapi as BM25Model
+
+from src.config import CHUNK_OVERLAP, CHUNK_SIZE, VECTORSTORE_DIR
+from src.document_loader import chunk_documents, load_documents
+
+logger = logging.getLogger(__name__)
+
+
+class BM25Retriever:
+    """Lightweight local BM25 retriever built from chunked knowledge base.
+
+    Matches the same chunk boundaries as ChromaVectorStore (CHUNK_SIZE=800,
+    CHUNK_OVERLAP=200) so RRF fusion receives candidates from identical chunks.
+
+    Supports:
+    - Disk persistence via save_index / load_index (pickle).
+    - Incremental indexing via add_chunks() so newly-uploaded files are
+      queryable immediately without re-reading the full corpus.
+    - Full section metadata passed through to rag_pipeline.py so
+      section_heading, section_path, section_level, etc. are available.
+    """
+
+    _INDEX_FILENAME = "bm25_index.pkl"
+
+    def __init__(
+        self,
+        kb_path: str | None = None,
+        chunk_size: int = CHUNK_SIZE,
+        chunk_overlap: int = CHUNK_OVERLAP,
+        vectorstore_dir: str | Path | None = None,
+    ):
+        self.kb_path = kb_path
+        self.chunk_size = chunk_size
+        self.chunk_overlap = chunk_overlap
+        self.vectorstore_dir = Path(vectorstore_dir or VECTORSTORE_DIR)
+
+        self._chunks: List[Dict[str, Any]] = []
+        self._tokenized: List[List[str]] = []
+        self._bm25: Optional[BM25Okapi] = None
+
+    # ------------------------------------------------------------------
+    # Index path
+    # ------------------------------------------------------------------
+
+    def _index_path(self) -> Path:
+        return self.vectorstore_dir / self._INDEX_FILENAME
+
+    # ------------------------------------------------------------------
+    # Build / Rebuild
+    # ------------------------------------------------------------------
+
+    def build_index(
+        self,
+        kb_path: str | None = None,
+        chunk_size: int | None = None,
+        chunk_overlap: int | None = None,
+    ) -> None:
+        """Load all documents from kb_path, chunk them, and build BM25 index."""
+        path = kb_path or self.kb_path
+        if chunk_size is not None:
+            self.chunk_size = chunk_size
+        if chunk_overlap is not None:
+            self.chunk_overlap = chunk_overlap
+
+        docs = load_documents(path)
+        chunks = chunk_documents(
+            docs,
+            chunk_size=self.chunk_size,
+            chunk_overlap=self.chunk_overlap,
+        )
+
+        self._chunks = []
+        self._tokenized = []
+
+        for c in chunks:
+            tokens = self._tokenize(c.get("text") or "")
+            self._tokenized.append(tokens)
+            self._chunks.append(self._extract_chunk_meta(c))
+
+        if self._tokenized:
+            self._bm25 = BM25Model(self._tokenized)
+
+        logger.info(
+            "BM25: built index over %d chunks from %d documents.",
+            len(self._chunks),
+            len(docs),
+        )
+
+    # ------------------------------------------------------------------
+    # Incremental update
+    # ------------------------------------------------------------------
+
+    def add_chunks(self, new_chunks: List[Dict[str, Any]]) -> None:
+        """Append new pre-chunked documents to the existing BM25 index.
+
+        ``new_chunks`` should be the same dict format produced by
+        ``chunk_documents()`` — each item must have at least a ``"text"`` key.
+        """
+        if not new_chunks:
+            return
+
+        for c in new_chunks:
+            tokens = self._tokenize(c.get("text") or "")
+            self._tokenized.append(tokens)
+            self._chunks.append(self._extract_chunk_meta(c))
+
+        # Rebuild BM25 over all (existing + new) tokens.
+        if self._tokenized:
+            self._bm25 = BM25Model(self._tokenized)
+
+        logger.info(
+            "BM25: added %d chunks; index now contains %d chunks.",
+            len(new_chunks),
+            len(self._chunks),
+        )
+
+    # ------------------------------------------------------------------
+    # Persistence
+    # ------------------------------------------------------------------
+
+    def save_index(self, path: str | Path | None = None) -> None:
+        """Persist the BM25 corpus and chunk metadata to disk."""
+        target = Path(path) if path else self._index_path()
+        target.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "chunks": self._chunks,
+            "tokenized": self._tokenized,
+            "chunk_size": self.chunk_size,
+            "chunk_overlap": self.chunk_overlap,
+        }
+        with open(target, "wb") as fh:
+            pickle.dump(payload, fh, protocol=pickle.HIGHEST_PROTOCOL)
+        logger.info("BM25: index saved to %s.", target)
+
+    def load_index(self, path: str | Path | None = None) -> bool:
+        """Restore index from disk.  Returns True on success, False otherwise."""
+        target = Path(path) if path else self._index_path()
+        if not target.exists():
+            return False
+        try:
+            with open(target, "rb") as fh:
+                payload = pickle.load(fh)
+            self._chunks = payload.get("chunks", [])
+            self._tokenized = payload.get("tokenized", [])
+            self.chunk_size = payload.get("chunk_size", self.chunk_size)
+            self.chunk_overlap = payload.get("chunk_overlap", self.chunk_overlap)
+            if self._tokenized:
+                self._bm25 = BM25Model(self._tokenized)
+            logger.info(
+                "BM25: loaded index from %s (%d chunks).",
+                target,
+                len(self._chunks),
+            )
+            return True
+        except Exception as exc:  # pragma: no cover
+            logger.warning("BM25: failed to load index from %s: %s", target, exc)
+            return False
+
+    # ------------------------------------------------------------------
+    # Query
+    # ------------------------------------------------------------------
+
+    def query(self, query: str, top_k: int = 5) -> List[Dict[str, Any]]:
+        """Return up to top_k chunks sorted by BM25 score (descending)."""
+        if not self._bm25 or not self._chunks:
+            return []
+
+        tokens = self._tokenize(query)
+        scores = self._bm25.get_scores(tokens)
+        ranked_idx = sorted(
+            range(len(scores)),
+            key=lambda i: scores[i],
+            reverse=True,
+        )[:top_k]
+
+        results = []
+        for idx in ranked_idx:
+            score = float(scores[idx])
+            if score <= 0:
+                # Token overlap fallback for small corpora
+                overlap = set(tokens) & set(self._tokenized[idx])
+                if not overlap:
+                    continue
+                score = float(len(overlap))
+            chunk = self._chunks[idx]
+            results.append({
+                **chunk,
+                "bm25_score": score,
+            })
+        return results
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _tokenize(text: str) -> List[str]:
+        return (text or "").lower().split()
+
+    @staticmethod
+    def _extract_chunk_meta(c: Dict[str, Any]) -> Dict[str, Any]:
+        """Extract all metadata fields that rag_pipeline.py expects."""
+        return {
+            "filename": c.get("filename", ""),
+            "chunk_id": c.get("chunk_id", ""),
+            "text": c.get("text", ""),
+            "source_path": c.get("source_path", ""),
+            "section_heading": c.get("section_heading", ""),
+            "section_path": c.get("section_path", ""),
+            "section_level": c.get("section_level", 0),
+            "chunk_index": c.get("chunk_index", 0),
+            "total_section_chunks": c.get("total_section_chunks", 0),
+            "category": c.get("category", ""),
+            "has_heading": c.get("has_heading", False),
+        }
