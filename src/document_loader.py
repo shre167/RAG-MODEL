@@ -141,7 +141,7 @@ def chunk_documents(
             return True
 
         # Numbered section headings: "1.", "2.3.", "10."
-        if re.match(r"^\d+(\.\d+)*\.\s+\S", ln):
+        if re.match(r"^\d+(\.\d+)*\.\s+\S", ln) and not re.search(r"[.!?]\s*$", ln):
             return True
 
         # ALL CAPS substantial headings (≥ 2 words, ≤ 120 chars)

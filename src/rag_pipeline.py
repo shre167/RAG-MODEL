@@ -22,7 +22,6 @@ from src.config import (
     LLM_BASE_URL,
     LLM_MODEL,
     MIN_RERANK_SCORE,
-    RERANKER_MODEL,
     RERANK_TOP_K,
     SCORE_THRESHOLD,
     TOP_K,
@@ -40,7 +39,6 @@ from src.document_loader import (
 from src.embeddings import EmbeddingService
 from src.bm25_retriever import BM25Retriever
 from src.query_normalizer import canonicalize_query
-from src.re_ranker import ReRanker
 from src.utils import ensure_directory
 from src.vector_store import ChromaVectorStore
 
@@ -117,6 +115,17 @@ MAX_CONTEXT_CHARS = 18000
 # absolute sanity floor and calibrated against an evaluation dataset.
 RERANK_ABSTAIN_FLOOR = MIN_RERANK_SCORE
 
+# CrossEncoder reranking is intentionally disabled.
+# Retrieval uses Dense + BM25 + RRF only.
+ENABLE_RERANKER = False
+
+# RRF is a ranking signal, not a probability.
+# With RRF_K=60, a rank-0 result in one retriever is ~0.01639;
+# a rank-0 result in both retrievers is ~0.03279.
+RRF_ABSTAIN_FLOOR = 0.015
+STRONG_RRF_THRESHOLD = 0.025
+MODERATE_RRF_THRESHOLD = RRF_ABSTAIN_FLOOR
+
 
 # Relative separation from the runner-up.
 #
@@ -146,11 +155,8 @@ STRONG_TOP_PERCENTILE = 0.85
 MIN_PERCENTILE_POOL = 5
 
 
-# RRF is a rank-based score, not a calibrated relevance probability.
-#
-# This is only a conservative fallback threshold when CrossEncoder
-# reranking is unavailable.
-RRF_ABSTAIN_FLOOR = 0.015
+# RRF_ABSTAIN_FLOOR is defined above with the other RRF thresholds so it is
+# available when MODERATE_RRF_THRESHOLD is initialized.
 
 
 # ======================================================================
@@ -230,9 +236,6 @@ class Candidate:
               ↓
         Candidate Pool
               ↓
-        CrossEncoder
-          Reranking
-              ↓
         Evidence Evaluation
               ↓
         Context Selection
@@ -272,10 +275,10 @@ class Evidence:
 
     The evidence gate combines:
 
-    - absolute reranker floor
-    - top-vs-second margin
-    - top-score distribution
+    - absolute RRF floor
+    - RRF rank strength
     - retriever agreement
+    - source diversity
     """
 
     level: str
@@ -471,41 +474,14 @@ class RAGPipeline:
             )
 
         # ==============================================================
-
         # CROSS-ENCODER RERANKER
-
         # ==============================================================
-
+        # Disabled intentionally. Do not instantiate ReRanker here; doing
+        # so can trigger a local Hugging Face model download.
         self.reranker = None
-
-        try:
-
-            self.reranker = ReRanker(
-                model_name=RERANKER_MODEL
-            )
-
-            if getattr(
-                self.reranker,
-                "available",
-                False,
-            ):
-
-                logger.info(
-                    "CrossEncoder reranker initialized."
-                )
-
-            else:
-
-                logger.warning(
-                    "CrossEncoder reranker unavailable."
-                )
-
-        except Exception as exc:
-
-            logger.warning(
-                "Reranker initialization failed: %s",
-                exc,
-            )
+        logger.info(
+            "CrossEncoder reranker disabled; using Dense + BM25 + RRF only."
+        )
 
     # ==================================================================
     # HELPERS
@@ -1657,6 +1633,11 @@ class RAGPipeline:
         candidates: list[Candidate],
     ) -> bool:
 
+        # Reranking is disabled. Never load or invoke a local
+        # Hugging Face CrossEncoder.
+        if not ENABLE_RERANKER:
+            return False
+
         if (
             self.reranker is None
             or not getattr(
@@ -2101,606 +2082,302 @@ class RAGPipeline:
         self,
         candidates: list[Candidate],
         reranked: bool,
-    ) -> tuple[
-        list[Candidate],
-        Evidence,
-    ]:
+        search_text: str,
+    ) -> tuple[list[Candidate], Evidence]:
+        """Evaluate RRF-only evidence after the CrossEncoder is disabled.
 
+        Important design rule:
+            *RRF rank is used to combine retrievers, not to pretend that a
+            nearest neighbour is automatically relevant.*
+
+        Dense retrieval can always return something, even for an unrelated
+        question. Therefore source diversity is NEVER treated as evidence.
+        A candidate must have actual retrieval support:
+
+        1. agreement between dense and BM25, or
+        2. a positive BM25 match, or
+        3. a genuinely strong dense match relative to the dense candidate pool.
+
+        This gives the RRF-only pipeline an explicit abstention gate instead
+        of relying on the LLM to decide whether the retrieved context is real
+        evidence.
+        """
         if not candidates:
-
             return [], Evidence(
-
                 level="none",
-
                 should_answer=False,
-
                 top_score=0.0,
-
                 score_source="none",
-
                 supporting_chunks=0,
-
                 top_gap=None,
-
                 agreement=False,
-
                 top_percentile=None,
-
                 retrieval_mode="unknown",
-
-                reason=(
-                    "No candidates were retrieved."
-                ),
+                reason="No candidates were retrieved.",
             )
 
-        retrieval_mode = (
-            self._retrieval_mode(
-                candidates
-            )
-        )
-
-        # ==============================================================
-        # RERANKED PATH
-        # ==============================================================
-
-        if reranked:
-
-            ranked = sorted(
-                [
-                    candidate
-                    for candidate in candidates
-                    if candidate.rerank_score
-                    is not None
-                ],
-                key=lambda candidate:
-                    candidate.rerank_score,
-                reverse=True,
-            )
-
-            if not ranked:
-
-                return [], Evidence(
-
-                    level="none",
-
-                    should_answer=False,
-
-                    top_score=0.0,
-
-                    score_source="reranker",
-
-                    supporting_chunks=0,
-
-                    top_gap=None,
-
-                    agreement=False,
-
-                    top_percentile=None,
-
-                    retrieval_mode=retrieval_mode,
-
-                    reason=(
-                        "The reranker did not produce "
-                        "usable scores."
-                    ),
-                )
-
-            # ----------------------------------------------------------
-            # DEDUPLICATE BEFORE EVIDENCE CLASSIFICATION
-            # ----------------------------------------------------------
-
-            ranked = (
-                self._deduplicate_candidates(
-                    ranked
-                )
-            )
-
-            if not ranked:
-
-                return [], Evidence(
-
-                    level="none",
-
-                    should_answer=False,
-
-                    top_score=0.0,
-
-                    score_source="reranker",
-
-                    supporting_chunks=0,
-
-                    top_gap=None,
-
-                    agreement=False,
-
-                    top_percentile=None,
-
-                    retrieval_mode=retrieval_mode,
-
-                    reason=(
-                        "No usable unique evidence "
-                        "remained after deduplication."
-                    ),
-                )
-
-            top = ranked[0]
-
-            top_score = (
-                top.rerank_score
-                if top.rerank_score
-                is not None
-                else float("-inf")
-            )
-
-            # ----------------------------------------------------------
-            # ABSOLUTE FLOOR
-            #
-            # This is essential.
-            #
-            # Relative separation alone is not sufficient because even
-            # a completely irrelevant query will produce a maximum score
-            # among the retrieved candidates.
-            # ----------------------------------------------------------
-
-            if (
-                not math.isfinite(
-                    top_score
-                )
-                or top_score
-                < RERANK_ABSTAIN_FLOOR
-            ):
-
-                return [], Evidence(
-
-                    level="none",
-
-                    should_answer=False,
-
-                    top_score=top_score,
-
-                    score_source="reranker",
-
-                    supporting_chunks=0,
-
-                    top_gap=None,
-
-                    agreement=(
-                        top.in_both_retrievers
-                    ),
-
-                    top_percentile=None,
-
-                    retrieval_mode=retrieval_mode,
-
-                    reason=(
-                        "The best reranked candidate "
-                        "did not pass the calibrated "
-                        "absolute relevance floor."
-                    ),
-                )
-
-            # ----------------------------------------------------------
-            # SCORE DISTRIBUTION
-            # ----------------------------------------------------------
-
-            scores = [
-                candidate.rerank_score
-                for candidate in ranked
-                if candidate.rerank_score
-                is not None
-            ]
-
-            top_percentile = (
-                self._top_score_percentile(
-                    scores
-                )
-                if len(scores)
-                >= MIN_PERCENTILE_POOL
-                else None
-            )
-
-            # ----------------------------------------------------------
-            # TOP-1 / TOP-2 GAP
-            # ----------------------------------------------------------
-
-            top_gap = None
-
-            if (
-                len(ranked) > 1
-                and ranked[1].rerank_score
-                is not None
-            ):
-
-                top_gap = (
-                    top_score
-                    - ranked[1].rerank_score
-                )
-
-            # ----------------------------------------------------------
-            # SUPPORTING CANDIDATES
-            #
-            # These are candidates reasonably close to the top score.
-            # They are not required to be multiple chunks.
-            # ----------------------------------------------------------
-
-            supporting = [
-
-                candidate
-
-                for candidate in ranked
-
-                if (
-                    candidate.rerank_score
-                    is not None
-
-                    and (
-                        top_score
-                        - candidate.rerank_score
-                    )
-                    <= SUPPORT_SCORE_WINDOW
-                )
-            ]
-
-            supporting_count = len(
-                supporting
-            )
-
-            agreement = (
-                top.in_both_retrievers
-            )
-
-            # ----------------------------------------------------------
-            # RELATIVE SIGNALS
-            # ----------------------------------------------------------
-
-            strong_gap = (
-                top_gap is not None
-                and top_gap
-                >= STRONG_RERANK_GAP
-            )
-
-            useful_gap = (
-                top_gap is not None
-                and top_gap
-                >= MIN_RERANK_GAP
-            )
-
-            strong_percentile = (
-                top_percentile is not None
-                and top_percentile
-                >= STRONG_TOP_PERCENTILE
-            )
-
-            useful_percentile = (
-                top_percentile is not None
-                and top_percentile
-                >= MIN_TOP_PERCENTILE
-            )
-
-            # ----------------------------------------------------------
-            # STRONG EVIDENCE
-            #
-            # Strong evidence requires the absolute floor first.
-            #
-            # Then at least one meaningful relative signal:
-            #
-            # - strong separation
-            # - strong distribution position + agreement
-            # - agreement + useful separation
-            #
-            # This avoids treating every max score as strong evidence.
-            # ----------------------------------------------------------
-
-            strong = (
-
-                top_score
-                >= RERANK_ABSTAIN_FLOOR
-
-                and (
-                    strong_gap
-
-                    or (
-                        strong_percentile
-                        and agreement
-                    )
-
-                    or (
-                        agreement
-                        and useful_gap
-                    )
-                )
-            )
-
-            if strong:
-
-                return (
-
-                    supporting,
-
-                    Evidence(
-
-                        level="strong",
-
-                        should_answer=True,
-
-                        top_score=top_score,
-
-                        score_source="reranker",
-
-                        supporting_chunks=(
-                            supporting_count
-                        ),
-
-                        top_gap=top_gap,
-
-                        agreement=agreement,
-
-                        top_percentile=(
-                            top_percentile
-                        ),
-
-                        retrieval_mode=(
-                            retrieval_mode
-                        ),
-
-                        reason=(
-                            "The top reranked candidate "
-                            "passed the absolute relevance "
-                            "floor and showed strong relative "
-                            "evidence."
-                        ),
-                    ),
-                )
-
-            # ----------------------------------------------------------
-            # MODERATE EVIDENCE
-            #
-            # Moderate evidence still requires the absolute floor.
-            #
-            # Relative evidence can come from:
-            #
-            # - retriever agreement
-            # - useful top gap
-            # - useful percentile
-            #
-            # A single excellent chunk is allowed.
-            # ----------------------------------------------------------
-
-            moderate = (
-
-                top_score
-                >= RERANK_ABSTAIN_FLOOR
-
-                and (
-                    agreement
-                    or useful_gap
-                    or useful_percentile
-                )
-            )
-
-            if moderate:
-
-                return (
-
-                    supporting,
-
-                    Evidence(
-
-                        level="moderate",
-
-                        should_answer=True,
-
-                        top_score=top_score,
-
-                        score_source="reranker",
-
-                        supporting_chunks=(
-                            supporting_count
-                        ),
-
-                        top_gap=top_gap,
-
-                        agreement=agreement,
-
-                        top_percentile=(
-                            top_percentile
-                        ),
-
-                        retrieval_mode=(
-                            retrieval_mode
-                        ),
-
-                        reason=(
-                            "The top reranked candidate "
-                            "passed the absolute relevance "
-                            "floor and had sufficient relative "
-                            "retrieval evidence."
-                        ),
-                    ),
-                )
-
-            # ----------------------------------------------------------
-            # BORDERLINE / ABSTAIN
-            # ----------------------------------------------------------
-
-            return [], Evidence(
-
-                level="none",
-
-                should_answer=False,
-
-                top_score=top_score,
-
-                score_source="reranker",
-
-                supporting_chunks=0,
-
-                top_gap=top_gap,
-
-                agreement=agreement,
-
-                top_percentile=(
-                    top_percentile
-                ),
-
-                retrieval_mode=retrieval_mode,
-
-                reason=(
-                    "The top candidate passed the absolute "
-                    "floor but did not show sufficient "
-                    "relative evidence to answer reliably."
-                ),
-            )
-
-        # ==============================================================
-        # RERANKER UNAVAILABLE
-        # ==============================================================
-
+        retrieval_mode = self._retrieval_mode(candidates)
         ranked = sorted(
             candidates,
-            key=lambda candidate:
-                candidate.rrf_score,
+            key=lambda c: (c.rrf_score, c.in_both_retrievers),
             reverse=True,
         )
-
-        ranked = (
-            self._deduplicate_candidates(
-                ranked
-            )
-        )
+        ranked = self._deduplicate_candidates(ranked)
 
         if not ranked:
-
             return [], Evidence(
-
                 level="none",
-
                 should_answer=False,
-
                 top_score=0.0,
-
                 score_source="rrf",
-
                 supporting_chunks=0,
-
                 top_gap=None,
-
                 agreement=False,
-
                 top_percentile=None,
-
                 retrieval_mode=retrieval_mode,
-
-                reason=(
-                    "No usable candidates remained."
-                ),
+                reason="No usable unique candidates remained after deduplication.",
             )
 
         top = ranked[0]
+        top_rrf = float(top.rrf_score)
+        agreement = bool(top.in_both_retrievers)
 
-        if (
-            top.rrf_score
-            < RRF_ABSTAIN_FLOOR
-        ):
-
+        # RRF itself has a known scale for k=60. Do not lower these values
+        # merely to turn a weak result into a stronger-looking label.
+        if not math.isfinite(top_rrf) or top_rrf < RRF_ABSTAIN_FLOOR:
             return [], Evidence(
-
                 level="none",
-
                 should_answer=False,
-
-                top_score=top.rrf_score,
-
+                top_score=top_rrf,
                 score_source="rrf",
-
                 supporting_chunks=0,
-
                 top_gap=None,
-
-                agreement=(
-                    top.in_both_retrievers
-                ),
-
+                agreement=agreement,
                 top_percentile=None,
-
                 retrieval_mode=retrieval_mode,
-
                 reason=(
-                    "Hybrid retrieval did not "
-                    "produce sufficiently strong "
-                    "rank-based evidence."
+                    "The best hybrid candidate did not reach the minimum "
+                    "RRF evidence floor."
                 ),
             )
 
-        # RRF is not calibrated enough to make the same kind of
-        # strong/weak confidence claims as a calibrated reranker.
+        # --------------------------------------------------------------
+        # DENSE QUALITY SIGNAL
+        # --------------------------------------------------------------
+        dense = [
+            c for c in ranked
+            if c.dense_distance is not None
+            and math.isfinite(c.dense_distance)
+        ]
+        dense_distances = [float(c.dense_distance) for c in dense]
+        dense_median = (
+            statistics.median(dense_distances)
+            if dense_distances else None
+        )
+        top_dense_distance = (
+            float(top.dense_distance)
+            if top.dense_distance is not None
+            and math.isfinite(top.dense_distance)
+            else None
+        )
+
+        # A dense-only hit needs to stand out from the other dense neighbours.
+        # Relative distance is used because Chroma collections can differ in
+        # their absolute distance scale. Lower distance is better.
+        dense_relative_strength = None
+        if dense_median is not None and top_dense_distance is not None:
+            denominator = max(abs(dense_median), 1e-9)
+            dense_relative_strength = (
+                dense_median - top_dense_distance
+            ) / denominator
+
+        dense_strong = bool(
+            top_dense_distance is not None
+            and dense_relative_strength is not None
+            and dense_relative_strength >= 0.15
+        )
+
+        # --------------------------------------------------------------
+        # RETRIEVAL SUPPORT — NEVER USE SOURCE COUNT AS PROOF
+        # --------------------------------------------------------------
+        # Dense retrieval is a nearest-neighbour search: it will return a
+        # chunk even when the question is completely outside the KB.
+        # Therefore a dense-only candidate is NOT sufficient evidence.
         #
-        # Therefore this path is intentionally conservative.
-        final = (
-            self._select_context_candidates(
-                ranked,
-                reranked=False,
+        # We use lexical overlap as the conservative answerability signal
+        # for the RRF-only pipeline. This deliberately favors abstention over
+        # sending unrelated chunks to the LLM.
+        stopwords = {
+            "a", "an", "and", "are", "as", "at", "be", "by", "for",
+            "from", "how", "i", "in", "is", "it", "me", "my", "of",
+            "on", "or", "that", "the", "this", "to", "was", "what",
+            "when", "where", "which", "who", "why", "with", "you",
+            "your", "tell", "give", "explain", "describe", "about",
+        }
+
+        query_tokens = {
+            token
+            for token in re.findall(r"[a-z0-9]+", search_text.lower())
+            if len(token) > 2 and token not in stopwords
+        }
+
+        def lexical_overlap_ratio(c: Candidate) -> float:
+            if not query_tokens:
+                return 0.0
+            text_tokens = set(
+                re.findall(r"[a-z0-9]+", (c.text or "").lower())
             )
+            return len(query_tokens & text_tokens) / len(query_tokens)
+
+        def has_lexical_support(c: Candidate) -> bool:
+            # BM25 must actually have matched the candidate.
+            if not (
+                c.bm25_rank is not None
+                and c.bm25_score is not None
+                and math.isfinite(float(c.bm25_score))
+                and float(c.bm25_score) > 0.0
+            ):
+                return False
+
+            # A single concept such as "Jupiter" is enough. For multi-token
+            # questions require at least half of the meaningful query terms.
+            overlap_ratio = lexical_overlap_ratio(c)
+            if len(query_tokens) <= 1:
+                return overlap_ratio >= 1.0
+            return overlap_ratio >= 0.5
+
+        def has_direct_text_support(c: Candidate) -> bool:
+            # This is intentionally independent of BM25. It allows a good
+            # dense result to support a paraphrased astronomy question only
+            # when the answer text itself contains meaningful query terms.
+            # It does NOT allow an arbitrary dense nearest neighbour through.
+            overlap_ratio = lexical_overlap_ratio(c)
+            if len(query_tokens) <= 1:
+                return overlap_ratio >= 1.0
+            return overlap_ratio >= 0.5
+
+        def is_supported(c: Candidate) -> bool:
+            # Agreement is the strongest RRF-only signal.
+            if c.in_both_retrievers:
+                return True
+
+            # A one-retriever candidate must still have direct lexical support.
+            return has_lexical_support(c) or (
+                c.dense_rank is not None
+                and c.dense_rank <= 2
+                and dense_strong
+                and has_direct_text_support(c)
+            )
+
+        supported = [c for c in ranked if is_supported(c)]
+
+        # The top candidate itself must have evidence. This is the key fix for
+        # unrelated questions such as "what is my name?" or "what is the Eiffel
+        # Tower?": dense nearest-neighbour results alone no longer get passed
+        # to the LLM simply because they exist.
+        if not supported or top not in supported:
+            return [], Evidence(
+                level="none",
+                should_answer=False,
+                top_score=top_rrf,
+                score_source="rrf",
+                supporting_chunks=0,
+                top_gap=None,
+                agreement=agreement,
+                top_percentile=None,
+                retrieval_mode=retrieval_mode,
+                reason=(
+                    "Retrieval returned nearest neighbours, but the best "
+                    "candidate did not contain sufficient lexical, hybrid, "
+                    "or dense-quality evidence to support an answer."
+                ),
+            )
+
+        # Keep only evidence-backed chunks. This prevents unrelated dense-only
+        # neighbours from leaking into the LLM context after the gate passes.
+        final = self._select_context_candidates(
+            supported,
+            reranked=False,
         )
 
         if not final:
-
             return [], Evidence(
-
                 level="none",
-
                 should_answer=False,
-
-                top_score=top.rrf_score,
-
+                top_score=top_rrf,
                 score_source="rrf",
-
                 supporting_chunks=0,
-
                 top_gap=None,
-
-                agreement=(
-                    top.in_both_retrievers
-                ),
-
+                agreement=agreement,
                 top_percentile=None,
-
                 retrieval_mode=retrieval_mode,
+                reason="No evidence-backed context remained after filtering.",
+            )
 
+        top_gap = None
+        if len(ranked) > 1:
+            top_gap = top_rrf - float(ranked[1].rrf_score)
+
+        # Strong = both retrievers agree on the best chunk and it is among the
+        # strongest possible RRF results. Moderate = one reliable retrieval
+        # signal is present. Weak is deliberately NOT answerable.
+        strong = bool(
+            agreement
+            and top_rrf >= STRONG_RRF_THRESHOLD
+            and (
+                has_lexical_support(top)
+                or top_dense_distance is not None
+            )
+        )
+
+        moderate = bool(
+            top_rrf >= RRF_ABSTAIN_FLOOR
+            and (
+                agreement
+                or has_lexical_support(top)
+                or dense_strong
+            )
+        )
+
+        if strong:
+            level = "strong"
+        elif moderate:
+            level = "moderate"
+        else:
+            level = "weak"
+
+        if level == "weak":
+            return [], Evidence(
+                level="weak",
+                should_answer=False,
+                top_score=top_rrf,
+                score_source="rrf",
+                supporting_chunks=0,
+                top_gap=top_gap,
+                agreement=agreement,
+                top_percentile=None,
+                retrieval_mode=retrieval_mode,
                 reason=(
-                    "No usable context remained "
-                    "after diversity filtering."
+                    "The retrieved evidence was too weak to answer reliably."
                 ),
             )
 
         return final, Evidence(
-
-            level="moderate",
-
+            level=level,
             should_answer=True,
-
-            top_score=top.rrf_score,
-
+            top_score=top_rrf,
             score_source="rrf",
-
-            supporting_chunks=len(
-                final
-            ),
-
-            top_gap=None,
-
-            agreement=(
-                top.in_both_retrievers
-            ),
-
+            supporting_chunks=len(final),
+            top_gap=top_gap,
+            agreement=agreement,
             top_percentile=None,
-
             retrieval_mode=retrieval_mode,
-
             reason=(
-                "Answer generated from rank-based "
-                "retrieval because CrossEncoder "
-                "reranking was unavailable."
+                "Answer supported by Dense + BM25 RRF retrieval without "
+                "CrossEncoder reranking."
+                if agreement
+                else "Answer supported by a positive retrieval signal "
+                     "without CrossEncoder reranking."
             ),
         )
 
@@ -3252,6 +2929,7 @@ class RAGPipeline:
             self._evaluate_evidence(
                 fused,
                 reranked,
+                search_text,
             )
         )
 

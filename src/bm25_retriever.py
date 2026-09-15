@@ -1,7 +1,7 @@
 from __future__ import annotations
 
+import hashlib
 import logging
-import os
 import pickle
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -16,22 +16,20 @@ from src.document_loader import chunk_documents, load_documents
 
 logger = logging.getLogger(__name__)
 
+_INDEX_FILENAME = "bm25_index.pkl"
+_INDEX_VERSION = 2
+
 
 class BM25Retriever:
-    """Lightweight local BM25 retriever built from chunked knowledge base.
+    """Persistent BM25 index using the exact same canonical chunks as Chroma.
 
-    Matches the same chunk boundaries as ChromaVectorStore (CHUNK_SIZE=800,
-    CHUNK_OVERLAP=200) so RRF fusion receives candidates from identical chunks.
+    The important invariant is: one chunk produced by document_loader is one
+    record here, with the same filename + chunk_id + text + metadata.
 
-    Supports:
-    - Disk persistence via save_index / load_index (pickle).
-    - Incremental indexing via add_chunks() so newly-uploaded files are
-      queryable immediately without re-reading the full corpus.
-    - Full section metadata passed through to rag_pipeline.py so
-      section_heading, section_path, section_level, etc. are available.
+    File replacement is atomic at the logical level: old chunks for a file are
+    removed before its new chunks are inserted. This prevents stale + duplicate
+    BM25 records when a document is edited or re-uploaded.
     """
-
-    _INDEX_FILENAME = "bm25_index.pkl"
 
     def __init__(
         self,
@@ -39,26 +37,29 @@ class BM25Retriever:
         chunk_size: int = CHUNK_SIZE,
         chunk_overlap: int = CHUNK_OVERLAP,
         vectorstore_dir: str | Path | None = None,
-    ):
+    ) -> None:
         self.kb_path = kb_path
         self.chunk_size = chunk_size
         self.chunk_overlap = chunk_overlap
         self.vectorstore_dir = Path(vectorstore_dir or VECTORSTORE_DIR)
-
         self._chunks: List[Dict[str, Any]] = []
         self._tokenized: List[List[str]] = []
-        self._bm25: Optional[BM25Okapi] = None
-
-    # ------------------------------------------------------------------
-    # Index path
-    # ------------------------------------------------------------------
+        self._bm25: Optional[Any] = None
+        self._document_hashes: Dict[str, str] = {}
 
     def _index_path(self) -> Path:
-        return self.vectorstore_dir / self._INDEX_FILENAME
+        return self.vectorstore_dir / _INDEX_FILENAME
 
-    # ------------------------------------------------------------------
-    # Build / Rebuild
-    # ------------------------------------------------------------------
+    @staticmethod
+    def _file_hash(content: str) -> str:
+        return hashlib.sha256((content or "").encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _chunk_key(chunk: Dict[str, Any]) -> str:
+        return f"{chunk.get('filename', '')}::chunk-{chunk.get('chunk_id', '')}"
+
+    def _rebuild_model(self) -> None:
+        self._bm25 = BM25Model(self._tokenized) if self._tokenized else None
 
     def build_index(
         self,
@@ -66,8 +67,10 @@ class BM25Retriever:
         chunk_size: int | None = None,
         chunk_overlap: int | None = None,
     ) -> None:
-        """Load all documents from kb_path, chunk them, and build BM25 index."""
+        """Build BM25 from the canonical document_loader chunks and persist it."""
         path = kb_path or self.kb_path
+        if not path:
+            raise ValueError("BM25 knowledge-base path is not configured.")
         if chunk_size is not None:
             self.chunk_size = chunk_size
         if chunk_overlap is not None:
@@ -82,135 +85,171 @@ class BM25Retriever:
 
         self._chunks = []
         self._tokenized = []
+        self._document_hashes = {
+            str(doc.get("filename", "")): self._file_hash(str(doc.get("content", "")))
+            for doc in docs
+        }
 
-        for c in chunks:
-            tokens = self._tokenize(c.get("text") or "")
-            self._tokenized.append(tokens)
-            self._chunks.append(self._extract_chunk_meta(c))
+        seen_keys: set[str] = set()
+        for chunk in chunks:
+            if not (chunk.get("text") or "").strip():
+                continue
+            key = self._chunk_key(chunk)
+            if key in seen_keys:
+                raise ValueError(f"Duplicate BM25 chunk ID generated: {key}")
+            seen_keys.add(key)
+            self._chunks.append(self._extract_chunk_meta(chunk))
+            self._tokenized.append(self._tokenize(chunk.get("text") or ""))
 
-        if self._tokenized:
-            self._bm25 = BM25Model(self._tokenized)
-
+        self._rebuild_model()
+        self.save_index()
         logger.info(
-            "BM25: built index over %d chunks from %d documents.",
-            len(self._chunks),
-            len(docs),
+            "BM25: rebuilt index over %d chunks from %d documents.",
+            len(self._chunks), len(docs),
         )
 
-    # ------------------------------------------------------------------
-    # Incremental update
-    # ------------------------------------------------------------------
+    def replace_file_chunks(
+        self,
+        filename: str,
+        new_chunks: List[Dict[str, Any]],
+        content_hash: str | None = None,
+    ) -> None:
+        """Replace every BM25 chunk belonging to *filename* with new_chunks."""
+        filename = Path(filename).name
+        kept_chunks: List[Dict[str, Any]] = []
+        kept_tokens: List[List[str]] = []
+
+        for chunk, tokens in zip(self._chunks, self._tokenized):
+            if str(chunk.get("filename", "")) != filename:
+                kept_chunks.append(chunk)
+                kept_tokens.append(tokens)
+
+        seen: set[str] = {self._chunk_key(c) for c in kept_chunks}
+        for chunk in new_chunks:
+            if not (chunk.get("text") or "").strip():
+                continue
+            key = self._chunk_key(chunk)
+            if key in seen:
+                raise ValueError(f"Duplicate BM25 chunk ID: {key}")
+            seen.add(key)
+            kept_chunks.append(self._extract_chunk_meta(chunk))
+            kept_tokens.append(self._tokenize(chunk.get("text") or ""))
+
+        self._chunks = kept_chunks
+        self._tokenized = kept_tokens
+        if content_hash is not None:
+            self._document_hashes[filename] = content_hash
+        self._rebuild_model()
+        logger.info(
+            "BM25: replaced file %s; index now contains %d chunks.",
+            filename, len(self._chunks),
+        )
+
+    def delete_file(self, filename: str) -> int:
+        """Delete all BM25 chunks belonging to a source file."""
+        filename = Path(filename).name
+        before = len(self._chunks)
+        kept = [
+            (chunk, tokens)
+            for chunk, tokens in zip(self._chunks, self._tokenized)
+            if str(chunk.get("filename", "")) != filename
+        ]
+        self._chunks = [c for c, _ in kept]
+        self._tokenized = [t for _, t in kept]
+        self._document_hashes.pop(filename, None)
+        self._rebuild_model()
+        removed = before - len(self._chunks)
+        if removed:
+            logger.info("BM25: deleted %d chunks for %s.", removed, filename)
+        return removed
 
     def add_chunks(self, new_chunks: List[Dict[str, Any]]) -> None:
-        """Append new pre-chunked documents to the existing BM25 index.
-
-        ``new_chunks`` should be the same dict format produced by
-        ``chunk_documents()`` — each item must have at least a ``"text"`` key.
-        """
+        """Backward-compatible append; prefer replace_file_chunks for updates."""
         if not new_chunks:
             return
-
-        for c in new_chunks:
-            tokens = self._tokenize(c.get("text") or "")
-            self._tokenized.append(tokens)
-            self._chunks.append(self._extract_chunk_meta(c))
-
-        # Rebuild BM25 over all (existing + new) tokens.
-        if self._tokenized:
-            self._bm25 = BM25Model(self._tokenized)
-
-        logger.info(
-            "BM25: added %d chunks; index now contains %d chunks.",
-            len(new_chunks),
-            len(self._chunks),
-        )
-
-    # ------------------------------------------------------------------
-    # Persistence
-    # ------------------------------------------------------------------
+        by_file: Dict[str, List[Dict[str, Any]]] = {}
+        for chunk in new_chunks:
+            by_file.setdefault(Path(str(chunk.get("filename", ""))).name, []).append(chunk)
+        for filename, chunks in by_file.items():
+            self.replace_file_chunks(filename, chunks)
 
     def save_index(self, path: str | Path | None = None) -> None:
-        """Persist the BM25 corpus and chunk metadata to disk."""
         target = Path(path) if path else self._index_path()
         target.parent.mkdir(parents=True, exist_ok=True)
         payload = {
+            "version": _INDEX_VERSION,
             "chunks": self._chunks,
             "tokenized": self._tokenized,
             "chunk_size": self.chunk_size,
             "chunk_overlap": self.chunk_overlap,
+            "document_hashes": self._document_hashes,
         }
         with open(target, "wb") as fh:
             pickle.dump(payload, fh, protocol=pickle.HIGHEST_PROTOCOL)
         logger.info("BM25: index saved to %s.", target)
 
     def load_index(self, path: str | Path | None = None) -> bool:
-        """Restore index from disk.  Returns True on success, False otherwise."""
         target = Path(path) if path else self._index_path()
         if not target.exists():
             return False
         try:
             with open(target, "rb") as fh:
                 payload = pickle.load(fh)
+            if payload.get("version") != _INDEX_VERSION:
+                logger.info("BM25: ignoring incompatible index version.")
+                return False
             self._chunks = payload.get("chunks", [])
             self._tokenized = payload.get("tokenized", [])
             self.chunk_size = payload.get("chunk_size", self.chunk_size)
             self.chunk_overlap = payload.get("chunk_overlap", self.chunk_overlap)
-            if self._tokenized:
-                self._bm25 = BM25Model(self._tokenized)
-            logger.info(
-                "BM25: loaded index from %s (%d chunks).",
-                target,
-                len(self._chunks),
-            )
+            self._document_hashes = payload.get("document_hashes", {})
+            if len(self._chunks) != len(self._tokenized):
+                return False
+            self._rebuild_model()
+            logger.info("BM25: loaded index from %s (%d chunks).", target, len(self._chunks))
             return True
-        except Exception as exc:  # pragma: no cover
+        except Exception as exc:
             logger.warning("BM25: failed to load index from %s: %s", target, exc)
             return False
 
-    # ------------------------------------------------------------------
-    # Query
-    # ------------------------------------------------------------------
+    def is_in_sync_with_documents(self, kb_path: str | Path | None = None) -> bool:
+        """Return True only when persisted BM25 hashes match the current KB files."""
+        path = kb_path or self.kb_path
+        if not path:
+            return False
+        docs = load_documents(path)
+        current = {
+            str(doc.get("filename", "")): self._file_hash(str(doc.get("content", "")))
+            for doc in docs
+        }
+        return current == self._document_hashes
 
     def query(self, query: str, top_k: int = 5) -> List[Dict[str, Any]]:
-        """Return up to top_k chunks sorted by BM25 score (descending)."""
-        if not self._bm25 or not self._chunks:
+        if self._bm25 is None or not self._chunks:
             return []
-
         tokens = self._tokenize(query)
+        if not tokens:
+            return []
         scores = self._bm25.get_scores(tokens)
-        ranked_idx = sorted(
-            range(len(scores)),
-            key=lambda i: scores[i],
-            reverse=True,
-        )[:top_k]
-
-        results = []
+        ranked_idx = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)[:max(0, top_k)]
+        results: List[Dict[str, Any]] = []
         for idx in ranked_idx:
             score = float(scores[idx])
             if score <= 0:
-                # Token overlap fallback for small corpora
                 overlap = set(tokens) & set(self._tokenized[idx])
                 if not overlap:
                     continue
                 score = float(len(overlap))
-            chunk = self._chunks[idx]
-            results.append({
-                **chunk,
-                "bm25_score": score,
-            })
+            results.append({**self._chunks[idx], "bm25_score": score})
         return results
-
-    # ------------------------------------------------------------------
-    # Internal helpers
-    # ------------------------------------------------------------------
 
     @staticmethod
     def _tokenize(text: str) -> List[str]:
-        return (text or "").lower().split()
+        import re
+        return re.findall(r"[a-z0-9]+", (text or "").lower())
 
     @staticmethod
     def _extract_chunk_meta(c: Dict[str, Any]) -> Dict[str, Any]:
-        """Extract all metadata fields that rag_pipeline.py expects."""
         return {
             "filename": c.get("filename", ""),
             "chunk_id": c.get("chunk_id", ""),
