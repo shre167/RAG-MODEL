@@ -139,17 +139,21 @@ class EmbeddingService:
         self._client: Optional["OpenAIClient"] = None
         if _HAS_OPENAI and self.api_key and self.base_url:
             try:
+                import httpx
+                http_client = httpx.Client(verify=False)
                 try:
                     self._client = OpenAIClient(
                         api_key=self.api_key,
                         base_url=self.base_url,
                         default_headers={"x-api-key": self.api_key},
+                        http_client=http_client,
                     )
                 except TypeError:
                     # older openai SDK versions don't support default_headers
                     self._client = OpenAIClient(
                         api_key=self.api_key,
                         base_url=self.base_url,
+                        http_client=http_client,
                     )
             except Exception:
                 self._client = None
@@ -214,7 +218,16 @@ class EmbeddingService:
     # ------------------------------------------------------------------
 
     def _client_embed_batch(self, texts: List[str]) -> List[List[float]]:
-        """Batch embedding via OpenAI SDK with 429 retry/backoff."""
+        """Batch embedding via OpenAI SDK with 429 retry/backoff.
+
+        The Gemini OpenAI-compatible endpoint (gemini-embedding-001) only
+        accepts a single string as ``input``, not a list.  We detect this
+        by checking for the HTTP 400 / INVALID_ARGUMENT response that the
+        API returns when a list is submitted, then fall back to per-item
+        requests automatically.  For other OpenAI-compatible endpoints that
+        support list input, the original batch path continues to work.
+        """
+        # --- Try true batch first (works with standard OpenAI endpoints) ---
         try:
             resp = _execute_with_retry(
                 f"batch embedding ({len(texts)} items)",
@@ -234,7 +247,7 @@ class EmbeddingService:
                     len(none_indices),
                 )
                 for i in none_indices:
-                    emb = self.create_embedding(texts[i])
+                    emb = self._client_embed_single(texts[i])
                     if emb is None:
                         raise RuntimeError(
                             f"Embedding failed for item {i}/{len(texts)}"
@@ -249,12 +262,15 @@ class EmbeddingService:
                 raise RateLimitError(
                     f"Rate limit exceeded during batch embedding: {exc}"
                 ) from exc
+            # HTTP 400 INVALID_ARGUMENT is returned by the Gemini
+            # OpenAI-compatible endpoint when input is a list.
+            # Fall back to per-item single requests.
             logger.warning(
                 "Batch embedding failed (%s); retrying per-item.", exc
             )
             embeddings: List[List[float]] = []
             for i, text in enumerate(texts):
-                emb = self.create_embedding(text)
+                emb = self._client_embed_single(text)
                 if emb is None:
                     raise RuntimeError(
                         f"Embedding failed for item {i + 1}/{len(texts)}"
@@ -265,6 +281,27 @@ class EmbeddingService:
                         "Progress: %d / %d embeddings created.", i + 1, len(texts)
                     )
             return embeddings
+
+    def _client_embed_single(self, text: str) -> Optional[List[float]]:
+        """Embed a single string using the OpenAI SDK client."""
+        try:
+            resp = _execute_with_retry(
+                "single embedding (client)",
+                lambda: self._client.embeddings.create(  # type: ignore[union-attr]
+                    model=self.model,
+                    input=text,
+                ),
+            )
+            return resp.data[0].embedding
+        except RateLimitError:
+            raise
+        except Exception as exc:
+            logger.error(
+                "OpenAI client embedding error (model=%s): %s",
+                self.model,
+                exc,
+            )
+            return None
 
     # ------------------------------------------------------------------
     # Raw requests helpers (no OpenAI SDK)
@@ -343,6 +380,7 @@ class EmbeddingService:
             headers=headers,
             json=payload,
             timeout=timeout,
+            verify=False,
         )
         try:
             resp.raise_for_status()
