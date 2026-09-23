@@ -69,6 +69,17 @@ from src.rag_pipeline.query import (
     prepare_search_query,
     safe_float,
 )
+from src.rag_pipeline.evaluation import evaluate_retrieval, evaluate_answer_quality
+from src.rag_pipeline.observability import observe_pipeline_answer
+from src.rag_pipeline.observation_store import record_observation
+from src.rag_pipeline.citations import generate_claim_citations
+from src.rag_pipeline.confidence import evaluate_confidence
+from src.rag_pipeline.kb_state import (
+    check_index_consistency,
+    delete_document as _delete_kb_document,
+    get_current_kb_state,
+    increment_kb_version,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -487,6 +498,38 @@ class RAGPipeline:
             },
         }
 
+    def answer_question(
+        self,
+        question: str,
+        retrieval_mode: str = "hybrid",
+        evaluation_labels: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Run the unchanged pipeline and persist one complete observation."""
+        import time
+
+        started = time.perf_counter()
+        response = self._answer_question_impl(question, retrieval_mode)
+        total_latency_ms = (time.perf_counter() - started) * 1000
+        observation = record_observation(
+            self.vectorstore_path,
+            question,
+            response,
+            getattr(self.embedding_service, "model", None),
+            total_latency_ms,
+        )
+        response["observation"] = {
+            key: observation[key]
+            for key in ("query_id", "timestamp", "latency_ms", "embedding_model")
+        }
+        return observe_pipeline_answer(
+            pipeline=self,
+            question=question,
+            retrieval_mode=retrieval_mode,
+            response=response,
+            total_latency_ms=total_latency_ms,
+            labels=evaluation_labels,
+        )
+
     # ==================================================================
     # INGESTION
     # ==================================================================
@@ -695,6 +738,8 @@ class RAGPipeline:
                 "Vector store is empty after ingestion."
             )
 
+        new_kb_state = increment_kb_version(self)
+
         return {
             "chunks_indexed": embedded_count,
             "chunks_skipped": skipped_count,
@@ -702,6 +747,8 @@ class RAGPipeline:
             "files_processed": len(docs),
             "chunks_created": len(chunks),
             "collection_count": count_after,
+            "kb_version": new_kb_state.version,
+            "indexes_consistent": new_kb_state.indexes_consistent,
         }
 
     def ingest_file(
@@ -1028,15 +1075,12 @@ class RAGPipeline:
             manifest
         )
 
-        count_after = (
-            self.vector_store
-            .get_collection_count()
-        )
+        new_kb_state = increment_kb_version(self)
 
         return {
             "filename": filename,
             "chunks_added": len(ids),
-            "collection_count": count_after,
+            "collection_count": new_kb_state.chroma_chunks,
             "skipped": False,
             "hash": file_hash,
             "chunks_created": len(new_chunks),
@@ -1044,7 +1088,35 @@ class RAGPipeline:
             "stale_chunks_deleted": len(
                 stale_old_ids
             ),
+            "kb_version": new_kb_state.version,
+            "indexes_consistent": new_kb_state.indexes_consistent,
         }
+
+    # ==================================================================
+    # KNOWLEDGE BASE STATE & DOCUMENT MANAGEMENT
+    # ==================================================================
+
+    def get_kb_state(self) -> dict[str, Any]:
+        """Return the current version, document count, and index counts."""
+        return get_current_kb_state(self).to_dict()
+
+    def check_index_consistency(self) -> dict[str, Any]:
+        """Check whether Chroma and BM25 indexes represent the same chunk count."""
+        return check_index_consistency(self)
+
+    def delete_document(
+        self,
+        filename: str,
+        delete_file_from_disk: bool = True,
+    ) -> dict[str, Any]:
+        """
+        Safely remove all chunks of a document from both Chroma and BM25 simultaneously.
+        """
+        return _delete_kb_document(
+            self,
+            filename,
+            delete_file_from_disk=delete_file_from_disk,
+        )
 
     def _manifest_path(
         self,
@@ -1165,7 +1237,7 @@ class RAGPipeline:
     # MAIN ENTRY POINT
     # ==================================================================
 
-    def answer_question(
+    def _answer_question_impl(
         self,
         question: str,
         retrieval_mode: str = "hybrid",
@@ -1210,6 +1282,19 @@ class RAGPipeline:
             "hybrid",
         )
 
+        try:
+            kb_state = self.get_kb_state()
+        except Exception:
+            kb_state = {
+                "version": 1,
+                "document_count": 0,
+                "chroma_chunks": 0,
+                "bm25_chunks": 0,
+                "indexes_consistent": True,
+                "last_updated": "",
+                "consistency_message": "KB state unavailable",
+            }
+
         def empty_response(
             answer: str,
             response_type: str = "system",
@@ -1220,6 +1305,11 @@ class RAGPipeline:
                 "retrieved_chunks": [],
                 "num_retrieved": 0,
                 "evidence": None,
+                "evaluation": None,
+                "citations": [],
+                "citation_coverage": None,
+                "confidence": None,
+                "kb_state": kb_state,
                 "response_type": response_type,
                 "retrieval_mode": retrieval_mode,
             }
@@ -1364,6 +1454,8 @@ class RAGPipeline:
                     query_embedding
                 )
             )
+            for c in candidates.values():
+                c.in_dense = True
 
         # OBSERVATORY: snapshot raw Dense results BEFORE BM25 merges in
         raw_dense_results = [
@@ -1394,6 +1486,9 @@ class RAGPipeline:
                 search_text,
                 candidates,
             )
+            for c in candidates.values():
+                if c.bm25_rank is not None:
+                    c.in_bm25 = True
 
         # OBSERVATORY: snapshot raw BM25 results (ranks now populated)
         raw_bm25_results = [
@@ -1549,6 +1644,8 @@ class RAGPipeline:
         )
 
         # OBSERVATORY: RRF-ranked snapshot
+        for c in fused:
+            c.in_rrf = True
         rrf_results_snapshot = [c.to_dict() for c in fused]
 
         # --------------------------------------------------------------
@@ -1572,15 +1669,52 @@ class RAGPipeline:
                 retrieval_mode=retrieval_mode,
             )
         )
+        for c in final_candidates:
+            c.in_final_evidence = True
+
+        # --------------------------------------------------------------
+        # RUNTIME EVALUATION LAYER (7 Criteria + Health Score)
+        # --------------------------------------------------------------
+        eval_result = evaluate_retrieval(
+            query=question,
+            candidates=list(candidates.values()),
+            dense_results=raw_dense_results,
+            bm25_results=raw_bm25_results,
+            fused_results=fused,
+            selected_candidates=final_candidates,
+            retrieval_mode=retrieval_mode,
+        )
 
         if not evidence.should_answer:
+            from src.rag_pipeline.models import CitationCoverage
+            conf_result = evaluate_confidence(
+                evaluation=eval_result,
+                citations=[],
+                citation_coverage=CitationCoverage(0, 0, 0, 0.0, False, []),
+                evidence_level=evidence.level,
+            )
+
             return {
                 "answer": ABSTAIN_MESSAGE,
+                "raw_answer": ABSTAIN_MESSAGE,
                 "sources": [],
                 "retrieved_chunks": [],
                 "num_retrieved": 0,
                 "evidence": evidence.as_dict(),
+                "evaluation": eval_result.to_dict(),
+                "citations": [],
+                "citation_coverage": {
+                    "total_claims": 0,
+                    "supported_claims": 0,
+                    "unsupported_claims": 0,
+                    "coverage_percentage": 0.0,
+                    "has_unsupported": False,
+                    "unsupported_claims_list": [],
+                },
+                "confidence": conf_result.to_dict(),
+                "kb_state": kb_state,
                 "response_type": "abstain",
+                "retrieval_mode": retrieval_mode,
                 "trace": {
                     "query": {
                         "original": question,
@@ -1626,6 +1760,20 @@ class RAGPipeline:
                         "supporting_candidates": [],
                         "rejected_candidates": rrf_results_snapshot,
                     },
+                    "evaluation": eval_result.to_dict(),
+                    "citations": [],
+                    "citation_coverage": {
+                        "total_claims": 0,
+                        "supported_claims": 0,
+                        "unsupported_claims": 0,
+                        "coverage_percentage": 0.0,
+                        "has_unsupported": False,
+                        "unsupported_claims_list": [],
+                    },
+                    "confidence": conf_result.to_dict(),
+                    "kb_state": kb_state,
+                    "selected_evidence": [],
+                    "candidate_journey": [c.to_dict() for c in fused],
                     "token_optimizer": {},
                     "context": {
                         "chars": 0,
@@ -1660,6 +1808,8 @@ class RAGPipeline:
         )
 
         final_candidates = opt_result["selected"]
+        for c in final_candidates:
+            c.in_llm_context = True
 
         if not final_candidates:
             fallback_evidence = Evidence(
@@ -1682,12 +1832,18 @@ class RAGPipeline:
 
             return {
                 "answer": ABSTAIN_MESSAGE,
+                "raw_answer": ABSTAIN_MESSAGE,
                 "sources": [],
                 "retrieved_chunks": [],
                 "num_retrieved": 0,
                 "evidence": (
                     fallback_evidence.as_dict()
                 ),
+                "evaluation": eval_result.to_dict(),
+                "citations": [],
+                "citation_coverage": None,
+                "confidence": None,
+                "kb_state": kb_state,
                 "response_type": "abstain",
                 "retrieval_mode": retrieval_mode,
             }
@@ -1713,16 +1869,59 @@ class RAGPipeline:
             Any,
         ] = {}
 
-        answer = self._ask_llm(
+        raw_answer = self._ask_llm(
             question,
             context,
             trace=generation_trace,
         )
 
+        # --------------------------------------------------------------
+        # 16. POST-GENERATION GROUNDING & CLAIM CITATIONS
+        # --------------------------------------------------------------
+        citations, citation_coverage = generate_claim_citations(
+            raw_answer,
+            final_candidates,
+            kb_version=kb_state.get("version", 1),
+        )
+        answer_evaluation = evaluate_answer_quality(
+            question, raw_answer, citations, citation_coverage, final_candidates
+        )
+        grounding_trace = {
+            "stage": "post_generation",
+            "claim_count": citation_coverage.total_claims,
+            "directly_supported_claims": citation_coverage.supported_claims,
+            "partially_supported_claims": citation_coverage.partially_supported_claims,
+            "unsupported_claims": citation_coverage.unsupported_claims,
+            "coverage_percentage": citation_coverage.coverage_percentage,
+            "claim_to_citation": [
+                {
+                    "claim": citation.claim,
+                    "citation": citation.marker,
+                    "status": citation.status,
+                    "evidence": {
+                        "filename": citation.filename,
+                        "chunk_id": citation.chunk_id,
+                        "passage": citation.passage,
+                    },
+                }
+                for citation in citations
+            ],
+        }
+
+        # --------------------------------------------------------------
+        # 17. EVIDENCE-BACKED CONFIDENCE
+        # --------------------------------------------------------------
+        confidence_result = evaluate_confidence(
+            evaluation=eval_result,
+            citations=citations,
+            citation_coverage=citation_coverage,
+            evidence_level=evidence.level,
+        )
+
         answer = (
-            f"{answer}\n\n"
-            f"Confidence: "
-            f"{evidence.level.title()} evidence"
+            f"{raw_answer}\n\n"
+            f"Evidence-backed Confidence: {confidence_result.level} "
+            f"({evidence.level.title()} evidence)"
         )
 
         opt_trace: dict[str, Any] = {
@@ -1733,12 +1932,20 @@ class RAGPipeline:
 
         return {
             "answer": answer,
+            "raw_answer": raw_answer,
             "sources": source_names,
             "retrieved_chunks": retrieved_chunks,
             "num_retrieved": len(
                 retrieved_chunks
             ),
             "evidence": evidence.as_dict(),
+            "evaluation": eval_result.to_dict(),
+            "citations": [c.to_dict() for c in citations],
+            "citation_coverage": citation_coverage.to_dict(),
+            "grounding": grounding_trace,
+            "confidence": confidence_result.to_dict(),
+            "answer_evaluation": answer_evaluation,
+            "kb_state": kb_state,
             "response_type": "rag",
             "retrieval_mode": retrieval_mode,
             "trace": {
@@ -1792,6 +1999,15 @@ class RAGPipeline:
                     "supporting_candidates": supporting_snapshot,
                     "rejected_candidates": rejected_snapshot,
                 },
+                "evaluation": eval_result.to_dict(),
+                "citations": [c.to_dict() for c in citations],
+                "citation_coverage": citation_coverage.to_dict(),
+                "grounding": grounding_trace,
+                "confidence": confidence_result.to_dict(),
+                "answer_evaluation": answer_evaluation,
+                "kb_state": kb_state,
+                "selected_evidence": [c.to_dict() for c in final_candidates],
+                "candidate_journey": [c.to_dict() for c in fused],
                 "token_optimizer": opt_trace,
                 "context": {
                     "chars": len(context),

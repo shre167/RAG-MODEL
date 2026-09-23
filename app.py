@@ -9,6 +9,7 @@ import streamlit as st
 from src.config import KNOWLEDGE_BASE_DIR, VECTORSTORE_DIR
 from src.document_loader import chunk_documents, list_txt_files, load_documents
 from src.rag_pipeline import RAGPipeline
+from src.rag_pipeline.observation_store import load_observations
 from src.rag_pipeline.observatory import (
     build_observatory_snapshot,
     describe_evidence_level,
@@ -27,10 +28,15 @@ from src.ui.astronomy_theme import (
     render_arch_plane_open,
     render_architecture_node,
     render_chunk_map,
+    render_citation_card,
+    render_citation_coverage_badge,
+    render_confidence_card,
     render_control_label,
+    render_evaluation_criterion_card,
     render_evidence_badge,
     render_formula_card,
     render_html,
+    render_kb_state_card,
     render_kv_rows,
     render_mode_chip,
     render_mode_description,
@@ -38,6 +44,7 @@ from src.ui.astronomy_theme import (
     render_page_header,
     render_panel_card,
     render_pipeline_node,
+    render_retrieval_health_card,
     render_section_title,
     render_sidebar_divider,
     render_simulation_tag,
@@ -85,12 +92,22 @@ SEGMENT_TO_MODE = {MODES[key]["segment"]: key for key in MODE_ORDER}
 
 PAGE_MISSION = "Mission Control"
 PAGE_LAB = "Retrieval Lab"
+PAGE_OBSERVATION = "Observation & Evaluation"
+PAGE_DASHBOARD = "Evaluation Dashboard"
+PAGE_BENCHMARK = "Benchmark"
+PAGE_COMPARISON = "Query Comparison"
 PAGE_INGEST = "Ingestion Pipeline"
 PAGE_CHUNKS = "Chunk Monitor"
 PAGE_ARCH = "System Architecture"
 
 # (group label, [(page, icon)])
 NAV_GROUPS = [
+    ("Evaluation", [
+        (PAGE_OBSERVATION, "Observation"),
+        (PAGE_DASHBOARD, "Dashboard"),
+        (PAGE_BENCHMARK, "Benchmark"),
+        (PAGE_COMPARISON, "Compare"),
+    ]),
     ("Mission Control", [(PAGE_MISSION, "🌌")]),
     ("Retrieval", [(PAGE_LAB, "🔬")]),
     ("Knowledge Base", [(PAGE_INGEST, "📥"), (PAGE_CHUNKS, "🧩")]),
@@ -98,6 +115,14 @@ NAV_GROUPS = [
 ]
 
 PAGES = [page for _, items in NAV_GROUPS for page, _ in items]
+
+
+def _sidebar_nav_label(marker: str, page_name: str, icon: str) -> str:
+    """Build sidebar button text; skip text icons that duplicate the page name."""
+    if icon and not icon.isascii():
+        return f"{marker}  {icon}  {page_name}"
+    return f"{marker}  {page_name}"
+
 
 INGESTION_STAGES = [
     ("📄", "Document", "Loaded"),
@@ -173,6 +198,18 @@ ARCH_DESCRIPTIONS = [
     ("Answer",
      "The response returned to the user, together with its supporting "
      "sources and the runtime trace the Retrieval Lab reads."),
+    ("Observation & Trace",
+     "Captures full candidate journeys, index statistics, and retrieval states."),
+    ("Retrieval Health Evaluation",
+     "Evaluates 7 relative retrieval criteria at runtime, prioritizing direct "
+     "answer support and relevance over agreement."),
+    ("Claim Grounding & Citations",
+     "Verifies factual claims against retrieved passages, mapping bracketed "
+     "citations to chunk sources and flagging unsupported claims."),
+    ("Evidence Confidence",
+     "Computes evidence-backed confidence (HIGH/MEDIUM/LOW) with explainable reasons."),
+    ("Knowledge Base State",
+     "Tracks versioning, document counts, and Chroma/BM25 index synchronization."),
 ]
 
 RETRIEVAL_DIAGRAM = """\
@@ -532,6 +569,12 @@ def _build_meta(response: dict, requested_mode: str) -> dict:
         "candidate_count": retrieval.get("candidate_count"),
         "trace_available": bool(trace),
         "error": response.get("error", ""),
+        "evaluation": response.get("evaluation") or snapshot.get("evaluation", {}),
+        "citations": response.get("citations") or snapshot.get("citations", []),
+        "citation_coverage": response.get("citation_coverage") or snapshot.get("citation_coverage", {}),
+        "confidence": response.get("confidence") or snapshot.get("confidence", {}),
+        "kb_state": response.get("kb_state") or snapshot.get("kb_state", {}),
+        "candidate_journey": trace.get("candidate_journey") or snapshot.get("candidate_journey", []),
     }
 
 
@@ -562,7 +605,7 @@ def _render_chunk_list(chunks: list, mode_label: str = "") -> None:
 
 
 def _render_answer_extras(meta: dict) -> None:
-    """Render mode, evidence, sources and retrieved context under an answer."""
+    """Render mode, evidence, confidence, citations, sources and retrieved context under an answer."""
     chip_col, evidence_col = st.columns([1, 1])
 
     with chip_col:
@@ -577,12 +620,35 @@ def _render_answer_extras(meta: dict) -> None:
                 )
             )
 
+    confidence = meta.get("confidence")
+    if confidence:
+        render_html(render_confidence_card(confidence))
+
+    coverage = meta.get("citation_coverage")
+    kb_state = meta.get("kb_state")
+    if coverage or kb_state:
+        sub_col1, sub_col2 = st.columns([1, 1])
+        with sub_col1:
+            if coverage:
+                render_html(render_citation_coverage_badge(coverage))
+        with sub_col2:
+            if kb_state:
+                v = kb_state.get("version", 1)
+                sync = "✓ Synced" if kb_state.get("indexes_consistent", True) else "⚠ Mismatch"
+                st.caption(f"Knowledge Base: **v{v}** ({sync})")
+
     sources = meta.get("supporting_sources") or []
 
     if sources:
         render_html(render_sources_card(sources))
     else:
         st.caption("No supporting sources were selected for this answer.")
+
+    citations = meta.get("citations") or []
+    if citations:
+        with st.expander(f"Claim Citations & Evidence Passages ({len(citations)})", expanded=False):
+            for c in citations:
+                render_html(render_citation_card(c))
 
     context_chunks = meta.get("context_chunks") or []
     candidates = meta.get("candidates") or []
@@ -1268,6 +1334,7 @@ def _render_retrieval_lab(response) -> None:
     _lab_section_evidence(snapshot.get("evidence", {}))
     _lab_section_context(trace, snapshot.get("context", {}))
     _lab_section_generation(snapshot.get("generation", {}))
+    _lab_section_grounding_chain(snapshot.get("query", {}), snapshot.get("grounding", {}))
 
     with st.expander("Raw trace (sanitized)"):
         st.caption(
@@ -1275,6 +1342,72 @@ def _render_retrieval_lab(response) -> None:
             "observatory.export_trace_json()."
         )
         st.json(export_trace_json(trace))
+
+
+def _lab_section_grounding_chain(query: dict, grounding: dict) -> None:
+    """Render the auditable Query -> Evidence -> Claim -> Citation chain."""
+    render_html(render_section_title("Grounding chain"))
+    st.caption("Query → selected evidence passage → generated claim → citation verification")
+    rows = []
+    for item in grounding.get("claim_to_citation", []):
+        evidence = item.get("evidence", {})
+        rows.append({
+            "Query": query.get("original", ""),
+            "Evidence": f"{evidence.get('filename', '')} / {evidence.get('chunk_id', '')}",
+            "Claim": item.get("claim", ""),
+            "Citation": item.get("citation", ""),
+            "Verdict": item.get("status", ""),
+        })
+    if rows:
+        st.dataframe(rows, use_container_width=True, hide_index=True)
+    else:
+        st.info("No generated claims were available for post-generation grounding.")
+
+
+def _render_observation_page(pipeline: RAGPipeline) -> None:
+    render_html(render_page_header("RUNTIME DIAGNOSTICS", "Observation & Evaluation", "Persistent, local records of query execution and explainable evaluation."))
+    rows = load_observations(pipeline.vectorstore_path)
+    if not rows:
+        st.info("No observations recorded yet. Run a query from Mission Control.")
+        return
+    choices = {f"{row['timestamp']} · {row['raw_query']}": row for row in rows}
+    selected = choices[st.selectbox("Recorded query", list(choices))]
+    trace = selected.get("trace", {})
+    snapshot = build_observatory_snapshot(trace)
+    st.json({"query_id": selected["query_id"], "normalized_query": selected["normalized_query"], "latency_ms": selected["latency_ms"], "embedding_model": selected["embedding_model"]})
+    st.subheader("Query → Dense/BM25/RRF → Evidence → Context → Answer")
+    st.json({"dense": snapshot.get("retrieval", {}).get("raw_dense", []), "bm25": snapshot.get("retrieval", {}).get("raw_bm25", []), "rrf": snapshot.get("retrieval", {}).get("rrf_calculation", []), "selected_evidence": trace.get("selected_evidence", []), "context": trace.get("context", {}), "grounding": trace.get("grounding", {})})
+    st.subheader("Evaluation and insights")
+    st.json({"retrieval": selected.get("evaluation", {}), "answer": selected.get("answer_evaluation", {})})
+
+
+def _render_dashboard_page(pipeline: RAGPipeline) -> None:
+    render_html(render_page_header("RUNTIME DIAGNOSTICS", "Evaluation Dashboard", "Aggregate live heuristics from recorded observations; these are not accuracy metrics."))
+    rows = load_observations(pipeline.vectorstore_path)
+    if not rows:
+        st.info("No observations recorded yet.")
+        return
+    table = [{"query": row["raw_query"], "latency_ms": row["latency_ms"], "retrieval_health": row.get("evaluation", {}).get("retrieval_health_score"), "citation_coverage": row.get("answer_evaluation", {}).get("citation_coverage", {}).get("score")} for row in rows]
+    st.dataframe(table, use_container_width=True, hide_index=True)
+
+
+def _render_benchmark_page(pipeline: RAGPipeline) -> None:
+    render_html(render_page_header("EVALUATION", "Benchmark", "Labelled queries are evaluated separately from live heuristic observations."))
+    st.info("Add labelled cases with query, relevant_documents/relevant_chunks, expected_facets, and optional reference_answer. Benchmark calculation is available in src/rag_pipeline/benchmark.py.")
+
+
+def _render_comparison_page(pipeline: RAGPipeline) -> None:
+    render_html(render_page_header("RUNTIME DIAGNOSTICS", "Query Comparison", "Compare two recorded executions without rerunning retrieval."))
+    rows = load_observations(pipeline.vectorstore_path)
+    if len(rows) < 2:
+        st.info("Run at least two queries to compare observations.")
+        return
+    labels = [f"{row['timestamp']} · {row['raw_query']}" for row in rows]
+    left, right = st.columns(2)
+    with left:
+        st.json(rows[labels.index(st.selectbox("First query", labels, key="compare_a"))])
+    with right:
+        st.json(rows[labels.index(st.selectbox("Second query", labels, index=1, key="compare_b"))])
 
 
 # ============================================================================
@@ -2374,7 +2507,7 @@ def _render_sidebar(
                 marker = "◉" if active else "◇"
 
                 if st.button(
-                    f"{marker}  {icon}  {page_name}",
+                    _sidebar_nav_label(marker, page_name, icon),
                     key=f"nav_{page_name}",
                     type="primary" if active else "secondary",
                     **WIDE,
@@ -2529,6 +2662,22 @@ def main() -> None:
         _render_retrieval_lab(st.session_state.last_response)
         return
 
+    if page == PAGE_OBSERVATION:
+        _render_observation_page(pipeline)
+        return
+
+    if page == PAGE_DASHBOARD:
+        _render_dashboard_page(pipeline)
+        return
+
+    if page == PAGE_BENCHMARK:
+        _render_benchmark_page(pipeline)
+        return
+
+    if page == PAGE_COMPARISON:
+        _render_comparison_page(pipeline)
+        return
+
     if page == PAGE_INGEST:
         _render_ingestion_page(pipeline, status, collection_count)
         return
@@ -2542,6 +2691,105 @@ def main() -> None:
         return
 
     _render_mission_control(pipeline, status, collection_count)
+
+
+def _short_topic(query: str, index: int) -> str:
+    words = [w for w in query.replace("?", "").split() if w.lower() not in {"what", "is", "are", "how", "does", "the", "and"}]
+    return f"Q{index:02d} · {' '.join(words[:3]) or 'query'}"
+
+
+def _render_observation_page(pipeline: RAGPipeline) -> None:
+    render_html(render_page_header("RUNTIME DIAGNOSTICS", "Observation & Evaluation", "Persistent system insight dashboard. Live scores are heuristics, not accuracy."))
+    rows = load_observations(pipeline.vectorstore_path)
+    if not rows:
+        st.info("No observations recorded yet.")
+        return
+    dense = sum(len(r.get("trace", {}).get("retrieval", {}).get("raw_dense", [])) for r in rows)
+    bm25 = sum(len(r.get("trace", {}).get("retrieval", {}).get("raw_bm25", [])) for r in rows)
+    latencies = sorted(r["latency_ms"] for r in rows)
+    cols = st.columns(4)
+    cols[0].metric("Queries", len(rows)); cols[1].metric("Dense hits", dense); cols[2].metric("BM25 hits", bm25); cols[3].metric("Median latency", f"{latencies[len(latencies)//2]:.0f} ms")
+    st.subheader("Retrieval and evidence trends")
+    st.bar_chart({"Dense contribution": dense, "BM25 contribution": bm25})
+    sources = {}
+    for row in rows:
+        for c in row.get("trace", {}).get("selected_evidence", []):
+            sources[c.get("filename", "unknown")] = sources.get(c.get("filename", "unknown"), 0) + 1
+    if sources:
+        st.caption("Selected-evidence document distribution"); st.bar_chart(sources)
+    latest = rows[0]; criteria = latest.get("evaluation", {}).get("criteria", {})
+    agreement = criteria.get("retriever_agreement", {})
+    direct = criteria.get("direct_answer_support", {})
+    coverage = latest.get("answer_evaluation", {}).get("citation_coverage", {})
+    st.subheader("Explainable AI insights")
+    insights = [
+        ("What happened", f"Dense and BM25 agreed on {agreement.get('metrics', {}).get('overlapping_chunks_count', 'no')} candidate(s).", agreement.get("reason", ""), "Agreement is consensus only; it does not establish correctness."),
+        ("What happened", direct.get("reason", "Direct-answer support was not instrumented."), "Computed from the recorded candidate text, definitional patterns, term density, filename match, and term coverage.", "This distinguishes answer evidence from topical lexical overlap."),
+        ("What happened", f"End-to-end latency was {latest.get('latency_ms')} ms.", "Only end-to-end request timing is recorded.", "Stage-wise latency is Not instrumented; no attribution is invented."),
+        ("What happened", f"Citation coverage was {coverage.get('score', 'Not instrumented')}.", coverage.get("reason", "No citation result recorded."), "This is grounded-claim coverage, not answer accuracy."),
+    ]
+    for _, happened, why, meaning in insights:
+        with st.expander(happened, expanded=True):
+            st.write("**Why:**", why); st.write("**What it means:**", meaning)
+    with st.expander("Query drill-down"):
+        choices = {_short_topic(r["raw_query"], i): r for i, r in enumerate(rows, 1)}
+        selected = choices[st.selectbox("Recorded query", list(choices))]
+        st.json({"trace": selected.get("trace", {}), "evaluation": selected.get("evaluation", {}), "answer_evaluation": selected.get("answer_evaluation", {})})
+
+
+def _render_dashboard_page(pipeline: RAGPipeline) -> None:
+    render_html(render_page_header("EVALUATION", "Evaluation Dashboard", "Calculation-visible live heuristic evaluation, separated from labelled benchmarks."))
+    rows = load_observations(pipeline.vectorstore_path)
+    if not rows:
+        st.info("No observations recorded yet."); return
+    data = {**rows[0].get("evaluation", {}).get("criteria", {}), **rows[0].get("answer_evaluation", {})}
+    formulas = {
+        "retrieval_strength": "60 + min(35, relative_gap×75), plus 5 when top candidate is in both retrievers; clamped 10–100.",
+        "direct_answer_support": "Maximum top-6 candidate support: definitional 50 + up to 30, or density path 30 + up to 20; +15 filename match; +15×term coverage; clamped 5–100.",
+        "evidence_relevance": "(direct×100 + broad×55 + tangential×10)/inspected, +10 when directly relevant evidence exists.",
+        "retriever_agreement": "50% Jaccard(Dense,BM25) + 50% top-3 overlap ratio×100.",
+        "ranking_stability": "Average top-3 Dense/BM25 survival in RRF top-5 ×100; clamped 20–100.",
+        "evidence_sufficiency": "Simple: 95/75/40 based on direct support ≥70/≥45/else; complex: term coverage×70 + min(20,chunks×6).",
+        "evidence_coherence": "Rule-based source concentration and source/query-term alignment.",
+        "facet_coverage": "Evidence-covered detected live facets / detected facets ×100.",
+        "evidence_claim_grounding": "Supported citations / citations ×100.",
+        "citation_coverage": "Fully supported claims / extracted claims ×100.",
+        "citation_correctness": "Citations with direct answer support / citations ×100.",
+    }
+    for name, metric in data.items():
+        with st.expander(f"{metric.get('label', name.replace('_', ' ').title())}: {metric.get('score', 'Not instrumented')}"):
+            st.write("**Definition:**", metric.get("definition", "Live answer/evidence check."))
+            st.write("**Actual calculation:**", formulas.get(name, "Not instrumented"))
+            st.write("**Data used:**", metric.get("metrics", metric.get("reason", "Recorded trace.")))
+            st.write("**Interpretation:**", metric.get("reason", "Higher only reflects this project-specific heuristic."))
+            st.caption("Standard vs heuristic: Project-specific heuristic, not accuracy.")
+    st.subheader("Labelled benchmark evaluation")
+    st.write("Precision@K = relevant retrieved / K; Recall@K = relevant retrieved / total relevant; MRR = 1 / rank of first relevant; nDCG@K = standard discounted gain. These require labels and are not live heuristic scores.")
+    st.caption("Latency = end-to-end request duration. Median is available in Observation; P95 is Not instrumented until enough recorded observations exist.")
+
+
+def _render_comparison_page(pipeline: RAGPipeline) -> None:
+    render_html(render_page_header("RUNTIME DIAGNOSTICS", "Query Comparison", "Compare system behavior using compact query identifiers."))
+    rows = load_observations(pipeline.vectorstore_path)
+    if len(rows) < 2:
+        st.info("Run at least two queries to compare observations."); return
+    labels = [_short_topic(r["raw_query"], i) for i, r in enumerate(rows, 1)]
+    first = rows[labels.index(st.selectbox("First query", labels, key="compare_a"))]
+    second = rows[labels.index(st.selectbox("Second query", labels, index=1, key="compare_b"))]
+    def metrics(row):
+        c, a = row.get("evaluation", {}).get("criteria", {}), row.get("answer_evaluation", {})
+        return {"Latency ms": row.get("latency_ms"), "Retrieval strength": c.get("retrieval_strength", {}).get("score"), "Agreement": c.get("retriever_agreement", {}).get("score"), "Evidence support": c.get("direct_answer_support", {}).get("score"), "Grounding": a.get("evidence_claim_grounding", {}).get("score"), "Citation coverage": a.get("citation_coverage", {}).get("score")}
+    left, right = metrics(first), metrics(second)
+    st.dataframe([{"Metric": key, labels[rows.index(first)]: left[key], labels[rows.index(second)]: right[key]} for key in left], hide_index=True, use_container_width=True)
+    changed = [f"{key}: {left[key]} → {right[key]}" for key in left if left[key] != right[key]]
+    st.subheader("What changed?"); st.write("; ".join(changed) if changed else "No recorded metric difference.")
+
+
+def _render_benchmark_page(pipeline: RAGPipeline) -> None:
+    render_html(render_page_header("EVALUATION", "Benchmark", "Labelled benchmark evaluation only; intentionally separate from live heuristic evaluation."))
+    st.write("A benchmark case supplies query, relevant_documents or relevant_chunks, expected_facets, and optional reference_answer.")
+    st.write("When labels are present: Precision@K = relevant retrieved / K; Recall@K = relevant retrieved / total relevant; MRR = 1 / rank of first relevant; nDCG@K uses standard discounted cumulative gain normalized by ideal DCG.")
+    st.info("No labelled benchmark result is stored yet. Live Retrieval Strength, Evidence Support, and Grounding are not labelled accuracy metrics.")
 
 
 if __name__ == "__main__":

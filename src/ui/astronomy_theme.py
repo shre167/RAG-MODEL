@@ -3078,3 +3078,254 @@ def render_arch_legend() -> str:
         + "".join(items)
         + "</div>"
     )
+
+
+# ============================================================================
+# OBSERVATION, EVALUATION & CITATION THEMED UI COMPONENTS
+# ============================================================================
+
+def render_retrieval_health_card(health_score: float, summary: str = "") -> str:
+    """Renders the top-level Retrieval Health Score card."""
+    score = round(float(health_score), 1)
+    if score >= 80.0:
+        color = "#4ade80"
+        border_color = "rgba(74, 222, 128, 0.35)"
+        status_label = "ROBUST"
+        glow = "rgba(74, 222, 128, 0.15)"
+    elif score >= 55.0:
+        color = "#5ec4d4"
+        border_color = "rgba(94, 196, 212, 0.35)"
+        status_label = "MODERATE"
+        glow = "rgba(94, 196, 212, 0.15)"
+    else:
+        color = "#fbbf24"
+        border_color = "rgba(251, 191, 36, 0.35)"
+        status_label = "LIMITED"
+        glow = "rgba(251, 191, 36, 0.15)"
+
+    summary_escaped = html.escape(summary) if summary else ""
+
+    return f"""
+<div style="background: radial-gradient(circle at 10% 20%, {glow}, rgba(14, 20, 36, 0.85));
+            border: 1px solid {border_color}; border-radius: 12px; padding: 1.2rem 1.4rem; margin: 0.8rem 0 1.2rem;">
+    <div style="display: flex; justify-content: space-between; align-items: center;">
+        <div>
+            <div style="color: #64748b; font-size: 0.65rem; font-weight: 700; letter-spacing: 0.15em; text-transform: uppercase;">
+                RETRIEVAL HEALTH SCORE · DETERMINISTIC RUNTIME EVALUATION
+            </div>
+            <div style="color: #e8edf7; font-size: 0.95rem; margin-top: 0.3rem; line-height: 1.4;">
+                {summary_escaped}
+            </div>
+        </div>
+        <div style="text-align: right; margin-left: 1.5rem;">
+            <div style="font-size: 2.2rem; font-weight: 800; color: {color}; line-height: 1;">
+                {score}<span style="font-size: 1.1rem; color: #64748b; font-weight: 500;">/100</span>
+            </div>
+            <div style="color: {color}; font-size: 0.65rem; font-weight: 700; letter-spacing: 0.12em; margin-top: 0.3rem;">
+                {status_label}
+            </div>
+        </div>
+    </div>
+</div>
+"""
+
+
+def render_evaluation_criterion_card(criterion_key: str, data: dict) -> str:
+    """Renders one criterion card with score, reason, definition, and supporting chunks."""
+    score = round(float(data.get("score", 0.0)), 1)
+    label = html.escape(str(data.get("label", criterion_key)))
+    definition = html.escape(str(data.get("definition", "")))
+    reason = html.escape(str(data.get("reason", "")))
+
+    if score >= 75.0:
+        bar_color = "#4ade80"
+        badge_bg = "rgba(74, 222, 128, 0.15)"
+        badge_border = "rgba(74, 222, 128, 0.35)"
+    elif score >= 50.0:
+        bar_color = "#5ec4d4"
+        badge_bg = "rgba(94, 196, 212, 0.15)"
+        badge_border = "rgba(94, 196, 212, 0.35)"
+    else:
+        bar_color = "#fbbf24"
+        badge_bg = "rgba(251, 191, 36, 0.15)"
+        badge_border = "rgba(251, 191, 36, 0.35)"
+
+    return f"""
+<div style="background: rgba(14, 20, 36, 0.7); border: 1px solid rgba(120, 150, 210, 0.16);
+            border-radius: 10px; padding: 0.9rem 1.1rem; margin-bottom: 0.7rem;">
+    <div style="display: flex; justify-content: space-between; align-items: baseline;">
+        <span style="font-weight: 600; color: #e8edf7; font-size: 0.92rem;">{label}</span>
+        <span style="background: {badge_bg}; border: 1px solid {badge_border}; color: {bar_color};
+                     padding: 0.15rem 0.6rem; border-radius: 6px; font-weight: 700; font-size: 0.85rem;">
+            {score}/100
+        </span>
+    </div>
+    <div style="background: rgba(255, 255, 255, 0.06); border-radius: 4px; height: 5px; width: 100%; margin: 0.5rem 0;">
+        <div style="background: {bar_color}; width: {min(100.0, score)}%; height: 5px; border-radius: 4px;"></div>
+    </div>
+    <div style="color: #94a3b8; font-size: 0.82rem; margin-top: 0.35rem; line-height: 1.4;">
+        {reason}
+    </div>
+    <div style="color: #64748b; font-size: 0.72rem; margin-top: 0.25rem;">
+        ◈ {definition}
+    </div>
+</div>
+"""
+
+
+def render_confidence_card(confidence: dict) -> str:
+    """Renders the Evidence-backed Confidence card with explainable reasons."""
+    level = html.escape(str(confidence.get("level", "MEDIUM")))
+    score = round(float(confidence.get("score", 50.0)), 1)
+    reasons = confidence.get("reasons", [])
+
+    if level == "HIGH":
+        color = "#4ade80"
+        border_color = "rgba(74, 222, 128, 0.35)"
+        bg_glow = "rgba(74, 222, 128, 0.12)"
+    elif level == "MEDIUM":
+        color = "#5ec4d4"
+        border_color = "rgba(94, 196, 212, 0.35)"
+        bg_glow = "rgba(94, 196, 212, 0.12)"
+    else:
+        color = "#fbbf24"
+        border_color = "rgba(251, 191, 36, 0.35)"
+        bg_glow = "rgba(251, 191, 36, 0.12)"
+
+    reason_items = "".join(
+        f'<div style="color: #cbd5e1; font-size: 0.82rem; margin-top: 0.3rem; line-height: 1.35;">{html.escape(r)}</div>'
+        for r in reasons
+    )
+
+    return f"""
+<div style="background: radial-gradient(circle at 5% 5%, {bg_glow}, rgba(14, 20, 36, 0.82));
+            border: 1px solid {border_color}; border-radius: 10px; padding: 1rem 1.2rem; margin: 0.6rem 0;">
+    <div style="display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid rgba(120,150,210,0.12); padding-bottom: 0.5rem; margin-bottom: 0.5rem;">
+        <span style="color: #64748b; font-size: 0.65rem; font-weight: 700; letter-spacing: 0.12em; text-transform: uppercase;">
+            EVIDENCE-BACKED CONFIDENCE
+        </span>
+        <span style="font-weight: 800; font-size: 0.95rem; color: {color}; letter-spacing: 0.08em;">
+            {level} · {score}/100
+        </span>
+    </div>
+    <div>
+        {reason_items}
+    </div>
+</div>
+"""
+
+
+def render_citation_card(citation: dict) -> str:
+    """Renders a claim citation with passage excerpt and verification badge."""
+    marker = html.escape(str(citation.get("marker", "")))
+    claim = html.escape(str(citation.get("claim", "")))
+    filename = html.escape(str(citation.get("filename", "unknown")))
+    chunk_id = html.escape(str(citation.get("chunk_id", "")))
+    passage = html.escape(str(citation.get("passage", "")))
+    origin = html.escape(str(citation.get("retrieval_source", "")))
+    status = citation.get("status", "supported")
+    reason = html.escape(str(citation.get("verification_reason", "")))
+    kb_ver = html.escape(str(citation.get("kb_version", "")))
+
+    if status == "supported":
+        badge = '<span style="background: rgba(74,222,128,0.15); border: 1px solid rgba(74,222,128,0.3); color: #4ade80; padding: 0.15rem 0.5rem; border-radius: 4px; font-size: 0.7rem; font-weight: 600;">✓ Supported by retrieved evidence</span>'
+        border_col = "rgba(74,222,128,0.25)"
+    elif status == "partially_supported":
+        badge = '<span style="background: rgba(94,196,212,0.15); border: 1px solid rgba(94,196,212,0.3); color: #5ec4d4; padding: 0.15rem 0.5rem; border-radius: 4px; font-size: 0.7rem; font-weight: 600;">ℹ Partially Supported</span>'
+        border_col = "rgba(94,196,212,0.25)"
+    else:
+        badge = '<span style="background: rgba(239,68,68,0.15); border: 1px solid rgba(239,68,68,0.3); color: #f87171; padding: 0.15rem 0.5rem; border-radius: 4px; font-size: 0.7rem; font-weight: 600;">⚠ Unsupported Claim</span>'
+        border_col = "rgba(239,68,68,0.35)"
+
+    return f"""
+<div style="background: rgba(14, 20, 36, 0.75); border-left: 3px solid {border_col}; border-top: 1px solid rgba(120,150,210,0.14); border-right: 1px solid rgba(120,150,210,0.14); border-bottom: 1px solid rgba(120,150,210,0.14); border-radius: 8px; padding: 0.85rem 1.1rem; margin-bottom: 0.75rem;">
+    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.4rem;">
+        <span style="font-weight: 700; color: #5ec4d4; font-size: 0.88rem;">{marker} {filename} <span style="color: #64748b; font-weight: normal; font-size: 0.8rem;">· Chunk {chunk_id} · KB v{kb_ver}</span></span>
+        {badge}
+    </div>
+    <div style="color: #e2e8f0; font-size: 0.84rem; margin-bottom: 0.45rem; font-style: italic;">
+        Claim: "{claim}"
+    </div>
+    <div style="background: rgba(7, 11, 20, 0.7); border: 1px solid rgba(120,150,210,0.12); border-radius: 6px; padding: 0.6rem 0.8rem; font-family: monospace; font-size: 0.8rem; color: #94a3b8; line-height: 1.45;">
+        {passage}
+    </div>
+    <div style="display: flex; justify-content: space-between; align-items: center; margin-top: 0.4rem; font-size: 0.72rem; color: #64748b;">
+        <span>Origin: {origin}</span>
+        <span>{reason}</span>
+    </div>
+</div>
+"""
+
+
+def render_citation_coverage_badge(coverage: dict) -> str:
+    """Renders the citation coverage badge."""
+    pct = round(float(coverage.get("coverage_percentage", 100.0)), 1)
+    has_unsupported = coverage.get("has_unsupported", False)
+    total = coverage.get("total_claims", 0)
+    supported = coverage.get("supported_claims", 0)
+
+    if not has_unsupported and pct >= 90.0:
+        color = "#4ade80"
+        bg = "rgba(74,222,128,0.15)"
+        border = "rgba(74,222,128,0.3)"
+        text = f"✓ {pct:.0f}% Citation Coverage ({supported}/{total} claims grounded)"
+    else:
+        color = "#f87171"
+        bg = "rgba(239,68,68,0.15)"
+        border = "rgba(239,68,68,0.35)"
+        text = f"⚠ {pct:.0f}% Citation Coverage ({coverage.get('unsupported_claims', 1)} unsupported claim(s))"
+
+    return f"""
+<div style="display: inline-block; background: {bg}; border: 1px solid {border}; color: {color};
+            padding: 0.25rem 0.75rem; border-radius: 6px; font-size: 0.75rem; font-weight: 600; margin: 0.3rem 0;">
+    {text}
+</div>
+"""
+
+
+def render_kb_state_card(kb_state: dict) -> str:
+    """Renders Knowledge Base state at query time."""
+    version = html.escape(str(kb_state.get("version", 1)))
+    doc_count = html.escape(str(kb_state.get("document_count", 0)))
+    chroma_chunks = html.escape(str(kb_state.get("chroma_chunks", 0)))
+    bm25_chunks = html.escape(str(kb_state.get("bm25_chunks", 0)))
+    consistent = kb_state.get("indexes_consistent", True)
+    msg = html.escape(str(kb_state.get("consistency_message", "")))
+
+    tag_col = "#4ade80" if consistent else "#fbbf24"
+    tag_bg = "rgba(74,222,128,0.15)" if consistent else "rgba(251,191,36,0.15)"
+
+    return f"""
+<div style="background: rgba(14, 20, 36, 0.75); border: 1px solid rgba(120, 150, 210, 0.16);
+            border-radius: 10px; padding: 0.9rem 1.1rem; margin: 0.6rem 0;">
+    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.5rem;">
+        <span style="font-weight: 700; color: #5ec4d4; font-size: 0.85rem; letter-spacing: 0.08em; text-transform: uppercase;">
+            KNOWLEDGE BASE STATE · QUERY REVISION v{version}
+        </span>
+        <span style="background: {tag_bg}; color: {tag_col}; padding: 0.15rem 0.55rem; border-radius: 5px; font-size: 0.72rem; font-weight: 600;">
+            {"✓ SYNCHRONIZED" if consistent else "⚠ MISMATCH"}
+        </span>
+    </div>
+    <div style="display: grid; grid-template-columns: repeat(4, 1fr); gap: 0.5rem; text-align: center; margin: 0.5rem 0;">
+        <div style="background: rgba(255,255,255,0.03); padding: 0.4rem; border-radius: 6px;">
+            <div style="color: #64748b; font-size: 0.65rem;">Documents</div>
+            <div style="color: #e2e8f0; font-weight: 700; font-size: 0.95rem;">{doc_count}</div>
+        </div>
+        <div style="background: rgba(255,255,255,0.03); padding: 0.4rem; border-radius: 6px;">
+            <div style="color: #64748b; font-size: 0.65rem;">Chroma Chunks</div>
+            <div style="color: #e2e8f0; font-weight: 700; font-size: 0.95rem;">{chroma_chunks}</div>
+        </div>
+        <div style="background: rgba(255,255,255,0.03); padding: 0.4rem; border-radius: 6px;">
+            <div style="color: #64748b; font-size: 0.65rem;">BM25 Chunks</div>
+            <div style="color: #e2e8f0; font-weight: 700; font-size: 0.95rem;">{bm25_chunks}</div>
+        </div>
+        <div style="background: rgba(255,255,255,0.03); padding: 0.4rem; border-radius: 6px;">
+            <div style="color: #64748b; font-size: 0.65rem;">KB Revision</div>
+            <div style="color: #5ec4d4; font-weight: 700; font-size: 0.95rem;">v{version}</div>
+        </div>
+    </div>
+    <div style="color: #94a3b8; font-size: 0.75rem; margin-top: 0.4rem;">
+        {msg}
+    </div>
+</div>
+"""

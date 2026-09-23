@@ -1662,10 +1662,75 @@ def build_observatory_snapshot(
             )
         ),
 
+        "evaluation": get_evaluation_diagnostics(trace),
+        "citations": get_citations_diagnostics(trace),
+        "citation_coverage": get_citation_coverage_diagnostics(trace),
+        "grounding": get_grounding_diagnostics(trace),
+        "confidence": get_confidence_diagnostics(trace),
+        "kb_state": get_kb_state_diagnostics(trace),
+        "candidate_journey": get_candidate_journey_diagnostics(trace),
+
         "trace_available": answer[
             "trace_available"
         ],
     }
+
+
+def get_evaluation_diagnostics(trace: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    trace = _as_dict(trace)
+    return _as_dict(trace.get("evaluation"))
+
+
+def get_citations_diagnostics(trace: Optional[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    trace = _as_dict(trace)
+    return _as_list(trace.get("citations"))
+
+
+def get_citation_coverage_diagnostics(trace: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    trace = _as_dict(trace)
+    return _as_dict(trace.get("citation_coverage"))
+
+
+def get_grounding_diagnostics(trace: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """Return the explicit Claim -> Evidence -> Citation post-generation chain."""
+    trace = _as_dict(trace)
+    grounding = _as_dict(trace.get("grounding"))
+    if grounding:
+        return grounding
+    # Backward-compatible reconstruction for traces recorded before grounding.
+    citations = _as_list(trace.get("citations"))
+    return {
+        "stage": "post_generation",
+        "claim_count": len(citations),
+        "claim_to_citation": [
+            {
+                "claim": item.get("claim", ""),
+                "citation": item.get("marker", ""),
+                "status": item.get("status", "unknown"),
+                "evidence": {
+                    "filename": item.get("filename", ""),
+                    "chunk_id": item.get("chunk_id", ""),
+                    "passage": item.get("passage", ""),
+                },
+            }
+            for item in citations
+        ],
+    }
+
+
+def get_confidence_diagnostics(trace: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    trace = _as_dict(trace)
+    return _as_dict(trace.get("confidence"))
+
+
+def get_kb_state_diagnostics(trace: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    trace = _as_dict(trace)
+    return _as_dict(trace.get("kb_state"))
+
+
+def get_candidate_journey_diagnostics(trace: Optional[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    trace = _as_dict(trace)
+    return _as_list(trace.get("candidate_journey"))
 
 
 # ============================================================================
