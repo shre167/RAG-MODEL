@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 from typing import Any
+import requests  # ← ADDED THIS
 
 from openai import OpenAI
 
@@ -206,50 +207,75 @@ def ask_llm(
         )
 
     # ------------------------------------------------------------------
-    # LLM request
+    # LLM request (REST API v2)
     # ------------------------------------------------------------------
 
     try:
-        normalized_base_url = (
-            resolved_base_url.strip()
+        # Build the full prompt from messages
+        system_content = next(
+            (msg["content"] for msg in messages if msg["role"] == "system"),
+            ""
         )
-
-        if not normalized_base_url.endswith("/"):
-            normalized_base_url += "/"
-
-        import httpx
-        http_client = httpx.Client(verify=False)
-
-        client = OpenAI(
-            api_key=resolved_api_key,
-            base_url=normalized_base_url,
-            http_client=http_client,
+        user_content = next(
+            (msg["content"] for msg in messages if msg["role"] == "user"),
+            ""
         )
+        
+        # Combine system and user messages into one prompt
+        full_prompt = f"{system_content}\n\n{user_content}" if system_content else user_content
 
-        response = client.chat.completions.create(
-            model=resolved_model,
-            messages=messages,
-            temperature=0.1,
+        # REST API v2 payload
+        payload = {
+            "action": "run",
+            "modelInterface": "langchain",
+            "data": {
+                "mode": "chain",
+                "text": full_prompt,
+                "modelName": resolved_model,
+                "provider": "bedrock",
+                "modelKwargs": {
+                    "maxTokens": 2048,
+                    "temperature": 0.1,
+                    "streaming": False,
+                    "topP": 0.9
+                }
+            }
+        }
+
+        logger.info(f"Calling REST API with model: {resolved_model}")
+
+        # Make REST API call
+        response = requests.post(
+            "https://api.generative.engine.capgemini.com/v2/llm/invoke",
+            json=payload,
+            headers={
+                "x-api-key": resolved_api_key,
+                "Content-Type": "application/json"
+            },
+            timeout=30,
+            verify=False  # Keep your existing SSL behavior
         )
 
         # --------------------------------------------------------------
         # Validate response
         # --------------------------------------------------------------
 
-        if not response.choices:
+        if response.status_code != 200:
             logger.error(
-                "Language model returned no choices."
+                f"Language model API returned status {response.status_code}: {response.text[:200]}"
             )
 
             if trace is not None:
-                trace["status"] = "empty_choices"
+                trace["status"] = f"api_error_{response.status_code}"
 
             return (
-                "The language model returned "
-                "no response."
+                "The language model request failed. "
+                "Please check the model configuration and connectivity."
             )
 
-        content = response.choices[0].message.content
+        # Parse JSON response
+        response_data = response.json()
+        content = response_data.get("content", "")
 
         if not content:
             logger.error(
@@ -275,24 +301,44 @@ def ask_llm(
                 }
             )
 
+        logger.info(f"Successfully received response: {len(answer)} characters")
+
         return answer
 
-    except Exception as exc:
-        logger.exception(
-            "LLM request failed: %s",
-            exc,
+    except requests.exceptions.Timeout:
+        logger.error("Request to language model timed out after 30 seconds")
+        
+        if trace is not None:
+            trace["status"] = "timeout"
+        
+        return (
+            "The language model request timed out. "
+            "Please try again."
         )
+
+    except requests.exceptions.RequestException as req_exc:
+        logger.error(f"Network error calling language model: {req_exc}")
+        
+        if trace is not None:
+            trace["status"] = "network_error"
+        
+        return (
+            "A network error occurred while calling the language model. "
+            "Please check your connection and try again."
+        )
+
+    except Exception as exc:
+        import traceback
+
+        print("\n========== LLM ERROR ==========")
+        traceback.print_exc()
+        print("MODEL =", resolved_model)
+        print("BASE_URL =", resolved_base_url)
+        print("ERROR =", repr(exc))
+        print("================================\n")
 
         if trace is not None:
-            trace.update(
-                {
-                    "status": "error",
-                    "error": str(exc),
-                }
-            )
+            trace["status"] = "exception"
+            trace["error"] = str(exc)
 
-        return (
-            "The language model request failed. "
-            "Please check the model configuration "
-            "and connectivity."
-        )
+        raise
