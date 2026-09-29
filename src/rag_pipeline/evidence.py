@@ -815,12 +815,42 @@ def evaluate_evidence(
         )
 
     # --------------------------------------------------------------
+    # Supporting candidates
+    #
+    # Check lexical or direct support across the ranked pool,
+    # not just the single top-ranked-by-score candidate. A chunk
+    # can win on raw term frequency without being the chunk that
+    # actually answers the question.
+    # --------------------------------------------------------------
+
+    supported = [
+        candidate
+        for candidate in ranked
+        if (
+            _has_lexical_support(
+                candidate,
+                query_tokens,
+            )
+            or _has_direct_text_support(
+                candidate,
+                query_tokens,
+            )
+        )
+    ]
+
+    best_supported = supported[0] if supported else None
+
+    # --------------------------------------------------------------
     # Strong BM25
     # --------------------------------------------------------------
 
     strong = bool(
-        top.bm25_rank == 0
-        and lexical
+        best_supported is not None
+        and best_supported.bm25_rank == 0
+        and _has_lexical_support(
+            best_supported,
+            query_tokens,
+        )
     )
 
     # --------------------------------------------------------------
@@ -828,12 +858,9 @@ def evaluate_evidence(
     # --------------------------------------------------------------
 
     moderate = bool(
-        top.bm25_rank is not None
-        and top.bm25_rank <= 2
-        and (
-            lexical
-            or direct
-        )
+        best_supported is not None
+        and best_supported.bm25_rank is not None
+        and best_supported.bm25_rank <= 5
     )
 
     if not moderate:
@@ -856,7 +883,7 @@ def evaluate_evidence(
         )
 
     final = select_context_candidates(
-        ranked,
+        supported,
         reranked=False,
     )
 

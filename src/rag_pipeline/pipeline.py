@@ -1832,6 +1832,9 @@ class RAGPipeline:
         opt_result = optimize_context(
             final_candidates,
             search_text,
+            max_context_chars=MAX_CONTEXT_CHARS,
+            max_chunks=MAX_CONTEXT_CHUNKS,
+            max_chunks_per_source=MAX_CHUNKS_PER_SOURCE,
         )
 
         final_candidates = opt_result["selected"]

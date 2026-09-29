@@ -1,6 +1,11 @@
 from __future__ import annotations
-
 from typing import Any
+
+from src.rag_pipeline.config import (
+    MAX_CHUNKS_PER_SOURCE,
+    MAX_CONTEXT_CHARS,
+    MAX_CONTEXT_CHUNKS,
+)
 
 
 def _safe_int(value: Any, default: int) -> int:
@@ -42,29 +47,39 @@ def _get_source(chunk: Any) -> str:
 def optimize_context(
     chunks: list[Any],
     search_text: str = "",
-    max_context_chars: int = 18000,
-    max_chunks: int = 5,
-    max_chunks_per_source: int = 3,
+    max_context_chars: int = MAX_CONTEXT_CHARS,
+    max_chunks: int = MAX_CONTEXT_CHUNKS,
+    max_chunks_per_source: int = MAX_CHUNKS_PER_SOURCE,
 ) -> dict[str, Any]:
     """
     Reduce retrieved candidates to a manageable context while preserving
     the original Candidate objects.
 
+    IMPORTANT:
+    Defaults now come from src.rag_pipeline.config, the same module used
+    by context.py and fallback.py. Previously this function defined its
+    own hardcoded defaults (18000 chars / 5 chunks / 3 per source), and
+    pipeline.py's call site never overrode them, so this second-pass
+    optimizer silently applied different, smaller limits than the ones
+    already enforced earlier in the pipeline by select_context_candidates().
+    That mismatch capped every answer at 5 chunks regardless of the
+    configured MAX_CONTEXT_CHUNKS value.
+
     Compatible with the existing pipeline.py contract.
     """
 
-    max_context_chars = _safe_int(max_context_chars, 18000)
-    max_chunks = _safe_int(max_chunks, 5)
-    max_chunks_per_source = _safe_int(max_chunks_per_source, 3)
+    max_context_chars = _safe_int(max_context_chars, MAX_CONTEXT_CHARS)
+    max_chunks = _safe_int(max_chunks, MAX_CONTEXT_CHUNKS)
+    max_chunks_per_source = _safe_int(max_chunks_per_source, MAX_CHUNKS_PER_SOURCE)
 
     if max_context_chars <= 0:
-        max_context_chars = 18000
+        max_context_chars = MAX_CONTEXT_CHARS
 
     if max_chunks <= 0:
-        max_chunks = 5
+        max_chunks = MAX_CONTEXT_CHUNKS
 
     if max_chunks_per_source <= 0:
-        max_chunks_per_source = 3
+        max_chunks_per_source = MAX_CHUNKS_PER_SOURCE
 
     search_text = str(search_text or "").strip()
 
@@ -192,21 +207,13 @@ def optimize_context(
     }
 
     return {
-        # Existing pipeline expects this.
         "selected": selected,
-
-        # Existing pipeline expects this key.
         "removed": removed,
-
-        # Useful compatibility aliases.
         "input_chunks": input_chunks,
         "output_chunks": output_chunks,
         "input_chars": input_chars,
         "output_chars": output_chars,
-
-        # Existing pipeline expects this.
         "stats": stats,
-
         "search_text": search_text,
         "steps": steps,
     }

@@ -15,20 +15,48 @@ def _split_into_claims(answer: str) -> list[str]:
         line = line.strip()
         if not line:
             continue
-        if re.match(r"^(?:sources|confidence|references|note):\b", line, re.I):
+        # Header words followed by a colon (e.g. "Sources:", "Details:")
+        # are presentation-only and must not be treated as claims.
+        # NOTE: the colon itself is not a word-boundary character, so the
+        # boundary check must occur before it, not immediately after it.
+        if re.match(r"^(?:sources|confidence|references|note|details|summary)\s*:", line, re.I):
             break
         lines.append(re.sub(r"^(?:[-*]|\d+\.)\s+", "", line))
     return [s.strip() for s in re.split(r"(?<=[.!?])\s+", " ".join(lines)) if len(s.strip()) >= 15]
 
 
+def _extract_entities(claim: str) -> set[str]:
+    """Proper nouns in the claim, lowercased, excluding the very first word."""
+    return {
+        term.lower()
+        for term in re.findall(r"(?<!^)\b[A-Z][A-Za-z0-9-]+\b", claim)
+    }
+
+
 def _find_best_passage_in_chunk(claim: str, text: str) -> tuple[str, float]:
+    """
+    Find the sentence in the chunk that best supports the claim.
+
+    Sentences containing more of the claim's named entities (people,
+    titles, proper nouns) are preferred over sentences that merely share
+    generic vocabulary. Generic word overlap is used only as a
+    tiebreaker among sentences with equal entity coverage. Without this,
+    a topically similar sentence lacking the actual named subject can
+    outscore the sentence that truly supports the claim.
+    """
     claim_terms = set(re.findall(r"[a-z0-9]+", claim.lower())) - _STOPWORDS
-    best, best_score = "", 0.0
+    claim_entities = _extract_entities(claim)
+
+    best, best_score, best_entity_hits = "", 0.0, -1
+
     for sentence in re.split(r"(?<=[.!?])\s+", text.strip()):
         terms = set(re.findall(r"[a-z0-9]+", sentence.lower())) - _STOPWORDS
         score = len(claim_terms & terms) / max(1, len(claim_terms))
-        if score > best_score:
-            best, best_score = sentence.strip(), score
+        entity_hits = len(claim_entities & terms)
+
+        if (entity_hits, score) > (best_entity_hits, best_score):
+            best, best_score, best_entity_hits = sentence.strip(), score, entity_hits
+
     return (best or text[:250].strip()), best_score
 
 
