@@ -783,6 +783,8 @@ class RAGPipeline:
                 file_path
             )
 
+        filename = file_path.name
+
         # --------------------------------------------------------------
         # Resolve target path & content bytes
         # --------------------------------------------------------------
@@ -1500,6 +1502,16 @@ class RAGPipeline:
             for c in candidates.values():
                 if c.bm25_rank is not None:
                     c.in_bm25 = True
+        elif retrieval_mode == "vector" and not candidates and self.bm25 is not None:
+            # Resilient fallback: if dense returned 0 candidates, fallback to BM25
+            logger.info("Dense retrieval yielded no results; falling back to BM25.")
+            self._bm25_retrieve(
+                search_text,
+                candidates,
+            )
+            for c in candidates.values():
+                if c.bm25_rank is not None:
+                    c.in_bm25 = True
 
         # OBSERVATORY: snapshot raw BM25 results (ranks now populated)
         raw_bm25_results = [
@@ -1516,36 +1528,40 @@ class RAGPipeline:
         # --------------------------------------------------------------
 
         if not candidates:
-            if self.bm25 is not None:
-                return {
-                    "answer": ABSTAIN_MESSAGE,
-                    "sources": [],
-                    "retrieved_chunks": [],
-                    "num_retrieved": 0,
-                    "evidence": {
-                        "level": "none",
-                        "should_answer": False,
-                        "top_score": 0.0,
-                        "score_source": "retrieval",
-                        "supporting_chunks": 0,
-                        "top_gap": None,
-                        "agreement": False,
-                        "top_percentile": None,
-                        "retrieval_mode": retrieval_mode,
-                        "reason": (
-                            f"No usable candidates were retrieved "
-                            f"in {retrieval_mode} mode."
-                        ),
-                    },
-                    "response_type": "abstain",
-                }
-
             fallback_response = (
                 self._answer_via_keyword_fallback(
                     question,
                     search_text,
                 )
             )
+            if fallback_response and fallback_response.get("sources"):
+                fallback_response.setdefault("response_type", "fallback")
+                fallback_response.setdefault("retrieval_mode", retrieval_mode)
+                return fallback_response
+
+            return {
+                "answer": ABSTAIN_MESSAGE,
+                "sources": [],
+                "retrieved_chunks": [],
+                "num_retrieved": 0,
+                "evidence": {
+                    "level": "none",
+                    "should_answer": False,
+                    "top_score": 0.0,
+                    "score_source": "retrieval",
+                    "supporting_chunks": 0,
+                    "top_gap": None,
+                    "agreement": False,
+                    "top_percentile": None,
+                    "retrieval_mode": retrieval_mode,
+                    "reason": (
+                        f"No usable candidates were retrieved "
+                        f"in {retrieval_mode} mode."
+                    ),
+                },
+                "response_type": "abstain",
+                "retrieval_mode": retrieval_mode,
+            }
 
             fallback_response.setdefault(
                 "response_type",
@@ -1887,13 +1903,27 @@ class RAGPipeline:
         )
 
         # --------------------------------------------------------------
+        # CHECK IF LLM FAILED - Skip citation/confidence if so
+        # --------------------------------------------------------------
+        llm_failed = (
+            generation_trace.get('status') == 'error' 
+            or 'language model request failed' in raw_answer.lower()
+            or 'could not generate' in raw_answer.lower()
+        )
+
+        # --------------------------------------------------------------
         # 16. POST-GENERATION GROUNDING & CLAIM CITATIONS
         # --------------------------------------------------------------
-        citations, citation_coverage = generate_claim_citations(
-            raw_answer,
-            final_candidates,
-            kb_version=kb_state.get("version", 1),
-        )
+        if llm_failed:
+            # LLM failed - skip citation processing
+            from src.rag_pipeline.models import CitationCoverage
+            citations, citation_coverage = [], CitationCoverage(0, 0, 0, 100.0, False, [])
+        else:
+            citations, citation_coverage = generate_claim_citations(
+                raw_answer,
+                final_candidates,
+                kb_version=kb_state.get("version", 1),
+            )
         answer_evaluation = evaluate_answer_quality(
             question, raw_answer, citations, citation_coverage, final_candidates
         )
@@ -1922,18 +1952,29 @@ class RAGPipeline:
         # --------------------------------------------------------------
         # 17. EVIDENCE-BACKED CONFIDENCE
         # --------------------------------------------------------------
-        confidence_result = evaluate_confidence(
-            evaluation=eval_result,
-            citations=citations,
-            citation_coverage=citation_coverage,
-            evidence_level=evidence.level,
-        )
+        if llm_failed:
+            # LLM failed - don't show misleading confidence
+            from src.rag_pipeline.models import ConfidenceResult
+            confidence_result = ConfidenceResult(
+                level="N/A",
+                score=0.0,
+                reasons=["LLM generation failed - cannot compute confidence"],
+                supporting_evidence=[]
+            )
+            answer = raw_answer  # Don't append confidence message
+        else:
+            confidence_result = evaluate_confidence(
+                evaluation=eval_result,
+                citations=citations,
+                citation_coverage=citation_coverage,
+                evidence_level=evidence.level,
+            )
 
-        answer = (
-            f"{raw_answer}\n\n"
-            f"Evidence-backed Confidence: {confidence_result.level} "
-            f"({evidence.level.title()} evidence)"
-        )
+            answer = (
+                f"{raw_answer}\n\n"
+                f"Evidence-backed Confidence: {confidence_result.level} "
+                f"({evidence.level.title()} evidence)"
+            )
 
         opt_trace: dict[str, Any] = {
             **opt_result["stats"],
