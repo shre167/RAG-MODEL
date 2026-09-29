@@ -260,6 +260,8 @@ def bm25_retrieve(
                 "total_section_chunks",
                 "category",
                 "has_heading",
+                "file_type",
+                "page_number",
             ):
                 value = result.get(field_name)
 

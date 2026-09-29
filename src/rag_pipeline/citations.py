@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+from pathlib import Path
 
 from src.rag_pipeline.models import Candidate, Citation, CitationCoverage
 
@@ -84,6 +85,15 @@ def generate_claim_citations(answer: str, selected_candidates: list[Candidate], 
             partial += 1
         else:
             unsupported.append(display_claim)
+
+        meta = candidate.metadata if candidate else {}
+        file_type = meta.get("file_type") or (Path(candidate.filename).suffix.lstrip(".").lower() if candidate and candidate.filename else "")
+        page_num = meta.get("page_number")
+        try:
+            page_number = int(page_num) if page_num and int(page_num) > 0 else None
+        except (ValueError, TypeError):
+            page_number = None
+
         citations.append(Citation(
             id=claim_id, marker=f"[{claim_id}]", claim=display_claim,
             filename=candidate.filename if status != "unsupported" or explicit else "None",
@@ -94,6 +104,8 @@ def generate_claim_citations(answer: str, selected_candidates: list[Candidate], 
             verification_reason=f"{status.replace('_', ' ').title()}: {detail} (term coverage: {support_score:.0%})",
             kb_version=kb_version, support_score=support_score, lexical_overlap=lexical,
             direct_answer_support=status == "supported",
+            file_type=file_type,
+            page_number=page_number,
         ))
     total = len(claims)
     return citations, CitationCoverage(

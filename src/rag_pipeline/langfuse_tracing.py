@@ -37,18 +37,28 @@ def _chunk_rows(items: list[dict[str, Any]], *, score_key: str) -> list[dict[str
     """Format chunk data for Langfuse observation output."""
     rows: list[dict[str, Any]] = []
     for index, item in enumerate(items, start=1):
+        filename = item.get("filename") or ""
+        file_type = item.get("file_type") or ""
+        page_number = item.get("page_number") or 0
+        if (file_type == "pdf" or filename.lower().endswith(".pdf")) and page_number > 0:
+            source_label = f"{filename} — p. {page_number}"
+        else:
+            source_label = item.get("source_label") or filename
         rows.append(
             {
                 "rank": item.get("dense_rank")
                 or item.get("bm25_rank")
                 or index,
-                "filename": item.get("filename"),
+                "filename": filename,
                 "chunk_id": item.get("chunk_id"),
                 "text_preview": (item.get("text") or "")[:240],
                 score_key: item.get(score_key),
                 "rrf_score": item.get("rrf_score"),
                 "dense_rank": item.get("dense_rank"),
                 "bm25_rank": item.get("bm25_rank"),
+                "file_type": file_type,
+                "page_number": page_number,
+                "source_label": source_label,
             }
         )
     return rows

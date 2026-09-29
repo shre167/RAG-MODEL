@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+from pathlib import Path
 from typing import Any
 
 from src.rag_pipeline.config import (
@@ -392,13 +393,24 @@ def build_context(
         )
 
         metadata = candidate.metadata or {}
+        file_type = metadata.get("file_type") or (Path(filename).suffix.lstrip(".").lower() if filename else "")
+        page_num = metadata.get("page_number")
+        try:
+            page_number = int(page_num) if page_num and int(page_num) > 0 else None
+        except (ValueError, TypeError):
+            page_number = None
 
-        if filename not in seen_sources:
-            seen_sources.add(filename)
-            source_names.append(filename)
+        if (file_type == "pdf" or filename.lower().endswith(".pdf")) and page_number is not None:
+            source_display = f"{filename} — p. {page_number}"
+        else:
+            source_display = filename
+
+        if source_display not in seen_sources:
+            seen_sources.add(source_display)
+            source_names.append(source_display)
 
         context_parts.append(
-            f"[Source {index}: {filename}]\n"
+            f"[Source {index}: {source_display}]\n"
             f"{text}"
         )
 
@@ -409,6 +421,9 @@ def build_context(
                 "chunk_id": candidate.chunk_id,
                 "text": text,
                 "metadata": metadata,
+                "file_type": file_type,
+                "page_number": page_number if page_number is not None else 0,
+                "source_label": source_display,
                 "dense_rank": candidate.dense_rank,
                 "dense_distance": candidate.dense_distance,
                 "bm25_rank": candidate.bm25_rank,

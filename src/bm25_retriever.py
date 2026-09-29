@@ -85,9 +85,13 @@ class BM25Retriever:
 
         self._chunks = []
         self._tokenized = []
+        file_contents: Dict[str, List[str]] = {}
+        for doc in docs:
+            fname = str(doc.get("filename", ""))
+            file_contents.setdefault(fname, []).append(str(doc.get("content", "")))
         self._document_hashes = {
-            str(doc.get("filename", "")): self._file_hash(str(doc.get("content", "")))
-            for doc in docs
+            fname: self._file_hash("\n\n".join(parts))
+            for fname, parts in file_contents.items()
         }
 
         seen_keys: set[str] = set()
@@ -218,9 +222,13 @@ class BM25Retriever:
         if not path:
             return False
         docs = load_documents(path)
+        file_contents: Dict[str, List[str]] = {}
+        for doc in docs:
+            fname = str(doc.get("filename", ""))
+            file_contents.setdefault(fname, []).append(str(doc.get("content", "")))
         current = {
-            str(doc.get("filename", "")): self._file_hash(str(doc.get("content", "")))
-            for doc in docs
+            fname: self._file_hash("\n\n".join(parts))
+            for fname, parts in file_contents.items()
         }
         return current == self._document_hashes
 
@@ -250,8 +258,10 @@ class BM25Retriever:
 
     @staticmethod
     def _extract_chunk_meta(c: Dict[str, Any]) -> Dict[str, Any]:
+        fname = c.get("filename", "")
+        suffix = Path(fname).suffix.lstrip(".").lower() if fname else ""
         return {
-            "filename": c.get("filename", ""),
+            "filename": fname,
             "chunk_id": c.get("chunk_id", ""),
             "text": c.get("text", ""),
             "source_path": c.get("source_path", ""),
@@ -262,4 +272,6 @@ class BM25Retriever:
             "total_section_chunks": c.get("total_section_chunks", 0),
             "category": c.get("category", ""),
             "has_heading": c.get("has_heading", False),
+            "file_type": c.get("file_type") or suffix or "txt",
+            "page_number": int(c.get("page_number", 0) or 0),
         }

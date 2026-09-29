@@ -5,7 +5,7 @@ import os
 from pathlib import Path
 
 from src.config import KNOWLEDGE_BASE_DIR, VECTORSTORE_DIR
-from src.document_loader import list_txt_files
+from src.document_loader import list_knowledge_files
 from src.rag_pipeline import RAGPipeline
 
 
@@ -25,10 +25,10 @@ def main() -> int:
     base_dir.mkdir(parents=True, exist_ok=True)
     vector_dir.mkdir(parents=True, exist_ok=True)
 
-    files = list_txt_files(base_dir)
+    files = list_knowledge_files(base_dir)
     if not files:
         print(
-            "No .txt files were found in knowledge_base/. "
+            "No supported knowledge files (.txt, .md, .docx, .pdf) were found in knowledge_base/. "
             "Add files there and run this command again."
         )
         return 0
