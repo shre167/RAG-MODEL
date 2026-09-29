@@ -7,7 +7,7 @@ from pathlib import Path
 import streamlit as st
 
 from src.config import KNOWLEDGE_BASE_DIR, VECTORSTORE_DIR
-from src.document_loader import chunk_documents, list_txt_files, load_documents
+from src.document_loader import chunk_documents, list_txt_files, list_knowledge_files, load_documents
 from src.rag_pipeline import RAGPipeline
 from src.rag_pipeline.observation_store import load_observations
 from src.rag_pipeline.observatory import (
@@ -448,7 +448,7 @@ def _kb_signature(kb_path: Path) -> tuple:
     signature = []
 
     try:
-        for path in sorted(list_txt_files(kb_path)):
+        for path in sorted(list_knowledge_files(kb_path)):
             stat = path.stat()
             signature.append((path.name, stat.st_size, int(stat.st_mtime)))
     except Exception:  # noqa: BLE001
@@ -715,20 +715,17 @@ def _ingest_uploaded_file(pipeline: RAGPipeline, uploaded, rerun: bool = False):
     """
     Run the existing incremental ingestion path for an uploaded file.
 
+    Reads raw bytes so that DOCX and PDF files are hashed and extracted correctly.
     This calls pipeline.ingest_file(...) unchanged. Existing chunks are
     never removed by this operation.
     """
-    try:
-        content = uploaded.getvalue().decode("utf-8", errors="ignore")
-    except Exception as exc:  # noqa: BLE001
-        st.error(f"Could not read {uploaded.name}: {exc}")
-        return None
+    raw_bytes: bytes = uploaded.getvalue()
 
     with st.spinner(f"Ingesting {uploaded.name} …"):
         try:
             result = pipeline.ingest_file(
                 file_path=uploaded.name,
-                content=content,
+                content=raw_bytes,
             )
         except Exception as exc:  # noqa: BLE001
             _service_error("INGESTION SERVICE UNAVAILABLE", exc)
@@ -737,7 +734,7 @@ def _ingest_uploaded_file(pipeline: RAGPipeline, uploaded, rerun: bool = False):
 
     result = dict(result or {})
     result["_filename"] = uploaded.name
-    result["_characters"] = len(content)
+    result["_characters"] = len(raw_bytes)
 
     st.session_state.last_ingestion = result
 
@@ -1089,13 +1086,13 @@ def _render_custom_composer(pipeline: RAGPipeline):
         with st.popover("＋", help="Add knowledge to the knowledge base"):
             st.markdown("**Add knowledge**")
             st.caption(
-                "Upload a TXT or Markdown file. Indexing is incremental, "
+                "Upload a TXT, Markdown, DOCX, or PDF file. Indexing is incremental, "
                 "so existing knowledge is preserved."
             )
 
             uploaded = st.file_uploader(
                 "Choose a file",
-                type=["txt", "md"],
+                type=["txt", "md", "docx", "pdf"],
                 key="composer_file_uploader",
                 label_visibility="collapsed",
             )
@@ -1639,8 +1636,8 @@ def _ingestion_tab_real(pipeline: RAGPipeline) -> None:
     )
 
     uploaded = st.file_uploader(
-        "Upload a TXT or Markdown file",
-        type=["txt", "md"],
+        "Upload a TXT, Markdown, DOCX, or PDF file",
+        type=["txt", "md", "docx", "pdf"],
         key="ingestion_page_uploader",
     )
 
@@ -2028,7 +2025,7 @@ def _render_chunk_monitor(pipeline: RAGPipeline) -> None:
         )
     )
 
-    files = list_txt_files(Path(KNOWLEDGE_BASE_DIR))
+    files = list_knowledge_files(Path(KNOWLEDGE_BASE_DIR))
 
     if not files:
         st.info("No TXT or Markdown files were found in the knowledge base.")
@@ -2794,3 +2791,5 @@ def _render_benchmark_page(pipeline: RAGPipeline) -> None:
 
 if __name__ == "__main__":
     main()
+
+

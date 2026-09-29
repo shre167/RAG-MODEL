@@ -273,6 +273,15 @@ class Citation:
     lexical_overlap: float = 0.0
     direct_answer_support: bool = False
 
+    file_type: str = ""
+    page_number: int | None = None
+
+    @property
+    def source_label(self) -> str:
+        if (self.file_type == "pdf" or self.filename.lower().endswith(".pdf")) and self.page_number and self.page_number > 0:
+            return f"{self.filename} — p. {self.page_number}"
+        return self.filename
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "id": self.id,
@@ -288,6 +297,9 @@ class Citation:
             "support_score": round(self.support_score, 3),
             "lexical_overlap": round(self.lexical_overlap, 3),
             "direct_answer_support": self.direct_answer_support,
+            "file_type": self.file_type,
+            "page_number": self.page_number,
+            "source_label": self.source_label,
         }
 
 

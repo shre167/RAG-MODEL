@@ -26,7 +26,9 @@ from src.config import (
 )
 from src.document_loader import (
     chunk_documents,
+    list_knowledge_files,
     list_txt_files,
+    load_document,
     load_documents,
 )
 from src.embeddings import EmbeddingService
@@ -448,7 +450,7 @@ class RAGPipeline:
     # ==================================================================
 
     def status(self) -> dict[str, Any]:
-        files = list_txt_files(
+        files = list_knowledge_files(
             self.knowledge_base_path
         )
 
@@ -556,7 +558,7 @@ class RAGPipeline:
 
         if not docs:
             raise ValueError(
-                "No .txt files were found in the knowledge base."
+                "No knowledge files were found in the knowledge base."
             )
 
         chunks = chunk_documents(
@@ -782,13 +784,15 @@ class RAGPipeline:
             )
 
         # --------------------------------------------------------------
-        # Resolve target path
+        # Resolve target path & content bytes
         # --------------------------------------------------------------
+
+        raw_bytes: bytes
 
         if content is not None:
             target = (
                 self.knowledge_base_path
-                / file_path.name
+                / filename
             )
 
             target.parent.mkdir(
@@ -796,10 +800,15 @@ class RAGPipeline:
                 exist_ok=True,
             )
 
-            target.write_text(
-                content,
-                encoding="utf-8",
-            )
+            if isinstance(content, bytes):
+                target.write_bytes(content)
+                raw_bytes = content
+            else:
+                target.write_text(
+                    content,
+                    encoding="utf-8",
+                )
+                raw_bytes = content.encode("utf-8")
 
             file_path = target
 
@@ -815,21 +824,14 @@ class RAGPipeline:
                     f"File not found: {file_path}"
                 )
 
-            content = file_path.read_text(
-                encoding="utf-8",
-                errors="ignore",
-            )
-
-        filename = file_path.name
+            raw_bytes = file_path.read_bytes()
 
         # --------------------------------------------------------------
         # Hash
         # --------------------------------------------------------------
 
         file_hash = hashlib.sha256(
-            content.encode(
-                "utf-8"
-            )
+            raw_bytes
         ).hexdigest()
 
         manifest = self._load_manifest()
@@ -868,22 +870,18 @@ class RAGPipeline:
         # Clean + chunk
         # --------------------------------------------------------------
 
-        from src.document_loader import (
-            clean_text as _clean_text,
+        docs = load_document(
+            file_path,
+            content=raw_bytes,
         )
 
-        doc = {
-            "filename": filename,
-            "source_path": str(
-                file_path
-            ),
-            "content": _clean_text(
-                content
-            ),
-        }
+        if not docs:
+            raise ValueError(
+                f"No extractable content found in {filename}."
+            )
 
         new_chunks = chunk_documents(
-            [doc],
+            docs,
             chunk_size=self.chunk_size,
             chunk_overlap=self.chunk_overlap,
         )
@@ -1208,6 +1206,19 @@ class RAGPipeline:
             "total_section_chunks": chunk.get(
                 "total_section_chunks",
                 0,
+            ),
+            "file_type": chunk.get(
+                "file_type",
+                "",
+            )
+            or Path(chunk.get("filename", "")).suffix.lstrip(".").lower()
+            or "txt",
+            "page_number": int(
+                chunk.get(
+                    "page_number",
+                    0,
+                )
+                or 0
             ),
         }
 
