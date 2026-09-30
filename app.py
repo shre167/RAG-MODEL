@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import json
+import logging
 import os
 import time
+from datetime import datetime
 from pathlib import Path
 
 import streamlit as st
@@ -91,26 +94,31 @@ MODES = {
 SEGMENT_TO_MODE = {MODES[key]["segment"]: key for key in MODE_ORDER}
 
 PAGE_MISSION = "Mission Control"
+PAGE_CHAT_HISTORY = "Chat History"
 PAGE_LAB = "Retrieval Lab"
 PAGE_OBSERVATION = "Observation & Evaluation"
 PAGE_DASHBOARD = "Evaluation Dashboard"
-PAGE_BENCHMARK = "Benchmark"
 PAGE_COMPARISON = "Query Comparison"
 PAGE_INGEST = "Ingestion Pipeline"
-PAGE_CHUNKS = "Chunk Monitor"
+PAGE_CHUNKS = "Database"
 PAGE_ARCH = "System Architecture"
 
 # (group label, [(page, icon)])
 NAV_GROUPS = [
+    ("Database & History", [
+        (PAGE_CHAT_HISTORY, "💬"),
+        (PAGE_CHUNKS, "🧩"),
+    ]),
+    ("Mission Control", [
+        (PAGE_MISSION, "🌌"),
+    ]),
+    ("Retrieval", [(PAGE_LAB, "🔬")]),
+    ("Knowledge Base", [(PAGE_INGEST, "📥")]),
     ("Evaluation", [
         (PAGE_OBSERVATION, "Observation"),
         (PAGE_DASHBOARD, "Dashboard"),
-        (PAGE_BENCHMARK, "Benchmark"),
         (PAGE_COMPARISON, "Compare"),
     ]),
-    ("Mission Control", [(PAGE_MISSION, "🌌")]),
-    ("Retrieval", [(PAGE_LAB, "🔬")]),
-    ("Knowledge Base", [(PAGE_INGEST, "📥"), (PAGE_CHUNKS, "🧩")]),
     ("System", [(PAGE_ARCH, "🛰")]),
 ]
 
@@ -991,8 +999,16 @@ def _render_mission_control(
     # ----------------------------------------------------------------
     # HISTORY
     # ----------------------------------------------------------------
-    if "chat_history" not in st.session_state:
-        st.session_state.chat_history = []
+    if "chat_history" not in st.session_state or st.session_state.chat_history is None:
+        st.session_state.chat_history = _load_persistent_chat_history(pipeline.vectorstore_path)
+
+    if st.session_state.chat_history:
+        _, clear_col = st.columns([8.8, 1.2])
+        with clear_col:
+            if st.button("🗑 Clear", key="clear_chat_mc", help="Clear conversation history"):
+                st.session_state.chat_history = []
+                _clear_persistent_chat_history(pipeline.vectorstore_path)
+                st.rerun()
 
     if not st.session_state.chat_history:
         st.info(
@@ -1054,10 +1070,17 @@ def _render_mission_control(
         st.markdown(answer)
         _render_answer_extras(meta)
 
-    st.session_state.chat_history.append({"role": "user", "content": question})
-    st.session_state.chat_history.append(
-        {"role": "assistant", "content": answer, "meta": meta}
-    )
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    user_entry = {"role": "user", "content": question, "timestamp": now_str}
+    assistant_entry = {
+        "role": "assistant",
+        "content": answer,
+        "meta": meta,
+        "timestamp": now_str,
+    }
+    st.session_state.chat_history.append(user_entry)
+    st.session_state.chat_history.append(assistant_entry)
+    _save_persistent_chat_turn(pipeline.vectorstore_path, user_entry, assistant_entry)
 
     st.rerun()
 
@@ -2019,180 +2042,363 @@ def _lab_section_generation(generation: dict) -> None:
 def _render_chunk_monitor(pipeline: RAGPipeline) -> None:
     render_html(
         render_page_header(
-            "DOCUMENT INSPECTION",
-            "Chunk Monitor",
-            "How each document is divided before it reaches the index.",
+            "STORAGE & INDEX INSPECTOR",
+            "Index & Chunk Inspector",
+            "Live inspection of what is stored in Chroma Vector DB, BM25 Lexical Index, and source documents.",
         )
     )
 
-    files = list_knowledge_files(Path(KNOWLEDGE_BASE_DIR))
+    tab_chroma, tab_bm25, tab_chunks = st.tabs([
+        "🗄 Vector Chroma DB",
+        "📚 BM25 Lexical Index",
+        "📄 Document Chunks",
+    ])
 
-    if not files:
-        st.info("No TXT or Markdown files were found in the knowledge base.")
-        return
-
-    chunks = _load_chunks(pipeline)
-
-    if not chunks:
-        st.warning(
-            "Chunks could not be computed for preview. The index itself is "
-            "unaffected."
-        )
-        return
-
-    size, overlap = _chunk_config(pipeline)
-
-    # ----------------------------------------------------------------
-    # OVERVIEW
-    # ----------------------------------------------------------------
-    render_html(render_section_title("Knowledge base overview"))
-
-    _dataframe([
-            {
-                "Document": path.name,
-                "Chunks": len(
-                    [c for c in chunks if c.get("filename") == path.name]
-                ),
-                "Characters": _document_characters(path),
-            }
-            for path in files
-        ])
-
-    # ----------------------------------------------------------------
-    # DOCUMENT SELECTOR
-    # ----------------------------------------------------------------
-    render_html(render_section_title("Document"))
-
-    selected_name = st.selectbox(
-        "Select a document",
-        [path.name for path in files],
-    )
-
-    selected_path = next(
-        (path for path in files if path.name == selected_name),
-        None,
-    )
-
-    selected_chunks = [
-        c for c in chunks if c.get("filename") == selected_name
-    ]
-
-    if not selected_chunks:
-        st.info("This document produced no non-empty chunks.")
-        return
-
-    file_size = None
-
-    if selected_path is not None:
+    # ================================================================
+    # TAB 1: VECTOR CHROMA DB
+    # ================================================================
+    with tab_chroma:
+        render_html(render_section_title("Chroma Vector Store — Live Vectors & Chunks"))
         try:
-            file_size = selected_path.stat().st_size
-        except Exception:  # noqa: BLE001
-            file_size = None
+            col_count = pipeline.vector_store.get_collection_count()
+            dim = pipeline.vector_store.get_collection_embedding_dimension()
+            col_name = pipeline.vector_store.collection_name
+        except Exception as exc:  # noqa: BLE001
+            st.warning(f"Could not connect to Chroma: {exc}")
+            col_count, dim, col_name = 0, None, "knowledge_base"
 
-    characters = (
-        _document_characters(selected_path)
-        if selected_path is not None
-        else None
-    )
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Indexed Chunks in Chroma", col_count)
+        c2.metric("Embedding Dimension", dim or "N/A")
+        c3.metric("Collection Name", col_name)
 
-    col1, col2, col3, col4 = st.columns(4)
-    col1.metric(
-        "File size",
-        f"{file_size:,} B" if file_size is not None else "N/A",
-    )
-    col2.metric(
-        "Characters",
-        f"{characters:,}" if characters is not None else "N/A",
-    )
-    col3.metric("Chunks", len(selected_chunks))
-    col4.metric(
-        "Chunk size / overlap",
-        f"{size} / {overlap}" if size is not None else "N/A",
-    )
+        if col_count == 0:
+            st.info("Chroma vector store is currently empty. Ingest documents to populate.")
+        else:
+            try:
+                chroma_data = pipeline.vector_store.collection.get(include=["documents", "metadatas"])
+                ids = chroma_data.get("ids") or []
+                docs = chroma_data.get("documents") or []
+                metas = chroma_data.get("metadatas") or []
 
-    # ----------------------------------------------------------------
-    # CHUNK BROWSER
-    # ----------------------------------------------------------------
-    render_html(render_section_title("Chunk browser"))
+                chroma_rows = []
+                for i, cid in enumerate(ids):
+                    meta = metas[i] if i < len(metas) and isinstance(metas[i], dict) else {}
+                    doc = docs[i] if i < len(docs) and docs[i] else ""
+                    chroma_rows.append({
+                        "Chunk ID": cid,
+                        "Filename": meta.get("filename", ""),
+                        "File Type": meta.get("file_type", ""),
+                        "Page": meta.get("page_number", 0) if meta.get("page_number") else "-",
+                        "Section Heading": meta.get("section_heading", ""),
+                        "Characters": len(doc),
+                        "Preview": (doc[:130] + "...") if len(doc) > 130 else doc,
+                        "_full_text": doc,
+                        "_meta": meta,
+                    })
 
-    chunk_number = st.number_input(
-        "Chunk",
-        min_value=1,
-        max_value=len(selected_chunks),
-        value=1,
-        step=1,
-    )
+                filter_c1, filter_c2 = st.columns([7, 3])
+                with filter_c1:
+                    search_chroma = st.text_input("Filter Chroma entries", placeholder="Filter by filename, chunk ID, or text...", key="chroma_filter")
+                with filter_c2:
+                    file_types = sorted(list({r["File Type"] for r in chroma_rows if r["File Type"]}))
+                    type_filter = st.selectbox("File type", ["All"] + file_types, key="chroma_type_filter")
 
-    index = int(chunk_number) - 1
-    chunk = selected_chunks[index]
+                filtered_chroma = chroma_rows
+                if type_filter != "All":
+                    filtered_chroma = [r for r in filtered_chroma if r["File Type"] == type_filter]
+                if search_chroma:
+                    s_low = search_chroma.strip().lower()
+                    filtered_chroma = [
+                        r for r in filtered_chroma
+                        if s_low in r["Chunk ID"].lower()
+                        or s_low in r["Filename"].lower()
+                        or s_low in r["_full_text"].lower()
+                        or s_low in str(r["Section Heading"]).lower()
+                    ]
 
-    render_html(render_chunk_map(len(selected_chunks), index))
+                st.caption(f"Displaying {len(filtered_chroma)} of {len(chroma_rows)} vector chunks in Chroma")
+                _dataframe([
+                    {
+                        "Chunk ID": r["Chunk ID"],
+                        "Filename": r["Filename"],
+                        "Format": r["File Type"],
+                        "Page": r["Page"],
+                        "Heading": r["Section Heading"],
+                        "Chars": r["Characters"],
+                        "Preview": r["Preview"],
+                    }
+                    for r in filtered_chroma
+                ])
 
-    st.caption(
-        f"Each cell is one chunk of {selected_name}, in document order. "
-        "The highlighted cell is the chunk shown below."
-    )
+                with st.expander("Inspect full chunk text & stored metadata from Chroma"):
+                    inspect_id = st.selectbox("Select Chunk ID to inspect", [r["Chunk ID"] for r in filtered_chroma], key="chroma_inspect_select")
+                    selected_entry = next((r for r in chroma_rows if r["Chunk ID"] == inspect_id), None)
+                    if selected_entry:
+                        st.markdown(f"**Chunk ID:** `{selected_entry['Chunk ID']}` | **Filename:** `{selected_entry['Filename']}`")
+                        st.code(selected_entry["_full_text"], language="text")
+                        st.json(selected_entry["_meta"])
+            except Exception as exc:  # noqa: BLE001
+                st.error(f"Error fetching Chroma chunks: {exc}")
 
-    text = chunk.get("text", "")
+    # ================================================================
+    # TAB 2: BM25 LEXICAL INDEX
+    # ================================================================
+    with tab_bm25:
+        render_html(render_section_title("BM25 Lexical Index — Vocabulary & Chunks"))
+        bm25_instance = getattr(pipeline, "bm25", None)
+        if bm25_instance is None or not hasattr(bm25_instance, "_chunks") or not bm25_instance._chunks:
+            st.info("BM25 lexical index is currently not loaded or empty. Ingest documents or sync the knowledge base.")
+        else:
+            bm25_chunks = bm25_instance._chunks
+            vocab = getattr(bm25_instance, "_vocab", {})
+            avg_dl = getattr(bm25_instance, "_avg_doc_len", 0.0)
 
-    render_html(
-        render_kv_rows(
-            [
-                ("Chunk ID", _na(chunk.get("chunk_id"))),
-                ("Filename", _na(chunk.get("filename"))),
-                ("Characters", len(text)),
-                ("Section heading", _na(chunk.get("section_heading"))),
-                ("Chunk index", _na(chunk.get("chunk_index"))),
-                ("Chunks in section", _na(chunk.get("total_section_chunks"))),
-                ("Category", _na(chunk.get("category"))),
-            ]
-        )
-    )
+            b1, b2, b3 = st.columns(3)
+            b1.metric("Indexed Chunks in BM25", len(bm25_chunks))
+            b2.metric("Vocabulary (Unique Terms)", len(vocab))
+            b3.metric("Avg Document Length", f"{avg_dl:.1f} tokens" if avg_dl else "N/A")
 
-    st.code(text, language="text")
+            bm25_rows = []
+            for i, c in enumerate(bm25_chunks):
+                cid = c.get("chunk_id", f"chunk_{i}")
+                fname = c.get("filename", "")
+                ftype = c.get("file_type", "")
+                pnum = c.get("page_number", 0)
+                heading = c.get("section_heading", "")
+                txt = c.get("text", "")
+                bm25_rows.append({
+                    "Chunk ID": cid,
+                    "Filename": fname,
+                    "Format": ftype,
+                    "Page": pnum if pnum and int(pnum) > 0 else "-",
+                    "Heading": heading,
+                    "Characters": len(txt),
+                    "Preview": (txt[:130] + "...") if len(txt) > 130 else txt,
+                    "_full_text": txt,
+                    "_raw": c,
+                })
 
-    with st.expander("Full chunk metadata"):
-        st.json(
-            {
-                "source_path": chunk.get("source_path", ""),
-                "section_heading": chunk.get("section_heading", ""),
-                "section_path": chunk.get("section_path", []),
-                "section_level": chunk.get("section_level", 0),
-                "chunk_index": chunk.get("chunk_index", 0),
-                "total_section_chunks": chunk.get("total_section_chunks", 0),
-                "category": chunk.get("category", ""),
-                "chunk_id": chunk.get("chunk_id", ""),
-            }
-        )
+            bf1, bf2 = st.columns([7, 3])
+            with bf1:
+                search_bm25 = st.text_input("Filter BM25 chunks", placeholder="Filter by term, heading, or filename...", key="bm25_filter")
+            with bf2:
+                term_lookup = st.text_input("Lookup word in vocabulary", placeholder="e.g. telescope", key="vocab_term_lookup")
 
-    # ----------------------------------------------------------------
-    # OVERLAP EXPLANATION
-    # ----------------------------------------------------------------
-    render_html(render_section_title("Why chunks overlap"))
+            if term_lookup:
+                t_clean = term_lookup.strip().lower()
+                df = getattr(bm25_instance, "_doc_freqs", {}).get(t_clean)
+                idf = getattr(bm25_instance, "_idf", {}).get(t_clean)
+                if df is not None:
+                    st.success(f"Term '{t_clean}' found in BM25 index: appears in **{df}** chunks (IDF weight: **{idf:.3f}**)")
+                else:
+                    st.warning(f"Term '{t_clean}' does not appear in the BM25 index vocabulary.")
 
-    if overlap:
-        st.write(
-            f"This knowledge base is configured with a {overlap}-character "
-            f"overlap between neighbouring chunks of {size} characters. "
-            "Overlap allows neighbouring chunks to retain contextual "
-            "continuity, so a sentence that crosses a boundary is still "
-            "readable in both chunks."
-        )
-    else:
-        st.write(
-            "Chunk overlap allows neighbouring chunks to retain contextual "
-            "continuity. The configured overlap is not available from the "
-            "pipeline, so no value is shown here."
-        )
+            filtered_bm25 = bm25_rows
+            if search_bm25:
+                s_low = search_bm25.strip().lower()
+                filtered_bm25 = [
+                    r for r in filtered_bm25
+                    if s_low in r["Chunk ID"].lower()
+                    or s_low in r["Filename"].lower()
+                    or s_low in r["_full_text"].lower()
+                    or s_low in str(r["Heading"]).lower()
+                ]
 
-    with st.expander(f"All chunks in {selected_name}"):
-        for position, item in enumerate(selected_chunks):
-            st.markdown(
-                f"**[ Chunk {position} ]** · "
-                f"`{item.get('chunk_id', '')}` · "
-                f"{len(item.get('text', ''))} characters"
+            st.caption(f"Displaying {len(filtered_bm25)} of {len(bm25_rows)} chunks in BM25 index")
+            _dataframe([
+                {
+                    "Chunk ID": r["Chunk ID"],
+                    "Filename": r["Filename"],
+                    "Format": r["Format"],
+                    "Page": r["Page"],
+                    "Heading": r["Heading"],
+                    "Chars": r["Characters"],
+                    "Preview": r["Preview"],
+                }
+                for r in filtered_bm25
+            ])
+
+            with st.expander("Inspect full chunk text & BM25 metadata"):
+                inspect_b_id = st.selectbox("Select BM25 Chunk ID", [r["Chunk ID"] for r in filtered_bm25], key="bm25_inspect_select")
+                sel_b = next((r for r in bm25_rows if r["Chunk ID"] == inspect_b_id), None)
+                if sel_b:
+                    st.markdown(f"**Chunk ID:** `{sel_b['Chunk ID']}` | **Filename:** `{sel_b['Filename']}`")
+                    st.code(sel_b["_full_text"], language="text")
+                    st.json({k: v for k, v in sel_b["_raw"].items() if k != "text"})
+
+    # ================================================================
+    # TAB 3: DOCUMENT CHUNKS (SOURCE FILES)
+    # ================================================================
+    with tab_chunks:
+        files = list_knowledge_files(Path(KNOWLEDGE_BASE_DIR))
+
+        if not files:
+            st.info("No supported files were found in the knowledge base.")
+            return
+
+        chunks = _load_chunks(pipeline)
+
+        if not chunks:
+            st.warning(
+                "Chunks could not be computed for preview. The index itself is "
+                "unaffected."
             )
-            st.code((item.get("text") or "")[:600], language="text")
+            return
+
+        size, overlap = _chunk_config(pipeline)
+
+        # ----------------------------------------------------------------
+        # OVERVIEW
+        # ----------------------------------------------------------------
+        render_html(render_section_title("Knowledge base overview"))
+
+        _dataframe([
+                {
+                    "Document": path.name,
+                    "Chunks": len(
+                        [c for c in chunks if c.get("filename") == path.name]
+                    ),
+                    "Characters": _document_characters(path),
+                }
+                for path in files
+            ])
+
+        # ----------------------------------------------------------------
+        # DOCUMENT SELECTOR
+        # ----------------------------------------------------------------
+        render_html(render_section_title("Document"))
+
+        selected_name = st.selectbox(
+            "Select a document",
+            [path.name for path in files],
+        )
+
+        selected_path = next(
+            (path for path in files if path.name == selected_name),
+            None,
+        )
+
+        selected_chunks = [
+            c for c in chunks if c.get("filename") == selected_name
+        ]
+
+        if not selected_chunks:
+            st.info("This document produced no non-empty chunks.")
+            return
+
+        file_size = None
+
+        if selected_path is not None:
+            try:
+                file_size = selected_path.stat().st_size
+            except Exception:  # noqa: BLE001
+                file_size = None
+
+        characters = (
+            _document_characters(selected_path)
+            if selected_path is not None
+            else None
+        )
+
+        col1, col2, col3, col4 = st.columns(4)
+        col1.metric(
+            "File size",
+            f"{file_size:,} B" if file_size is not None else "N/A",
+        )
+        col2.metric(
+            "Characters",
+            f"{characters:,}" if characters is not None else "N/A",
+        )
+        col3.metric("Chunks", len(selected_chunks))
+        col4.metric(
+            "Chunk size / overlap",
+            f"{size} / {overlap}" if size is not None else "N/A",
+        )
+
+        # ----------------------------------------------------------------
+        # CHUNK BROWSER
+        # ----------------------------------------------------------------
+        render_html(render_section_title("Chunk browser"))
+
+        chunk_number = st.number_input(
+            "Chunk",
+            min_value=1,
+            max_value=len(selected_chunks),
+            value=1,
+            step=1,
+        )
+
+        index = int(chunk_number) - 1
+        chunk = selected_chunks[index]
+
+        render_html(render_chunk_map(len(selected_chunks), index))
+
+        st.caption(
+            f"Each cell is one chunk of {selected_name}, in document order. "
+            "The highlighted cell is the chunk shown below."
+        )
+
+        text = chunk.get("text", "")
+
+        render_html(
+            render_kv_rows(
+                [
+                    ("Chunk ID", _na(chunk.get("chunk_id"))),
+                    ("Filename", _na(chunk.get("filename"))),
+                    ("Characters", len(text)),
+                    ("Section heading", _na(chunk.get("section_heading"))),
+                    ("Chunk index", _na(chunk.get("chunk_index"))),
+                    ("Chunks in section", _na(chunk.get("total_section_chunks"))),
+                    ("Category", _na(chunk.get("category"))),
+                ]
+            )
+        )
+
+        st.code(text, language="text")
+
+        with st.expander("Full chunk metadata"):
+            st.json(
+                {
+                    "source_path": chunk.get("source_path", ""),
+                    "section_heading": chunk.get("section_heading", ""),
+                    "section_path": chunk.get("section_path", []),
+                    "section_level": chunk.get("section_level", 0),
+                    "chunk_index": chunk.get("chunk_index", 0),
+                    "total_section_chunks": chunk.get("total_section_chunks", 0),
+                    "category": chunk.get("category", ""),
+                    "chunk_id": chunk.get("chunk_id", ""),
+                }
+            )
+
+        # ----------------------------------------------------------------
+        # OVERLAP EXPLANATION
+        # ----------------------------------------------------------------
+        render_html(render_section_title("Why chunks overlap"))
+
+        if overlap:
+            st.write(
+                f"This knowledge base is configured with a {overlap}-character "
+                f"overlap between neighbouring chunks of {size} characters. "
+                "Overlap allows neighbouring chunks to retain contextual "
+                "continuity, so a sentence that crosses a boundary is still "
+                "readable in both chunks."
+            )
+        else:
+            st.write(
+                "Chunk overlap allows neighbouring chunks to retain contextual "
+                "continuity. The configured overlap is not available from the "
+                "pipeline, so no value is shown here."
+            )
+
+        with st.expander(f"All chunks in {selected_name}"):
+            for position, item in enumerate(selected_chunks):
+                st.markdown(
+                    f"**[ Chunk {position} ]** · "
+                    f"`{item.get('chunk_id', '')}` · "
+                    f"{len(item.get('text', ''))} characters"
+                )
+                st.code((item.get("text") or "")[:600], language="text")
 
 
 
@@ -2667,8 +2873,8 @@ def main() -> None:
         _render_dashboard_page(pipeline)
         return
 
-    if page == PAGE_BENCHMARK:
-        _render_benchmark_page(pipeline)
+    if page == PAGE_CHAT_HISTORY:
+        _render_chat_history_page(pipeline)
         return
 
     if page == PAGE_COMPARISON:
@@ -2782,11 +2988,111 @@ def _render_comparison_page(pipeline: RAGPipeline) -> None:
     st.subheader("What changed?"); st.write("; ".join(changed) if changed else "No recorded metric difference.")
 
 
-def _render_benchmark_page(pipeline: RAGPipeline) -> None:
-    render_html(render_page_header("EVALUATION", "Benchmark", "Labelled benchmark evaluation only; intentionally separate from live heuristic evaluation."))
-    st.write("A benchmark case supplies query, relevant_documents or relevant_chunks, expected_facets, and optional reference_answer.")
-    st.write("When labels are present: Precision@K = relevant retrieved / K; Recall@K = relevant retrieved / total relevant; MRR = 1 / rank of first relevant; nDCG@K uses standard discounted cumulative gain normalized by ideal DCG.")
-    st.info("No labelled benchmark result is stored yet. Live Retrieval Strength, Evidence Support, and Grounding are not labelled accuracy metrics.")
+def _load_persistent_chat_history(vectorstore_path: Path | str | None = None) -> list[dict]:
+    path = Path(vectorstore_path or VECTORSTORE_DIR) / "chat_history.json"
+    if path.exists():
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(data, list):
+                return data
+        except Exception as exc:  # noqa: BLE001
+            logging.warning("Could not read chat_history.json: %s", exc)
+    return []
+
+
+def _save_persistent_chat_turn(vectorstore_path: Path | str | None, user_entry: dict, assistant_entry: dict) -> None:
+    path = Path(vectorstore_path or VECTORSTORE_DIR) / "chat_history.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    history = _load_persistent_chat_history(vectorstore_path)
+    history.append(user_entry)
+    history.append(assistant_entry)
+    try:
+        path.write_text(json.dumps(history, indent=2, ensure_ascii=False), encoding="utf-8")
+    except Exception as exc:  # noqa: BLE001
+        logging.warning("Could not write chat_history.json: %s", exc)
+
+
+def _clear_persistent_chat_history(vectorstore_path: Path | str | None = None) -> None:
+    path = Path(vectorstore_path or VECTORSTORE_DIR) / "chat_history.json"
+    if path.exists():
+        try:
+            path.unlink()
+        except Exception as exc:  # noqa: BLE001
+            logging.warning("Could not delete chat_history.json: %s", exc)
+
+
+def _render_chat_history_page(pipeline: RAGPipeline) -> None:
+    render_html(
+        render_page_header(
+            "CONVERSATION LOGS",
+            "Chat & Query History",
+            "Complete persistent log of all questions asked and answers generated.",
+        )
+    )
+
+    history = _load_persistent_chat_history(pipeline.vectorstore_path)
+    turns: list[tuple[dict, dict | None]] = []
+    i = 0
+    while i < len(history):
+        item = history[i]
+        if item.get("role") == "user":
+            user_msg = item
+            asst_msg = (
+                history[i + 1]
+                if (i + 1 < len(history) and history[i + 1].get("role") == "assistant")
+                else None
+            )
+            turns.append((user_msg, asst_msg))
+            i += 2 if asst_msg else 1
+        else:
+            i += 1
+
+    top_col1, top_col2, top_col3 = st.columns([4, 5, 2.5])
+    with top_col1:
+        st.metric("Total Questions Asked", len(turns))
+    with top_col2:
+        search_filter = st.text_input(
+            "Filter queries",
+            placeholder="Search questions or responses...",
+            key="chat_hist_filter",
+            label_visibility="collapsed",
+        )
+    with top_col3:
+        if turns and st.button("🗑 Clear All History", key="clear_all_chat_hist", **WIDE):
+            _clear_persistent_chat_history(pipeline.vectorstore_path)
+            st.session_state.chat_history = []
+            st.success("Chat history cleared.")
+            st.rerun()
+
+    if not turns:
+        st.info("No queries have been submitted yet. Go to Mission Control to ask questions about the universe!")
+        return
+
+    filtered_turns = turns
+    if search_filter:
+        q_low = search_filter.strip().lower()
+        filtered_turns = [
+            (u, a)
+            for (u, a) in turns
+            if q_low in (u.get("content") or "").lower()
+            or (a and q_low in (a.get("content") or "").lower())
+        ]
+        st.caption(f"Showing {len(filtered_turns)} of {len(turns)} turns matching '{search_filter}'")
+
+    for idx, (user_msg, asst_msg) in enumerate(reversed(filtered_turns), start=1):
+        timestamp = user_msg.get("timestamp", "")
+        q_text = user_msg.get("content", "")
+        with st.expander(
+            f"Q: {q_text[:85]}{'...' if len(q_text) > 85 else ''} {('· ' + timestamp) if timestamp else ''}",
+            expanded=(idx == 1),
+        ):
+            st.markdown(f"**Question:**\n{q_text}")
+            if asst_msg:
+                st.markdown("---")
+                st.markdown(f"**Answer:**\n{asst_msg.get('content', '')}")
+                meta = asst_msg.get("meta") or {}
+                if meta:
+                    _render_answer_extras(meta)
 
 
 if __name__ == "__main__":

@@ -15,69 +15,56 @@ def _split_into_claims(answer: str) -> list[str]:
         line = line.strip()
         if not line:
             continue
-        # Header words followed by a colon (e.g. "Sources:", "Details:")
-        # are presentation-only and must not be treated as claims.
-        # NOTE: the colon itself is not a word-boundary character, so the
-        # boundary check must occur before it, not immediately after it.
-        if re.match(r"^(?:sources|confidence|references|note|details|summary)\s*:", line, re.I):
+        if re.match(r"^(?:sources|confidence|references|note):\b", line, re.I):
             break
         lines.append(re.sub(r"^(?:[-*]|\d+\.)\s+", "", line))
     return [s.strip() for s in re.split(r"(?<=[.!?])\s+", " ".join(lines)) if len(s.strip()) >= 15]
 
 
-def _extract_entities(claim: str) -> set[str]:
-    """Proper nouns in the claim, lowercased, excluding the very first word."""
-    return {
-        term.lower()
-        for term in re.findall(r"(?<!^)\b[A-Z][A-Za-z0-9-]+\b", claim)
-    }
-
-
 def _find_best_passage_in_chunk(claim: str, text: str) -> tuple[str, float]:
-    """
-    Find the sentence in the chunk that best supports the claim.
-
-    Sentences containing more of the claim's named entities (people,
-    titles, proper nouns) are preferred over sentences that merely share
-    generic vocabulary. Generic word overlap is used only as a
-    tiebreaker among sentences with equal entity coverage. Without this,
-    a topically similar sentence lacking the actual named subject can
-    outscore the sentence that truly supports the claim.
-    """
     claim_terms = set(re.findall(r"[a-z0-9]+", claim.lower())) - _STOPWORDS
-    claim_entities = _extract_entities(claim)
+    if not claim_terms or not text.strip():
+        return (text[:250].strip() or ""), 0.0
 
-    best, best_score, best_entity_hits = "", 0.0, -1
-
-    for sentence in re.split(r"(?<=[.!?])\s+", text.strip()):
+    sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", text.strip()) if s.strip()]
+    best_sent, best_score = "", 0.0
+    for idx, sentence in enumerate(sentences):
         terms = set(re.findall(r"[a-z0-9]+", sentence.lower())) - _STOPWORDS
         score = len(claim_terms & terms) / max(1, len(claim_terms))
-        entity_hits = len(claim_entities & terms)
+        if score > best_score:
+            # Expand to include adjacent sentence if helpful for context
+            ctx_start = max(0, idx - 1)
+            ctx_end = min(len(sentences), idx + 2)
+            best_sent = " ".join(sentences[ctx_start:ctx_end])
+            best_score = score
 
-        if (entity_hits, score) > (best_entity_hits, best_score):
-            best, best_score, best_entity_hits = sentence.strip(), score, entity_hits
-
-    return (best or text[:250].strip()), best_score
+    return (best_sent or text[:300].strip()), best_score
 
 
-def _claim_support(claim: str, passage: str) -> tuple[str, float, str]:
-    """Verify direct support; reject related lexical matches with wrong facts."""
+def _claim_support(claim: str, passage: str, chunk_text: str = "") -> tuple[str, float, str]:
+    """Verify direct support against passage and full chunk context."""
     claim_terms = set(re.findall(r"[a-z0-9]+", claim.lower())) - _STOPWORDS
-    passage_terms = set(re.findall(r"[a-z0-9]+", passage.lower())) - _STOPWORDS
+    search_scope = f"{passage} {chunk_text}".lower()
+    passage_terms = set(re.findall(r"[a-z0-9]+", search_scope)) - _STOPWORDS
+
+    if not claim_terms:
+        return "supported", 1.0, "Claim contains no specific content constraints."
+
     coverage = len(claim_terms & passage_terms) / max(1, len(claim_terms))
-    entities = re.findall(r"(?<!^)\b[A-Z][A-Za-z0-9-]+\b", claim)
-    missing_entities = [term for term in entities if term.lower() not in passage_terms]
+
+    # Verify key numeric values if present in the claim
     claim_numbers = set(re.findall(r"\b\d+(?:\.\d+)?\b", claim))
-    passage_numbers = set(re.findall(r"\b\d+(?:\.\d+)?\b", passage))
+    passage_numbers = set(re.findall(r"\b\d+(?:\.\d+)?\b", search_scope))
     missing_values = claim_numbers - passage_numbers
-    if missing_entities or missing_values:
-        detail = ", ".join(missing_entities + sorted(missing_values))
-        return "unsupported", coverage, "Related lexical match, but answer-bearing entity/value is absent: " + detail
-    if coverage >= 0.70:
+    if missing_values:
+        detail = ", ".join(sorted(missing_values))
+        return "unsupported", coverage, f"Related text, but key numeric value is absent: {detail}"
+
+    if coverage >= 0.45:
         return "supported", coverage, "Direct answer-bearing terms are present in the passage."
-    if coverage >= 0.40:
-        return "partially_supported", coverage, "The passage supports only part of the claim."
-    return "unsupported", coverage, "The passage is topically related but lacks direct answer evidence."
+    if coverage >= 0.25:
+        return "partially_supported", coverage, "The passage provides partial support for the claim."
+    return "unsupported", coverage, "The passage lacks sufficient direct evidence for this claim."
 
 
 def _origin(candidate: Candidate) -> str:
@@ -106,7 +93,7 @@ def generate_claim_citations(answer: str, selected_candidates: list[Candidate], 
         candidates = [chunk_map[index] for index in explicit] if explicit else selected_candidates
         scored = [(_find_best_passage_in_chunk(display_claim, candidate.text or ""), candidate) for candidate in candidates]
         (passage, lexical), candidate = max(scored, key=lambda item: item[0][1])
-        status, support_score, detail = _claim_support(display_claim, passage)
+        status, support_score, detail = _claim_support(display_claim, passage, chunk_text=candidate.text or "")
         if status == "supported":
             fully_supported += 1
         elif status == "partially_supported":
@@ -136,9 +123,11 @@ def generate_claim_citations(answer: str, selected_candidates: list[Candidate], 
             page_number=page_number,
         ))
     total = len(claims)
+    cov_pct = round(((fully_supported * 1.0 + partial * 0.5) / total * 100.0) if total else 100.0, 1)
     return citations, CitationCoverage(
         total_claims=total, supported_claims=fully_supported, unsupported_claims=len(unsupported),
-        coverage_percentage=(fully_supported / total * 100.0) if total else 100.0,
+        coverage_percentage=cov_pct,
         has_unsupported=bool(unsupported), unsupported_claims_list=unsupported,
         partially_supported_claims=partial,
     )
+

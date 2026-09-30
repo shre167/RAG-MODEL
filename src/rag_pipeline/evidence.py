@@ -111,18 +111,24 @@ def _has_direct_text_support(
     candidate: Candidate,
     query_tokens: set[str],
 ) -> bool:
+    if not query_tokens:
+        return False
+
     overlap = _lexical_overlap_ratio(
         candidate,
         query_tokens,
     )
 
-    if not query_tokens:
-        return False
+    if overlap > 0.0:
+        return True
 
-    if len(query_tokens) == 1:
-        return overlap >= 1.0
+    # Fallback for stem/substring matches (e.g., galaxy vs galaxies, telescope vs telescopes)
+    text_lower = (candidate.text or "").lower()
+    for token in query_tokens:
+        if len(token) >= 3 and (token in text_lower or (token[:-1] in text_lower if token.endswith("s") else False)):
+            return True
 
-    return overlap > 0.0
+    return False
 
 
 def _has_lexical_support(

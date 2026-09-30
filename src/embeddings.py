@@ -140,7 +140,7 @@ class EmbeddingService:
         if _HAS_OPENAI and self.api_key and self.base_url:
             try:
                 import httpx
-                http_client = httpx.Client(verify=False)
+                http_client = httpx.Client(verify=False, timeout=httpx.Timeout(20.0, connect=6.0))
                 try:
                     self._client = OpenAIClient(
                         api_key=self.api_key,
@@ -178,6 +178,8 @@ class EmbeddingService:
                         model=self.model,
                         input=text,
                     ),
+                    max_retries=2,
+                    base_delay=0.5,
                 )
                 return resp.data[0].embedding
             except RateLimitError:

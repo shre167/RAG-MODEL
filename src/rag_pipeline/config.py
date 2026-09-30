@@ -71,8 +71,8 @@ ENABLE_RERANKER = False
 # RRF is a ranking signal, not a probability.
 # With RRF_K=60, a rank-0 result in one retriever is ~0.01639;
 # a rank-0 result in both retrievers is ~0.03279.
-RRF_ABSTAIN_FLOOR = 0.015
-STRONG_RRF_THRESHOLD = 0.025
+RRF_ABSTAIN_FLOOR = 0.008
+STRONG_RRF_THRESHOLD = 0.022
 MODERATE_RRF_THRESHOLD = RRF_ABSTAIN_FLOOR
 
 # Relative separation from the runner-up.

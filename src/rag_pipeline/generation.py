@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from openai import OpenAI, APIStatusError, APITimeoutError, APIConnectionError
+from openai import OpenAI
 
 from src.config import (
     GE_API_KEY,
@@ -32,9 +32,11 @@ def ask_llm(
     """
     Send the question and retrieved context to the LLM.
 
-    Uses the OpenAI-compatible Generative Engine endpoint
-    (https://openai.generative.engine.capgemini.com/v1) via the
-    official OpenAI SDK. Credentials are never logged or stored.
+    The function keeps API credentials private.
+
+    If a trace dictionary is provided, it records the LLM input and
+    runtime information needed by the RAG Observatory, but never stores
+    the API key.
     """
     resolved_api_key = (
         api_key
@@ -57,7 +59,10 @@ def ask_llm(
     # ------------------------------------------------------------------
 
     if not resolved_api_key:
-        logger.error("LLM API key is not configured.")
+        logger.error(
+            "LLM API key is not configured."
+        )
+
         return (
             "I could not generate the answer "
             "because the language-model API "
@@ -65,7 +70,10 @@ def ask_llm(
         )
 
     if not resolved_base_url:
-        logger.error("LLM base URL is not configured.")
+        logger.error(
+            "LLM base URL is not configured."
+        )
+
         return (
             "I could not generate the answer "
             "because the language-model endpoint "
@@ -73,7 +81,10 @@ def ask_llm(
         )
 
     if not resolved_model:
-        logger.error("LLM model is not configured.")
+        logger.error(
+            "LLM model is not configured."
+        )
+
         return (
             "I could not generate the answer "
             "because the language-model model "
@@ -168,6 +179,10 @@ def ask_llm(
     # ------------------------------------------------------------------
     # Observatory trace
     # ------------------------------------------------------------------
+    #
+    # Store the exact prompt/context going into the LLM.
+    # NEVER store the API key.
+    #
 
     if trace is not None:
         trace.clear()
@@ -191,22 +206,29 @@ def ask_llm(
         )
 
     # ------------------------------------------------------------------
-    # LLM request (OpenAI-compatible interface)
+    # LLM request
     # ------------------------------------------------------------------
 
     try:
-        client = OpenAI(
-            api_key=resolved_api_key,
-            base_url=resolved_base_url,
-            timeout=30,
+        normalized_base_url = (
+            resolved_base_url.strip()
         )
 
-        logger.info(f"Calling OpenAI-compatible endpoint with model: {resolved_model}")
+        if not normalized_base_url.endswith("/"):
+            normalized_base_url += "/"
+
+        import httpx
+        http_client = httpx.Client(verify=False, timeout=httpx.Timeout(45.0, connect=10.0))
+
+        client = OpenAI(
+            api_key=resolved_api_key,
+            base_url=normalized_base_url,
+            http_client=http_client,
+        )
 
         response = client.chat.completions.create(
             model=resolved_model,
             messages=messages,
-            max_completion_tokens=2048,
             temperature=0.1,
         )
 
@@ -215,22 +237,32 @@ def ask_llm(
         # --------------------------------------------------------------
 
         if not response.choices:
-            logger.error("Language model returned no choices.")
+            logger.error(
+                "Language model returned no choices."
+            )
 
             if trace is not None:
                 trace["status"] = "empty_choices"
 
-            return "The language model returned no response."
+            return (
+                "The language model returned "
+                "no response."
+            )
 
         content = response.choices[0].message.content
 
         if not content:
-            logger.error("Language model returned empty content.")
+            logger.error(
+                "Language model returned empty content."
+            )
 
             if trace is not None:
                 trace["status"] = "empty_content"
 
-            return "The language model returned an empty response."
+            return (
+                "The language model returned "
+                "an empty response."
+            )
 
         answer = content.strip()
 
@@ -243,54 +275,24 @@ def ask_llm(
                 }
             )
 
-        logger.info(f"Successfully received response: {len(answer)} characters")
-
         return answer
 
-    except APITimeoutError:
-        logger.error("Request to language model timed out after 30 seconds")
-
-        if trace is not None:
-            trace["status"] = "timeout"
-
-        return "The language model request timed out. Please try again."
-
-    except APIStatusError as status_exc:
-        logger.error(
-            f"Language model API returned status {status_exc.status_code}: {status_exc.message}"
+    except Exception as exc:
+        logger.exception(
+            "LLM request failed: %s",
+            exc,
         )
 
         if trace is not None:
-            trace["status"] = f"api_error_{status_exc.status_code}"
+            trace.update(
+                {
+                    "status": "error",
+                    "error": str(exc),
+                }
+            )
 
         return (
             "The language model request failed. "
-            "Please check the model configuration and connectivity."
+            "Please check the model configuration "
+            "and connectivity."
         )
-
-    except APIConnectionError as conn_exc:
-        logger.error(f"Network error calling language model: {conn_exc}")
-
-        if trace is not None:
-            trace["status"] = "network_error"
-
-        return (
-            "A network error occurred while calling the language model. "
-            "Please check your connection and try again."
-        )
-
-    except Exception as exc:
-        import traceback
-
-        print("\n========== LLM ERROR ==========")
-        traceback.print_exc()
-        print("MODEL =", resolved_model)
-        print("BASE_URL =", resolved_base_url)
-        print("ERROR =", repr(exc))
-        print("================================\n")
-
-        if trace is not None:
-            trace["status"] = "exception"
-            trace["error"] = str(exc)
-
-        raise

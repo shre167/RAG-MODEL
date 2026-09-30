@@ -141,6 +141,9 @@ class ChromaVectorStore:
 
     def query(self, query_embedding: List[float], n_results: int = 5) -> Dict[str, Any]:
         """Query the collection and return raw Chroma results."""
+        cnt = self.get_collection_count()
+        if cnt == 0:
+            return {"documents": [], "metadatas": [], "distances": [], "ids": []}
         query_dim = _embedding_dimension(query_embedding)
         existing_dim = self.get_collection_embedding_dimension()
         if existing_dim is not None and query_dim != existing_dim:
@@ -148,7 +151,8 @@ class ChromaVectorStore:
                 f"Query embedding dimension {query_dim} does not match "
                 f"collection dimension {existing_dim}."
             )
-        results = self.collection.query(query_embeddings=[query_embedding], n_results=n_results)
+        effective_n = min(n_results, cnt)
+        results = self.collection.query(query_embeddings=[query_embedding], n_results=effective_n)
         return results
 
     def delete_collection(self) -> None:

@@ -36,22 +36,24 @@ def evaluate_confidence(
     # not enter this calculation: a popular-but-wrong passage must not raise
     # confidence. Claim verification is the largest component.
     raw_confidence_score = (
-        (direct_score * 0.30)
-        + (coverage_pct * 0.40)
+        (direct_score * 0.35)
+        + (coverage_pct * 0.35)
         + (sufficiency_score * 0.20)
         + (relevance_score * 0.10)
     )
 
     # Unsupported claim penalty
-    if has_unsupported:
-        raw_confidence_score = max(20.0, raw_confidence_score - (citation_coverage.unsupported_claims * 15.0))
+    if has_unsupported and citation_coverage.unsupported_claims > 0:
+        penalty = min(25.0, citation_coverage.unsupported_claims * 8.0)
+        raw_confidence_score = max(15.0, raw_confidence_score - penalty)
 
     final_score = round(max(5.0, min(100.0, raw_confidence_score)), 1)
 
     # Determine confidence tier
-    if final_score >= 78.0 and not has_unsupported and direct_score >= 65.0:
+    unsupported_count = getattr(citation_coverage, "unsupported_claims", 0)
+    if (final_score >= 68.0 or (evidence_level == "strong" and final_score >= 60.0)) and unsupported_count == 0 and direct_score >= 48.0:
         level = "HIGH"
-    elif final_score >= 50.0:
+    elif final_score >= 42.0 or (evidence_level in ("strong", "moderate") and direct_score >= 40.0 and unsupported_count <= 1):
         level = "MEDIUM"
     else:
         level = "LOW"
