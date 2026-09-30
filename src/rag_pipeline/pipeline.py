@@ -1526,49 +1526,92 @@ class RAGPipeline:
         )
 
         # --------------------------------------------------------------
-        # 6. QUERY EMBEDDING
+        # 6-8. QUERY EMBEDDING + DENSE + BM25
+        # For hybrid: embedding API call and BM25 tokenization run
+        # concurrently to eliminate the sequential network wait.
         # --------------------------------------------------------------
+        import concurrent.futures as _cf
 
         query_embedding = None
+        candidates: dict[str, Candidate] = {}
+        bm25_query_tokens: list[str] = []
 
-        if (
+        need_dense = (
             collection_count > 0
             and retrieval_mode in {"vector", "hybrid"}
-        ):
-            try:
-                query_embedding = (
-                    self.embedding_service
-                    .create_embedding(
-                        search_text
-                    )
-                )
+        )
+        need_bm25 = retrieval_mode in {"bm25", "hybrid"}
 
-            except Exception as exc:
-                logger.warning(
-                    "Query embedding failed: %s",
-                    exc,
-                )
+        if retrieval_mode == "hybrid" and need_dense:
+            # CONCURRENT PATH: embed + bm25-tokenize in parallel
+            _embed_result: list | None = None
+            _dense_candidates: dict = {}
 
-        # --------------------------------------------------------------
-        # 7. DENSE RETRIEVAL
-        # --------------------------------------------------------------
+            def _run_dense() -> None:
+                nonlocal _embed_result, _dense_candidates
+                try:
+                    _embed_result = self.embedding_service.create_embedding(search_text)
+                    if _embed_result:
+                        _dense_candidates = self._dense_retrieve(_embed_result)
+                        for c in _dense_candidates.values():
+                            c.in_dense = True
+                except Exception as exc:
+                    logger.warning("Concurrent dense retrieval failed: %s", exc)
 
-        candidates: dict[
-            str,
-            Candidate,
-        ] = {}
+            def _run_bm25_tokenize() -> None:
+                nonlocal bm25_query_tokens
+                try:
+                    if self.bm25 is not None:
+                        bm25_query_tokens = self.bm25._tokenize(search_text)
+                except Exception:
+                    bm25_query_tokens = []
 
-        if (
-            retrieval_mode in {"vector", "hybrid"}
-            and query_embedding
-        ):
-            candidates = (
-                self._dense_retrieve(
-                    query_embedding
-                )
-            )
-            for c in candidates.values():
-                c.in_dense = True
+            with _cf.ThreadPoolExecutor(max_workers=2) as _pool:
+                _f_dense = _pool.submit(_run_dense)
+                _f_bm25t = _pool.submit(_run_bm25_tokenize)
+                _f_dense.result()
+                _f_bm25t.result()
+
+            query_embedding = _embed_result
+            candidates.update(_dense_candidates)
+
+            # BM25 retrieve runs main-thread (mutates shared candidates dict)
+            if need_bm25:
+                self._bm25_retrieve(search_text, candidates)
+                for c in candidates.values():
+                    if c.bm25_rank is not None:
+                        c.in_bm25 = True
+
+        else:
+            # SEQUENTIAL PATH (vector-only or bm25-only)
+            if need_dense:
+                try:
+                    query_embedding = self.embedding_service.create_embedding(search_text)
+                except Exception as exc:
+                    logger.warning("Query embedding failed: %s", exc)
+
+            if need_dense and query_embedding:
+                candidates = self._dense_retrieve(query_embedding)
+                for c in candidates.values():
+                    c.in_dense = True
+
+            if self.bm25 is not None:
+                try:
+                    bm25_query_tokens = self.bm25._tokenize(search_text)
+                except Exception:
+                    bm25_query_tokens = []
+
+            if need_bm25:
+                self._bm25_retrieve(search_text, candidates)
+                for c in candidates.values():
+                    if c.bm25_rank is not None:
+                        c.in_bm25 = True
+            elif retrieval_mode == "vector" and not candidates and self.bm25 is not None:
+                logger.info("Dense retrieval yielded no results; falling back to BM25.")
+                self._bm25_retrieve(search_text, candidates)
+                for c in candidates.values():
+                    if c.bm25_rank is not None:
+                        c.in_bm25 = True
 
         # OBSERVATORY: snapshot raw Dense results BEFORE BM25 merges in
         raw_dense_results = [
@@ -1579,39 +1622,6 @@ class RAGPipeline:
             )
             if c.dense_rank is not None
         ]
-
-        # --------------------------------------------------------------
-        # 8. BM25 RETRIEVAL
-        # --------------------------------------------------------------
-
-        # Capture tokenized query for Observatory display
-        bm25_query_tokens: list[str] = []
-        if self.bm25 is not None:
-            try:
-                bm25_query_tokens = self.bm25._tokenize(
-                    search_text
-                )
-            except Exception:
-                bm25_query_tokens = []
-
-        if retrieval_mode in {"bm25", "hybrid"}:
-            self._bm25_retrieve(
-                search_text,
-                candidates,
-            )
-            for c in candidates.values():
-                if c.bm25_rank is not None:
-                    c.in_bm25 = True
-        elif retrieval_mode == "vector" and not candidates and self.bm25 is not None:
-            # Resilient fallback: if dense returned 0 candidates, fallback to BM25
-            logger.info("Dense retrieval yielded no results; falling back to BM25.")
-            self._bm25_retrieve(
-                search_text,
-                candidates,
-            )
-            for c in candidates.values():
-                if c.bm25_rank is not None:
-                    c.in_bm25 = True
 
         # OBSERVATORY: snapshot raw BM25 results (ranks now populated)
         raw_bm25_results = [

@@ -15,7 +15,7 @@ def _split_into_claims(answer: str) -> list[str]:
         line = line.strip()
         if not line:
             continue
-        if re.match(r"^(?:sources|confidence|references|note):\b", line, re.I):
+        if re.match(r"^(?:sources|confidence|references|note|details|answer):\b", line, re.I):
             break
         lines.append(re.sub(r"^(?:[-*]|\d+\.)\s+", "", line))
     return [s.strip() for s in re.split(r"(?<=[.!?])\s+", " ".join(lines)) if len(s.strip()) >= 15]
