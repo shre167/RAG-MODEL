@@ -1672,6 +1672,10 @@ def _ingestion_tab_real(pipeline: RAGPipeline) -> None:
                 st.session_state.force_reload = True
                 st.success("Ingestion completed.")
 
+    # The KB management section is always shown, regardless of whether an
+    # ingestion has been run in this session.
+    _render_manage_knowledge_base(pipeline)
+
     result = st.session_state.get("last_ingestion")
 
     if not result:
@@ -1689,6 +1693,54 @@ def _ingestion_tab_real(pipeline: RAGPipeline) -> None:
 
     if st.button("Replay stages", key="ingestion_replay"):
         _replay_ingestion_stages(result)
+
+
+def _render_manage_knowledge_base(pipeline: RAGPipeline) -> None:
+    """Render the 'Manage Knowledge Base' section inside the real-ingestion tab.
+
+    Lists all documents currently in the knowledge base and lets the user
+    select and remove one. Calls pipeline.delete_document() which removes
+    chunks from both Chroma and BM25 and (optionally) deletes the file from
+    disk. Shows counts of deleted chunks after removal and triggers a rerun.
+    """
+    render_html(render_section_title("Manage Knowledge Base"))
+
+    kb_path = Path(pipeline.knowledge_base_path)
+    try:
+        kb_files = list_knowledge_files(kb_path)
+    except Exception as exc:  # noqa: BLE001
+        st.error(f"Could not read knowledge base directory: {exc}")
+        return
+
+    if not kb_files:
+        st.info("Knowledge base is empty.")
+        return
+
+    file_names = sorted(f.name for f in kb_files)
+
+    selected_file = st.selectbox(
+        "Select a document to remove",
+        options=file_names,
+        key="remove_doc_select",
+    )
+
+    if st.button("Remove Document", key="remove_doc_btn", type="primary"):
+        try:
+            result = pipeline.delete_document(
+                selected_file,
+                delete_file_from_disk=True,
+            )
+            chroma_del = result.get("deleted_from_chroma", 0)
+            bm25_del = result.get("deleted_from_bm25", 0)
+            st.success(
+                f"Removed **{selected_file}** — "
+                f"{chroma_del} chunk(s) deleted from Chroma, "
+                f"{bm25_del} chunk(s) removed from BM25."
+            )
+            st.session_state.force_reload = True
+            st.rerun()
+        except Exception as exc:  # noqa: BLE001
+            st.error(f"Failed to remove document: {exc}")
 
 
 # ==========================================================================

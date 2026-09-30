@@ -45,9 +45,9 @@ class Config:
 
     # ==================== EMBEDDING INGESTION ====================
     EMBEDDING_BATCH_SIZE: int = int(os.getenv("EMBEDDING_BATCH_SIZE", "10"))
-    EMBEDDING_MAX_RETRIES: int = int(os.getenv("EMBEDDING_MAX_RETRIES", "5"))
+    EMBEDDING_MAX_RETRIES: int = int(os.getenv("EMBEDDING_MAX_RETRIES", "2"))
     EMBEDDING_RETRY_BASE_DELAY: float = float(
-        os.getenv("EMBEDDING_RETRY_BASE_DELAY", "2.0")
+        os.getenv("EMBEDDING_RETRY_BASE_DELAY", "1.0")
     )
 
     # ==================== RETRIEVAL ====================

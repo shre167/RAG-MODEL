@@ -30,8 +30,8 @@ RRF_K = 60
 # Retrieve substantially more candidates than are finally sent to the LLM.
 # This prevents the first retriever ranking from becoming the final answer
 # ranking, especially as the knowledge base grows.
-MIN_RERANK_CANDIDATES = 30
-MAX_RERANK_CANDIDATES = 50
+MIN_RERANK_CANDIDATES = 20
+MAX_RERANK_CANDIDATES = 30
 
 RERANK_CANDIDATE_LIMIT = min(
     max(

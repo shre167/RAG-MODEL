@@ -1247,6 +1247,97 @@ class RAGPipeline:
         return safe_meta
 
     # ==================================================================
+    # MULTI-INTENT
+    # ==================================================================
+
+    def _answer_multi_intent(
+        self,
+        question: str,
+        retrieval_mode: str,
+    ) -> dict[str, Any] | None:
+        """
+        Split a multi-intent query into sub-questions and answer each
+        independently, then merge the results into a single response.
+
+        Returns None if splitting produces fewer than 2 valid questions
+        so the caller can fall through to the normal single-question pipeline.
+        """
+        import re
+
+        # Rule-based splitting — no LLM call
+        # Split on common multi-intent delimiters
+        raw = re.split(r" and | also |\? |\n|; ", question)
+
+        # Re-attach any trailing "?" that belonged to a full question
+        sub_questions: list[str] = []
+        for part in raw:
+            part = part.strip()
+            if len(part) < 10:
+                continue
+            # Restore a trailing "?" if the original had one after the split
+            if not part.endswith("?") and "?" in question:
+                part = part + "?"
+            sub_questions.append(part)
+
+        if len(sub_questions) < 2:
+            return None
+
+        sub_responses: list[tuple[str, dict[str, Any]]] = []
+        for sub_q in sub_questions:
+            try:
+                resp = self._answer_question_impl(sub_q, retrieval_mode)
+                sub_responses.append((sub_q, resp))
+            except Exception as exc:
+                logger.warning("Multi-intent sub-question failed: %s — %s", sub_q, exc)
+
+        if len(sub_responses) < 2:
+            return None
+
+        # ------------------------------------------------------------------
+        # Merge results
+        # ------------------------------------------------------------------
+        merged_answer_parts: list[str] = []
+        merged_sources: list[str] = []
+        merged_chunks: list[dict[str, Any]] = []
+        seen_chunk_ids: set[str] = set()
+
+        first_resp = sub_responses[0][1]
+
+        for sub_q, resp in sub_responses:
+            sub_answer = resp.get("answer") or ""
+            merged_answer_parts.append(f"**Q: {sub_q}**\n\n{sub_answer}")
+
+            for src in resp.get("sources") or []:
+                if src not in merged_sources:
+                    merged_sources.append(src)
+
+            for chunk in resp.get("retrieved_chunks") or []:
+                chunk_id = (
+                    chunk.get("chunk_id")
+                    or chunk.get("id")
+                    or str(chunk)
+                )
+                if chunk_id not in seen_chunk_ids:
+                    seen_chunk_ids.add(chunk_id)
+                    merged_chunks.append(chunk)
+
+        return {
+            "answer": "\n\n---\n\n".join(merged_answer_parts),
+            "raw_answer": "\n\n---\n\n".join(merged_answer_parts),
+            "sources": merged_sources,
+            "retrieved_chunks": merged_chunks,
+            "num_retrieved": len(merged_chunks),
+            "evidence": first_resp.get("evidence"),
+            "evaluation": first_resp.get("evaluation"),
+            "citations": first_resp.get("citations", []),
+            "citation_coverage": first_resp.get("citation_coverage"),
+            "confidence": first_resp.get("confidence"),
+            "kb_state": first_resp.get("kb_state"),
+            "response_type": "multi_intent",
+            "retrieval_mode": retrieval_mode,
+        }
+
+    # ==================================================================
     # MAIN ENTRY POINT
     # ==================================================================
 
@@ -1351,6 +1442,15 @@ class RAGPipeline:
                 "Hi! How can I help you?",
                 response_type="greeting",
             )
+
+        # --------------------------------------------------------------
+        # 2b. MULTI-INTENT CHECK
+        # --------------------------------------------------------------
+
+        if self._is_multi_intent_query(question):
+            sub_answers = self._answer_multi_intent(question, retrieval_mode)
+            if sub_answers:
+                return sub_answers
 
         # --------------------------------------------------------------
         # 3. VALIDATE KNOWLEDGE BASE
