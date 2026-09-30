@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import hashlib
 import json
@@ -92,28 +92,28 @@ class RAGPipeline:
 
     Architecture:
         User Query
-             ↓
+             â†“
         Greeting Check
-             ↓
+             â†“
         Query Preparation
-             ↓
-        ┌──────────────────────┐
-        │ Dense Retrieval      │
-        │ BM25 Retrieval       │
-        └──────────┬───────────┘
-                   ↓
+             â†“
+        â”Œâ”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”
+        â”‚ Dense Retrieval      â”‚
+        â”‚ BM25 Retrieval       â”‚
+        â””â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”¬â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”˜
+                   â†“
               RRF Fusion
-                   ↓
+                   â†“
             Candidate Pool
-                   ↓
+                   â†“
           Evidence Evaluation
-                   ↓
+                   â†“
         Deduplication + Diversity
-                   ↓
+                   â†“
           Context Selection
-                   ↓
+                   â†“
                   LLM
-                   ↓
+                   â†“
               Final Answer
 
     CrossEncoder reranking is intentionally disabled.
@@ -844,7 +844,7 @@ class RAGPipeline:
         )
 
         # --------------------------------------------------------------
-        # Unchanged file → skip
+        # Unchanged file â†’ skip
         # --------------------------------------------------------------
 
         if (
@@ -1264,7 +1264,7 @@ class RAGPipeline:
         """
         import re
 
-        # Rule-based splitting — no LLM call
+        # Rule-based splitting â€” no LLM call
         # Split on common multi-intent delimiters
         raw = re.split(r" and | also |\? |\n|; ", question)
 
@@ -1288,7 +1288,7 @@ class RAGPipeline:
                 resp = self._answer_question_impl(sub_q, retrieval_mode)
                 sub_responses.append((sub_q, resp))
             except Exception as exc:
-                logger.warning("Multi-intent sub-question failed: %s — %s", sub_q, exc)
+                logger.warning("Multi-intent sub-question failed: %s â€” %s", sub_q, exc)
 
         if len(sub_responses) < 2:
             return None
@@ -1351,25 +1351,25 @@ class RAGPipeline:
 
         Flow:
             Validate
-              ↓
+              â†“
             Greeting
-              ↓
+              â†“
             Query preparation
-              ↓
+              â†“
             Query embedding
-              ↓
+              â†“
             Dense + BM25
-              ↓
+              â†“
             RRF
-              ↓
+              â†“
             Evidence gate
-              ↓
+              â†“
             Token Optimizer
-              ↓
+              â†“
             Context
-              ↓
+              â†“
             LLM
-              ↓
+              â†“
             Answer
         """
 
@@ -2036,6 +2036,7 @@ class RAGPipeline:
                 raw_answer,
                 final_candidates,
                 kb_version=kb_state.get("version", 1),
+                embedding_service=self.embedding_service,
             )
         answer_evaluation = evaluate_answer_quality(
             question, raw_answer, citations, citation_coverage, final_candidates
