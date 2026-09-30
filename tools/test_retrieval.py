@@ -1,4 +1,4 @@
-import os
+﻿import os
 from pathlib import Path
 import sys
 
@@ -6,7 +6,8 @@ import sys
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-os.environ['DEV_EMBEDDINGS'] = 'true'
+# Use real embeddings from .env configuration instead of synthetic
+# os.environ['DEV_EMBEDDINGS'] = 'true'  # REMOVED - was causing dimension mismatch
 
 from src.rag_pipeline import RAGPipeline
 
