@@ -12,21 +12,6 @@ if TYPE_CHECKING:
 _STOPWORDS = {"a", "an", "and", "are", "as", "at", "be", "by", "for", "from", "in", "is", "it", "of", "on", "or", "that", "the", "this", "to", "was", "were", "with", "which", "who", "what", "when", "where", "why", "how", "has", "have", "had", "been", "will", "would", "could", "should", "may", "might", "can"}
 
 
-def _cosine_similarity(vec1: list[float], vec2: list[float]) -> float:
-    """Calculate cosine similarity between two vectors."""
-    if not vec1 or not vec2 or len(vec1) != len(vec2):
-        return 0.0
-    
-    dot_product = sum(a * b for a, b in zip(vec1, vec2))
-    mag1 = sum(a * a for a in vec1) ** 0.5
-    mag2 = sum(b * b for b in vec2) ** 0.5
-    
-    if mag1 == 0 or mag2 == 0:
-        return 0.0
-    
-    return dot_product / (mag1 * mag2)
-
-
 def _split_into_claims(answer: str) -> list[str]:
     """
     Extract claims ONLY from the Answer section, ignoring Details, Sources, etc.
@@ -86,51 +71,8 @@ def _split_into_claims(answer: str) -> list[str]:
     return claims
 
 
-def _find_best_passage_semantic(
-    claim: str, 
-    text: str, 
-    embedding_service: "EmbeddingService | None" = None
-) -> tuple[str, float]:
-    """Find most relevant passage using semantic similarity with embeddings."""
-    if not text.strip():
-        return "", 0.0
-    
-    sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", text.strip()) if s.strip()]
-    if not sentences:
-        return text[:300].strip(), 0.0
-    
-    # If no embedding service, fall back to lexical matching
-    if embedding_service is None:
-        return _find_best_passage_lexical(claim, text)
-    
-    try:
-        # Get claim embedding
-        claim_emb = embedding_service.create_embedding(claim)
-        
-        # Score each sentence semantically
-        best_passage = ""
-        best_score = 0.0
-        
-        for idx, sentence in enumerate(sentences):
-            sent_emb = embedding_service.create_embedding(sentence)
-            similarity = _cosine_similarity(claim_emb, sent_emb)
-            
-            if similarity > best_score:
-                # Include context: sentence before and after
-                ctx_start = max(0, idx - 1)
-                ctx_end = min(len(sentences), idx + 2)
-                best_passage = " ".join(sentences[ctx_start:ctx_end])
-                best_score = similarity
-        
-        return best_passage or text[:300].strip(), best_score
-    
-    except Exception:
-        # Fallback to lexical if embeddings fail
-        return _find_best_passage_lexical(claim, text)
-
-
 def _find_best_passage_lexical(claim: str, text: str) -> tuple[str, float]:
-    """Lexical fallback: find passage with most term overlap."""
+    """Fast lexical matching: find passage with most term overlap."""
     claim_terms = set(re.findall(r"[a-z0-9]+", claim.lower())) - _STOPWORDS
     if not claim_terms:
         return text[:300].strip(), 0.0
@@ -159,45 +101,13 @@ def _verify_claim_support(
     embedding_service: "EmbeddingService | None" = None
 ) -> tuple[str, float, str]:
     """
-    Verify if claim is supported by the passage using semantic similarity.
-    Returns: (status, score, reason)
+    Fast lexical verification - NO embedding calls during citation checking.
+    This runs after retrieval and must be quick.
     """
     if not passage.strip() and not chunk_text.strip():
         return "unsupported", 0.0, "No source content available."
     
-    # Use embedding-based semantic verification if available
-    if embedding_service is not None:
-        try:
-            claim_emb = embedding_service.create_embedding(claim)
-            
-            # Check both passage and full chunk
-            passage_emb = embedding_service.create_embedding(passage)
-            passage_sim = _cosine_similarity(claim_emb, passage_emb)
-            
-            chunk_sim = 0.0
-            if chunk_text and chunk_text != passage:
-                chunk_emb = embedding_service.create_embedding(chunk_text[:1000])  # Limit chunk size
-                chunk_sim = _cosine_similarity(claim_emb, chunk_emb)
-            
-            # Use the higher similarity score
-            semantic_score = max(passage_sim, chunk_sim)
-            
-            # Semantic similarity thresholds (well-calibrated for real embeddings)
-            if semantic_score >= 0.70:
-                return "supported", semantic_score, "Strong semantic alignment with source content."
-            elif semantic_score >= 0.55:
-                return "supported", semantic_score, "Good semantic match with source."
-            elif semantic_score >= 0.40:
-                return "partially_supported", semantic_score, "Moderate semantic relevance to source."
-            elif semantic_score >= 0.25:
-                return "partially_supported", semantic_score, "Weak semantic connection to source."
-            else:
-                return "unsupported", semantic_score, "Insufficient semantic alignment with source."
-        
-        except Exception:
-            pass  # Fall through to lexical verification
-    
-    # Lexical fallback verification
+    # Fast lexical verification only
     claim_terms = set(re.findall(r"[a-z0-9]+", claim.lower())) - _STOPWORDS
     search_scope = f"{passage} {chunk_text}".lower()
     passage_terms = set(re.findall(r"[a-z0-9]+", search_scope)) - _STOPWORDS
@@ -219,7 +129,7 @@ def _verify_claim_support(
         else:
             return "unsupported", lexical_coverage, f"Key numeric value '{missing}' not found in source."
     
-    # Lexical thresholds
+    # Lexical thresholds - optimized for speed
     if lexical_coverage >= 0.35:
         return "supported", lexical_coverage, "Strong lexical overlap with source."
     elif lexical_coverage >= 0.20:
@@ -248,11 +158,11 @@ def generate_claim_citations(
     embedding_service: "EmbeddingService | None" = None
 ) -> tuple[list[Citation], CitationCoverage]:
     """
-    Generate source-aware, semantically-verified citations.
+    Generate fast, source-aware citations using lexical verification only.
     
     Extracts claims ONLY from the Answer section, ignoring Details and Sources.
-    Uses embedding-based semantic similarity when available, falls back to
-    lexical matching. Provides clear traceability from claims to sources.
+    Uses fast lexical matching - no embedding calls during citation verification.
+    Embeddings are used during retrieval, not citation checking.
     """
     claims = _split_into_claims(answer) if answer.strip() else []
     if not selected_candidates:
@@ -270,16 +180,16 @@ def generate_claim_citations(
         explicit = [int(v) for v in re.findall(r"\[(?:Source\s*)?(\d+)\]", claim) if int(v) in chunk_map]
         candidates = [chunk_map[index] for index in explicit] if explicit else selected_candidates
         
-        # Find best supporting passage across candidates (semantic if possible)
+        # Find best supporting passage using fast lexical matching
         scored = [
-            (_find_best_passage_semantic(display_claim, candidate.text or "", embedding_service), candidate)
+            (_find_best_passage_lexical(display_claim, candidate.text or ""), candidate)
             for candidate in candidates
         ]
         (passage, match_score), candidate = max(scored, key=lambda item: item[0][1])
         
-        # Verify claim support with semantic or lexical analysis
+        # Verify claim support using fast lexical analysis (NO embeddings)
         status, support_score, reason = _verify_claim_support(
-            display_claim, passage, candidate.text or "", embedding_service
+            display_claim, passage, candidate.text or ""
         )
         
         # Update counters
@@ -312,7 +222,7 @@ def generate_claim_citations(
             passage=passage if passage else "[No supporting passage found]",
             retrieval_source=_origin(candidate) if status != "unsupported" or explicit else "Unverified",
             status=status,
-            verification_reason=f"{status.replace('_', ' ').title()}: {reason} (score: {support_score:.2f})",
+            verification_reason=f"{status.replace('_', ' ').title()}: {reason}",
             kb_version=kb_version,
             support_score=support_score,
             lexical_overlap=match_score,
