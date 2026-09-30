@@ -14,51 +14,50 @@ _STOPWORDS = {"a", "an", "and", "are", "as", "at", "be", "by", "for", "from", "i
 
 def _split_into_claims(answer: str) -> list[str]:
     """
-    Extract claims ONLY from the Answer section, ignoring Details, Sources, etc.
+    Extract claims from Answer AND Details sections.
+    Stop before Sources section.
     
     Expected format:
         Answer:
         <claims to extract>
         
         Details:
-        <ignore this>
+        <also extract from here>
         
         Sources:
-        <ignore this>
+        <ignore this and below>
     """
     lines = []
-    in_answer_section = False
+    in_extractable_section = False
     
     for line in answer.splitlines():
         line = line.strip()
         if not line:
             continue
         
-        # Check if we're entering the Answer section
-        if re.match(r"^(?:\*\*)?answer(?:\*\*)?:\s*$", line, re.I):
-            in_answer_section = True
+        # Check if we're entering Answer or Details section
+        if re.match(r"^(?:\*\*)?(?:answer|details)(?:\*\*)?:\s*$", line, re.I):
+            in_extractable_section = True
             continue
         
-        # Check if we're leaving the Answer section (entering Details, Sources, etc.)
-        if re.match(r"^(?:\*\*)?(?:details|sources|confidence|references|note)(?:\*\*)?:\s*$", line, re.I):
-            in_answer_section = False
-            break  # Stop processing once we leave Answer section
+        # Check if we're hitting Sources or other terminal section
+        if re.match(r"^(?:\*\*)?(?:sources|confidence|references|note)(?:\*\*)?:\s*$", line, re.I):
+            break  # Stop processing entirely
         
-        # If we're in the answer section, collect the line
-        if in_answer_section:
+        # If we're in Answer or Details section, collect the line
+        if in_extractable_section:
             # Remove bullet points or numbering
             cleaned = re.sub(r"^(?:[-*]|\d+\.)\s+", "", line)
             lines.append(cleaned)
     
-    # If no explicit "Answer:" section found, process all lines until we hit a section marker
-    # This handles cases where LLM doesn't use the exact format
+    # If no explicit "Answer:" or "Details:" section found, process all lines until terminal section
     if not lines:
         for line in answer.splitlines():
             line = line.strip()
             if not line:
                 continue
-            # Stop at any section marker
-            if re.match(r"^(?:\*\*)?(?:answer|details|sources|confidence|references|note)(?:\*\*)?:\s*$", line, re.I):
+            # Stop at terminal markers
+            if re.match(r"^(?:\*\*)?(?:sources|confidence|references|note)(?:\*\*)?:\s*$", line, re.I):
                 break
             # Remove bullet points or numbering
             cleaned = re.sub(r"^(?:[-*]|\d+\.)\s+", "", line)
@@ -158,9 +157,9 @@ def generate_claim_citations(
     embedding_service: "EmbeddingService | None" = None
 ) -> tuple[list[Citation], CitationCoverage]:
     """
-    Generate fast, source-aware citations using lexical verification only.
+    Generate fast, source-aware citations from Answer and Details sections.
     
-    Extracts claims ONLY from the Answer section, ignoring Details and Sources.
+    Extracts claims from both Answer AND Details sections, stops at Sources.
     Uses fast lexical matching - no embedding calls during citation verification.
     Embeddings are used during retrieval, not citation checking.
     """
