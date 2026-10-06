@@ -21,10 +21,14 @@ Design invariants:
 from __future__ import annotations
 
 import json
+import os
+import threading
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+_OBSERVATION_LOCK = threading.RLock()
 
 
 # ---------------------------------------------------------------------------
@@ -244,10 +248,52 @@ def record_observation(
 
     path = observation_path(vectorstore_path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a", encoding="utf-8") as handle:
-        handle.write(json.dumps(observation, ensure_ascii=False, default=str) + "\n")
+    with _OBSERVATION_LOCK:
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(observation, ensure_ascii=False, default=str) + "\n")
 
     return observation
+
+
+def update_observation_fields(
+    vectorstore_path: Path,
+    query_id: str,
+    fields: dict[str, Any],
+) -> bool:
+    """Update fields on a saved observation, preserving its other trace data."""
+    path = observation_path(vectorstore_path)
+    if not path.exists():
+        return False
+
+    with _OBSERVATION_LOCK:
+        updated_lines: list[str] = []
+        found = False
+        for line in path.read_text(encoding="utf-8").splitlines():
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                updated_lines.append(line)
+                continue
+
+            if row.get("query_id") == query_id:
+                row.update(fields)
+                if "deepeval" in fields:
+                    trace = row.setdefault("trace", {})
+                    if isinstance(trace, dict):
+                        trace["deepeval"] = fields["deepeval"]
+                found = True
+            updated_lines.append(
+                json.dumps(row, ensure_ascii=False, default=str)
+            )
+
+        if found:
+            temp_path = path.with_suffix(path.suffix + ".tmp")
+            temp_path.write_text(
+                "\n".join(updated_lines) + "\n",
+                encoding="utf-8",
+            )
+            os.replace(temp_path, path)
+        return found
 
 
 def load_observations(

@@ -104,10 +104,10 @@ def dense_retrieve(
         )
 
         filename = str(
-            metadata.get(
-                "filename",
-                f"document-{index}",
-            )
+            metadata.get("filename")
+            or metadata.get("book_name")
+            or metadata.get("book_title")
+            or f"document-{index}"
         )
 
         chunk_id = metadata.get(
@@ -205,6 +205,31 @@ def bm25_retrieve(
         )
         return
 
+    CANONICAL_FIELDS = (
+        "book_title",
+        "book_name",
+        "book_id",
+        "chapter_num",
+        "chapter_title",
+        "section_heading",
+        "section_title",
+        "page_start",
+        "page_end",
+        "page_number",
+        "token_count",
+        "character_count",
+        "prev_chunk_id",
+        "next_chunk_id",
+        "source_path",
+        "section_path",
+        "section_level",
+        "chunk_index",
+        "total_section_chunks",
+        "category",
+        "has_heading",
+        "file_type",
+    )
+
     for index, result in enumerate(bm25_results):
 
         if not isinstance(result, dict):
@@ -213,10 +238,10 @@ def bm25_retrieve(
         rank = index + 1
 
         filename = str(
-            result.get(
-                "filename",
-                "unknown",
-            )
+            result.get("filename")
+            or result.get("book_name")
+            or result.get("book_title")
+            or "unknown"
         )
 
         chunk_id = result.get(
@@ -251,20 +276,8 @@ def bm25_retrieve(
                 "chunk_id": chunk_id,
             }
 
-            for field_name in (
-                "source_path",
-                "section_heading",
-                "section_path",
-                "section_level",
-                "chunk_index",
-                "total_section_chunks",
-                "category",
-                "has_heading",
-                "file_type",
-                "page_number",
-            ):
+            for field_name in CANONICAL_FIELDS:
                 value = result.get(field_name)
-
                 if value is not None:
                     metadata[field_name] = value
 
@@ -299,18 +312,8 @@ def bm25_retrieve(
         # Preserve all useful BM25 metadata
         # --------------------------------------------------------------
 
-        for field_name in (
-            "source_path",
-            "section_heading",
-            "section_path",
-            "section_level",
-            "chunk_index",
-            "total_section_chunks",
-            "category",
-            "has_heading",
-        ):
+        for field_name in CANONICAL_FIELDS:
             value = result.get(field_name)
-
             if value is not None and value != "":
                 candidate.metadata[field_name] = value
 

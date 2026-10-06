@@ -9,9 +9,10 @@ from pathlib import Path
 
 import streamlit as st
 
-from src.config import KNOWLEDGE_BASE_DIR, VECTORSTORE_DIR
+from src.config import KNOWLEDGE_BASE_DIR, VECTORSTORE_DIR, ENABLE_IMAGE_ANALYSIS
 from src.document_loader import chunk_documents, list_txt_files, list_knowledge_files, load_documents
 from src.rag_pipeline import RAGPipeline
+from src.rag_pipeline.kb_state import get_current_kb_state
 from src.rag_pipeline.observation_store import load_observations
 from src.rag_pipeline.observatory import (
     build_observatory_snapshot,
@@ -106,20 +107,20 @@ PAGE_ARCH = "System Architecture"
 # (group label, [(page, icon)])
 NAV_GROUPS = [
     ("Database & History", [
-        (PAGE_CHAT_HISTORY, "💬"),
-        (PAGE_CHUNKS, "🧩"),
+        (PAGE_CHAT_HISTORY, ""),
+        (PAGE_CHUNKS, ""),
     ]),
     ("Mission Control", [
-        (PAGE_MISSION, "🌌"),
+        (PAGE_MISSION, ""),
     ]),
-    ("Retrieval", [(PAGE_LAB, "🔬")]),
-    ("Knowledge Base", [(PAGE_INGEST, "📥")]),
+    ("Retrieval", [(PAGE_LAB, "")]),
+    ("Knowledge Base", [(PAGE_INGEST, "")]),
     ("Evaluation", [
         (PAGE_OBSERVATION, "Observation"),
         (PAGE_DASHBOARD, "Dashboard"),
         (PAGE_COMPARISON, "Compare"),
     ]),
-    ("System", [(PAGE_ARCH, "🛰")]),
+    ("System", [(PAGE_ARCH, "")]),
 ]
 
 PAGES = [page for _, items in NAV_GROUPS for page, _ in items]
@@ -133,38 +134,38 @@ def _sidebar_nav_label(marker: str, page_name: str, icon: str) -> str:
 
 
 INGESTION_STAGES = [
-    ("📄", "Document", "Loaded"),
-    ("🧹", "Text Cleaning", "Normalized"),
-    ("✂️", "Chunking", "Segmented"),
-    ("🧬", "Embedding", "Vectorized"),
-    ("🗄️", "Chroma", "Stored"),
-    ("🔎", "BM25", "Indexed"),
-    ("✅", "Knowledge Ready", "Queryable"),
+    ("", "Document", "Loaded"),
+    ("", "Text Cleaning", "Normalized"),
+    ("", "Chunking", "Segmented"),
+    ("", "Embedding", "Vectorized"),
+    ("", "Chroma", "Stored"),
+    ("", "BM25", "Indexed"),
+    ("", "Knowledge Ready", "Queryable"),
 ]
 
 SIMULATION_STEPS = [
-    ("01", "📄", "DOCUMENT DETECTED",
+    ("01", "", "DOCUMENT DETECTED",
      "A TXT or Markdown file is discovered in the knowledge base "
      "directory and queued for processing."),
-    ("02", "📖", "TEXT EXTRACTED",
+    ("02", "", "TEXT EXTRACTED",
      "Raw text is read and normalized. Whitespace is collapsed and "
      "section headings are detected so they can be kept as metadata."),
-    ("03", "✂", "CONTENT CHUNKED",
+    ("03", "", "CONTENT CHUNKED",
      "The document is split into overlapping segments. Overlap keeps a "
      "sentence that crosses a boundary readable in both chunks."),
-    ("04", "🧠", "EMBEDDING GENERATED",
+    ("04", "", "EMBEDDING GENERATED",
      "Each chunk is converted into a numerical vector by the configured "
      "embedding model, capturing meaning rather than exact wording."),
-    ("05", "🛰", "STORED IN CHROMA",
+    ("05", "", "STORED IN CHROMA",
      "Vectors and metadata are written to the persistent Chroma "
      "collection, which survives restarts."),
-    ("06", "🔎", "INDEXED IN BM25",
+    ("06", "", "INDEXED IN BM25",
      "The same chunks are added to the persistent BM25 index for exact "
      "term matching, keeping rare names and identifiers findable."),
 ]
 
 # Component descriptions for the architecture page. These describe the
-# system as actually implemented — nothing here is aspirational.
+# system as actually implemented - nothing here is aspirational.
 ARCH_DESCRIPTIONS = [
     ("Document Loader",
      "Reads TXT and Markdown files from the knowledge base directory and "
@@ -222,44 +223,44 @@ ARCH_DESCRIPTIONS = [
 
 RETRIEVAL_DIAGRAM = """\
                     USER QUERY
-                        │
-                        ▼
+                        
+                        
                 Query Preparation
-                        │
-             ┌──────────┴──────────┐
-             ▼                     ▼
+                        
+             
+                                  
        Dense Retrieval           BM25
-             │                     │
-             └──────────┬──────────┘
-                        ▼
+                                  
+             
+                        
                        RRF
-                        │
-                        ▼
+                        
+                        
                 Evidence Evaluation
-                        │
-                        ▼
+                        
+                        
                  Context Selection
-                        │
-                        ▼
+                        
+                        
                   LLM Generation
-                        │
-                        ▼
+                        
+                        
                       Answer"""
 
 INGESTION_DIAGRAM = """\
 Documents
-    │
-    ▼
+    
+    
 Cleaning
-    │
-    ▼
+    
+    
 Chunking
-    │
-    ├───────────────┐
-    ▼               ▼
+    
+    
+                   
 Embeddings        BM25
-    │
-    ▼
+    
+    
 Chroma"""
 
 
@@ -316,7 +317,7 @@ def _segmented_control(options: list, default: str, key: str) -> str:
             )
         except TypeError:
             # Older Streamlit accepts segmented_control but not the
-            # width/use_container_width kwarg — retry without it rather
+            # width/use_container_width kwarg  retry without it rather
             # than losing the control entirely.
             try:
                 value = st.segmented_control(
@@ -473,11 +474,21 @@ def _compute_chunks(
     signature: tuple,
 ) -> list:
     """
-    Recompute chunks for inspection using the backend's own chunker.
-
-    This is the same chunking function the ingestion path uses, so the
-    preview reflects real behaviour. It does not write to Chroma or BM25.
+    Load canonical chunks for inspection.
+    Uses precomputed canonical chunks cache if available for instant UI rendering.
     """
+    cache_path = Path(VECTORSTORE_DIR) / "canonical_chunks_cache.json"
+    if cache_path.exists():
+        try:
+            cached = json.loads(cache_path.read_text(encoding="utf-8"))
+            if cached and isinstance(cached, list):
+                for c in cached:
+                    if not c.get("filename"):
+                        c["filename"] = c.get("book_name") or "Mind Management, Not Time Management (1).pdf"
+                return [c for c in cached if (c.get("text") or "").strip()]
+        except Exception:
+            pass
+
     documents = load_documents(Path(kb_path))
 
     chunks = chunk_documents(
@@ -485,6 +496,10 @@ def _compute_chunks(
         chunk_size=chunk_size,
         chunk_overlap=chunk_overlap,
     )
+
+    for c in chunks:
+        if not c.get("filename"):
+            c["filename"] = c.get("book_name") or "Mind Management, Not Time Management (1).pdf"
 
     return [c for c in chunks if (c.get("text") or "").strip()]
 
@@ -536,7 +551,7 @@ def _service_error(title: str, detail: str = "") -> None:
     available for debugging without being pushed at a normal user.
     """
     st.error(
-        f"⚠ {title}\n\n"
+        f" {title}\n\n"
         "The configured retrieval, embedding or generation service could "
         "not be reached. Check the environment and API configuration."
     )
@@ -563,6 +578,12 @@ def _build_meta(response: dict, requested_mode: str) -> dict:
     evidence = snapshot.get("evidence", {}) if snapshot else {}
     retrieval = snapshot.get("retrieval", {}) if snapshot else {}
 
+    raw_dense = retrieval.get("raw_dense") or []
+    raw_bm25 = retrieval.get("raw_bm25") or []
+    rrf_res = retrieval.get("rrf_results") or retrieval.get("rrf_calculation") or []
+    ctx_chunks = get_context_chunks(trace)
+    all_cand = get_candidate_chunks(trace, response)
+
     return {
         "requested_mode": requested_mode,
         "mode_label": retrieval.get(
@@ -572,9 +593,14 @@ def _build_meta(response: dict, requested_mode: str) -> dict:
         "evidence_level": evidence.get("level"),
         "evidence_label": describe_evidence_level(evidence.get("level")),
         "supporting_sources": get_supporting_sources(trace, response),
-        "context_chunks": get_context_chunks(trace),
-        "candidates": get_candidate_chunks(trace, response),
-        "candidate_count": retrieval.get("candidate_count"),
+        "context_chunks": ctx_chunks,
+        "candidates": all_cand,
+        "candidate_count": retrieval.get("candidate_count") or len(all_cand),
+        "dense_candidate_count": len(raw_dense),
+        "bm25_candidate_count": len(raw_bm25),
+        "rrf_candidate_count": retrieval.get("fused_count") or len(rrf_res) or len(all_cand),
+        "final_context_chunk_count": len(ctx_chunks),
+        "retrieval_time_ms": retrieval.get("retrieval_ms") or (response.get("observation", {}).get("latency_ms") if response else None),
         "trace_available": bool(trace),
         "error": response.get("error", ""),
         "evaluation": response.get("evaluation") or snapshot.get("evaluation", {}),
@@ -583,33 +609,79 @@ def _build_meta(response: dict, requested_mode: str) -> dict:
         "confidence": response.get("confidence") or snapshot.get("confidence", {}),
         "kb_state": response.get("kb_state") or snapshot.get("kb_state", {}),
         "candidate_journey": trace.get("candidate_journey") or snapshot.get("candidate_journey", []),
+        "llm_ms": trace.get("llm_ms") or response.get("llm_ms"),
+        "retrieval_ms": trace.get("retrieval_ms") or response.get("retrieval_ms"),
+        "deepeval_results": response.get("deepeval_results") or response.get("deepeval") or {},
+        "langfuse_trace_id": (
+            response.get("langfuse_trace_id")
+            or (response.get("observability") or {}).get("langfuse_trace_id")
+            or (response.get("observation", {}) or {}).get("langfuse_trace_id")
+        ),
     }
 
 
 def _render_chunk_list(chunks: list, mode_label: str = "") -> None:
-    """Render chunks with native components so text formatting survives."""
+    """Render chunks exposing complete canonical metadata and clean formatting."""
     for index, chunk in enumerate(chunks, start=1):
-        filename = chunk.get("filename") or "unknown source"
-        chunk_id = chunk.get("chunk_id") or "unknown id"
+        book = chunk.get("book") or chunk.get("book_title") or "Mind Management, Not Time Management"
+        chunk_id = chunk.get("chunk_id") or f"chunk_{index}"
+        ch = chunk.get("chapter") or chunk.get("chapter_num")
+        ch_str = f"Chapter {ch}" if ch and int(ch) > 0 else ""
+        sec = chunk.get("section") or chunk.get("section_heading") or chunk.get("section_title") or ""
+        p_range = chunk.get("page_range") or (f"pp. {chunk.get('page_start')}–{chunk.get('page_end')}" if chunk.get('page_start') else "")
 
-        parts = [f"**{index}. {filename}**", f"`{chunk_id}`"]
-
+        title_parts = [f"**{index}. {book}**"]
+        if ch_str:
+            title_parts.append(f"*{ch_str}*")
+        if p_range and p_range != "-":
+            title_parts.append(f"`{p_range}`")
         if mode_label:
-            parts.append(mode_label)
+            title_parts.append(f"[{mode_label}]")
 
-        score = chunk.get("score")
+        st.markdown(" — ".join(title_parts))
 
-        if score is not None:
-            parts.append(f"{chunk.get('score_label', 'Score')}: {score}")
+        # Canonical Metadata Badges
+        badges = [f"**Chunk ID:** `{chunk_id}`"]
+        if sec:
+            badges.append(f"**Section:** {sec}")
+        if chunk.get("dense_rank") is not None:
+            dist_str = f" (dist: {chunk.get('dense_distance')})" if chunk.get("dense_distance") is not None else ""
+            badges.append(f"**Dense:** #{chunk['dense_rank']}{dist_str}")
+        if chunk.get("bm25_rank") is not None:
+            score_str = f" (score: {chunk.get('bm25_score')})" if chunk.get("bm25_score") is not None else ""
+            badges.append(f"**BM25:** #{chunk['bm25_rank']}{score_str}")
+        if chunk.get("rrf_score") is not None and float(chunk.get("rrf_score") or 0) > 0:
+            badges.append(f"**RRF Score:** {chunk['rrf_score']}")
+        elif chunk.get("score") is not None:
+            badges.append(f"**Score:** {chunk['score']}")
 
-        st.markdown(" · ".join(parts))
+        st.caption(" | ".join(badges))
 
         text = chunk.get("text") or ""
-
         if text:
-            st.code(text, language="text")
+            with st.expander(f"Inspect Text — {len(text)} characters", expanded=(index == 1)):
+                # Rich metadata panel
+                meta_c1, meta_c2, meta_c3, meta_c4 = st.columns(4)
+                ch = chunk.get("chapter") or chunk.get("chapter_num")
+                ch_title = chunk.get("chapter_title") or ""
+                sec = chunk.get("section") or chunk.get("section_heading") or chunk.get("section_title") or ""
+                p_start = chunk.get("page_start")
+                p_end   = chunk.get("page_end") or p_start
+                tok     = chunk.get("token_count")
+                cid     = chunk.get("chunk_id") or ""
+
+                meta_c1.caption(f"**Book:** {chunk.get('book') or chunk.get('book_title') or '—'}")
+                meta_c2.caption(f"**Chapter:** {f'Ch. {ch}' if ch else '—'}{f' — {ch_title}' if ch_title else ''}")
+                meta_c3.caption(f"**Section:** {sec[:40] if sec else '—'}")
+                meta_c4.caption(f"**Pages:** {f'{p_start}–{p_end}' if p_start else '—'} | **Tokens:** {tok or '—'}")
+
+                st.code(text, language="text")
+
+                with st.expander("Raw metadata", expanded=False):
+                    st.json({k: v for k, v in chunk.items() if k != "text" and v is not None and v != "" and v != 0})
         else:
             st.caption("Chunk text is not present in the trace.")
+        st.markdown("---")
 
 
 def _render_answer_extras(meta: dict) -> None:
@@ -642,7 +714,7 @@ def _render_answer_extras(meta: dict) -> None:
         with sub_col2:
             if kb_state:
                 v = kb_state.get("version", 1)
-                sync = "✓ Synced" if kb_state.get("indexes_consistent", True) else "⚠ Mismatch"
+                sync = " Synced" if kb_state.get("indexes_consistent", True) else " Mismatch"
                 st.caption(f"Knowledge Base: **v{v}** ({sync})")
 
     sources = meta.get("supporting_sources") or []
@@ -658,34 +730,62 @@ def _render_answer_extras(meta: dict) -> None:
             for c in citations:
                 render_html(render_citation_card(c))
 
+    # ========================================================================
+    # RETRIEVAL METRICS & CITATION TRACE BREAKDOWN (Requirements 4 & 5)
+    # ========================================================================
     context_chunks = meta.get("context_chunks") or []
     candidates = meta.get("candidates") or []
+    citations = meta.get("citations") or []
 
+    retrieved_count = meta.get("candidate_count") or len(candidates) or len(context_chunks)
+    sent_count = len(context_chunks)
+
+    # Chunks actually cited as evidence in verified claims
+    cited_chunk_ids = {str(c.get("chunk_id")) for c in citations if c.get("chunk_id")}
+    cited_chunks = [c for c in context_chunks if str(c.get("chunk_id")) in cited_chunk_ids]
+    unused_chunks = [c for c in context_chunks if str(c.get("chunk_id")) not in cited_chunk_ids]
+    cited_count = len(cited_chunks)
+    unused_count = len(unused_chunks)
+
+    st.markdown("#### 🔬 Retrieval Results & Evidence Trace")
+
+    ret_ms = meta.get("retrieval_time_ms") or meta.get("retrieval_ms")
+    col1, col2 = st.columns(2)
+    col1.metric("Retrieval Latency", f"{ret_ms:.0f} ms" if isinstance(ret_ms, (int, float)) and ret_ms > 0 else "—")
+    llm_ms = meta.get("llm_ms") or meta.get("llm_time_ms")
+    col2.metric("LLM Generation Time", f"{llm_ms:.0f} ms" if isinstance(llm_ms, (int, float)) and llm_ms > 0 else "—")
+
+    # Chapter distribution of retrieved context
+    context_chunks = meta.get("context_chunks") or []
     if context_chunks:
-        label = (
-            f"Supporting context — {len(context_chunks)} chunks "
-            "sent to the model"
-        )
+        chapter_dist = {}
+        for c in context_chunks:
+            ch = c.get("chapter") or c.get("chapter_num")
+            try:
+                ch_int = int(ch) if ch else None
+            except (ValueError, TypeError):
+                ch_int = None
+            key = f"Ch. {ch_int}" if ch_int else "Unknown"
+            chapter_dist[key] = chapter_dist.get(key, 0) + 1
 
-        with st.expander(label):
-            _render_chunk_list(
-                context_chunks,
-                mode_label=meta.get("mode_label", ""),
-            )
+        if len(chapter_dist) > 1:
+            with st.expander("📚 Retrieved Context by Chapter", expanded=False):
+                st.caption("Distribution of final context chunks across book chapters.")
+                st.bar_chart(chapter_dist)
 
-    elif candidates:
-        with st.expander(
-            f"Retrieved candidates — {len(candidates)} chunks"
-        ):
-            st.caption(
-                "The trace did not record the final context bodies. These "
-                "are retrieval candidates, which are not the same as the "
-                "chunks that supported the answer."
-            )
-            _render_chunk_list(
-                candidates,
-                mode_label=meta.get("mode_label", ""),
-            )
+    if cited_chunks:
+        with st.expander(f"✅ Chunks Used as Citation Evidence ({cited_count})", expanded=True):
+            st.caption("These chunks were sent to the LLM and directly cited to verify factual statements in the answer.")
+            _render_chunk_list(cited_chunks, mode_label="Cited Evidence")
+
+    if unused_chunks:
+        with st.expander(f"ℹ️ Retrieved Chunks Not Cited ({unused_count})", expanded=False):
+            st.caption("These chunks were passed to the LLM as background/continuity context, but were not directly cited in the final claim evidence.")
+            _render_chunk_list(unused_chunks, mode_label="Uncited Context")
+
+    if not context_chunks and candidates:
+        with st.expander(f"Retrieved Candidates Pool ({len(candidates)})"):
+            _render_chunk_list(candidates, mode_label=meta.get("mode_label", ""))
 
     if meta.get("error"):
         _service_error("GENERATION SERVICE UNAVAILABLE", meta["error"])
@@ -729,7 +829,7 @@ def _ingest_uploaded_file(pipeline: RAGPipeline, uploaded, rerun: bool = False):
     """
     raw_bytes: bytes = uploaded.getvalue()
 
-    with st.spinner(f"Ingesting {uploaded.name} …"):
+    with st.spinner(f"Ingesting {uploaded.name} "):
         try:
             result = pipeline.ingest_file(
                 file_path=uploaded.name,
@@ -754,7 +854,7 @@ def _ingest_uploaded_file(pipeline: RAGPipeline, uploaded, rerun: bool = False):
         notice_type = "info"
     else:
         message = (
-            f"{uploaded.name} added — "
+            f"{uploaded.name} added  "
             f"{result.get('chunks_added', 'unknown')} new chunks indexed. "
             f"Total indexed: {result.get('collection_count', 'unknown')}."
         )
@@ -873,9 +973,22 @@ def _render_ingestion_result(result: dict) -> None:
             "backend. They are not estimated here."
         )
 
+    # Image-aware metadata
+    chunks_with_images = result.get("chunks_with_images", 0)
+    if chunks_with_images:
+        st.caption(f"🖼 {chunks_with_images} chunks contain pages with embedded images/figures (metadata preserved for retrieval)")
+
+    chunks_described = result.get("chunks_with_images_described", 0)
+    if chunks_described:
+        st.caption(f"🤖 {chunks_described} image pages analyzed by Gemini Vision and descriptions stored in chunk metadata")
+    elif chunks_with_images > 0:
+        enable_hint = not ENABLE_IMAGE_ANALYSIS
+        if enable_hint:
+            st.caption("💡 Set `ENABLE_IMAGE_ANALYSIS=true` in .env to enable Gemini Vision analysis of these images")
+
 
 # ============================================================================
-# PAGE — MISSION CONTROL
+# PAGE  MISSION CONTROL
 # ============================================================================
 
 def _render_overview_cards(
@@ -933,7 +1046,7 @@ def _render_overview_cards(
         )
 
     st.caption(
-        f"Embedding model: {embedding_model or 'N/A'} · "
+        f"Embedding model: {embedding_model or 'N/A'}  "
         f"Source documents: {status.get('txt_files_found', 'N/A')}"
     )
 
@@ -955,7 +1068,38 @@ def _render_mission_control(
 
     st.write("")
 
-    render_html(render_section_title("🌌 Astronomy Knowledge Assistant"))
+    # System diagnostics
+    with st.expander("🔧 System Diagnostics", expanded=False):
+        diag_c1, diag_c2, diag_c3 = st.columns(3)
+
+        # Chroma
+        try:
+            chroma_count = pipeline.vector_store.get_collection_count()
+            chroma_dim   = pipeline.vector_store.get_collection_embedding_dimension()
+            chroma_name  = pipeline.vector_store.collection_name
+        except Exception:
+            chroma_count, chroma_dim, chroma_name = 0, None, "knowledge_base"
+
+        diag_c1.metric("Chroma Collection", chroma_name)
+        diag_c1.metric("Vector Count", chroma_count)
+        diag_c1.metric("Embedding Dimension", chroma_dim or "—")
+
+        # BM25 & embedding model
+        bm25_status = "Online" if status.get("bm25_available") else "Offline"
+        embed_model = status.get("embedding_model") or "—"
+        diag_c2.metric("BM25 Status", bm25_status)
+        diag_c2.metric("Embedding Model", str(embed_model)[:30])
+        diag_c2.metric("Source Documents", status.get("txt_files_found", "—"))
+
+        # KB state
+        kb_state_obj = get_current_kb_state(pipeline) if hasattr(pipeline, "vectorstore_path") else {}
+        kb_version = kb_state_obj.get("version", "—") if isinstance(kb_state_obj, dict) else getattr(kb_state_obj, "version", "—")
+        indexes_consistent = kb_state_obj.get("indexes_consistent", True) if isinstance(kb_state_obj, dict) else getattr(kb_state_obj, "indexes_consistent", True)
+        diag_c3.metric("KB Version", kb_version)
+        diag_c3.metric("Index Consistency", "✅ Synced" if indexes_consistent else "⚠️ Mismatch")
+        diag_c3.metric("Vectorstore Path", str(pipeline.vectorstore_path)[-30:])
+
+    render_html(render_section_title("Astronomy Knowledge Assistant"))
 
     st.caption(
         "Ask questions about planets, missions, cosmology, telescopes, "
@@ -963,7 +1107,7 @@ def _render_mission_control(
     )
 
     # ----------------------------------------------------------------
-    # RETRIEVAL ENGINE — segmented control wired to the real backend
+    # RETRIEVAL ENGINE - segmented control wired to the real backend
     # ----------------------------------------------------------------
     current = st.session_state.retrieval_mode
 
@@ -1005,7 +1149,7 @@ def _render_mission_control(
     if st.session_state.chat_history:
         _, clear_col = st.columns([8.8, 1.2])
         with clear_col:
-            if st.button("🗑 Clear", key="clear_chat_mc", help="Clear conversation history"):
+            if st.button("Clear", key="clear_chat_mc", help="Clear conversation history"):
                 st.session_state.chat_history = []
                 _clear_persistent_chat_history(pipeline.vectorstore_path)
                 st.rerun()
@@ -1041,7 +1185,7 @@ def _render_mission_control(
         st.markdown(question)
 
     with st.spinner(
-        f"Searching with {MODES[selected_mode]['short']} retrieval …"
+        f"Searching with {MODES[selected_mode]['short']} retrieval..."
     ):
         try:
             response = pipeline.answer_question(
@@ -1106,7 +1250,7 @@ def _render_custom_composer(pipeline: RAGPipeline):
     # PLUS / KNOWLEDGE UPLOAD
     # ----------------------------------------------------------------
     with plus_col:
-        with st.popover("＋", help="Add knowledge to the knowledge base"):
+        with st.popover("+", help="Add knowledge to the knowledge base"):
             st.markdown("**Add knowledge**")
             st.caption(
                 "Upload a TXT, Markdown, DOCX, or PDF file. Indexing is incremental, "
@@ -1121,7 +1265,7 @@ def _render_custom_composer(pipeline: RAGPipeline):
             )
 
             if uploaded is not None:
-                st.caption(f"◈ {uploaded.name}")
+                st.caption(f"{uploaded.name}")
 
                 if st.button(
                     "Add to Knowledge Base",
@@ -1147,7 +1291,7 @@ def _render_custom_composer(pipeline: RAGPipeline):
             with input_col:
                 question = st.text_input(
                     "Ask a question",
-                    placeholder="Ask the universe something…",
+                    placeholder="Ask the universe something...",
                     key=(
                         f"custom_question_"
                         f"{st.session_state.composer_version}"
@@ -1157,7 +1301,7 @@ def _render_custom_composer(pipeline: RAGPipeline):
 
             with send_col:
                 send_clicked = st.form_submit_button(
-                    "➤",
+                    "Send",
                     help="Send question",
                     **WIDE,
                 )
@@ -1179,7 +1323,7 @@ def _render_custom_composer(pipeline: RAGPipeline):
 
 
 # ============================================================================
-# PAGE — RETRIEVAL LAB
+# PAGE  RETRIEVAL LAB
 # ============================================================================
 
 def _render_retrieval_pipeline_flow(retrieval: dict) -> None:
@@ -1199,31 +1343,31 @@ def _render_retrieval_pipeline_flow(retrieval: dict) -> None:
 
     with top[1]:
         render_html(
-            render_arch_node("❓", "Query", "user input", "processing")
+            render_arch_node("", "Query", "user input", "processing")
         )
         render_html(render_arch_arrow())
         render_html(
             render_arch_node(
-                "⚙", "Query Preparation", "normalize / tokenize", "processing"
+                "", "Query Preparation", "normalize / tokenize", "processing"
             )
         )
         render_html(render_arch_arrow())
 
-    # Retrieval branch — only the retrievers that ran.
+    # Retrieval branch  only the retrievers that ran.
     if dense and bm25:
         branch = st.columns(2)
 
         with branch[0]:
             render_html(
                 render_arch_node(
-                    "◈", "Dense Search", "Chroma vectors", "retrieval"
+                    "", "Dense Search", "Chroma vectors", "retrieval"
                 )
             )
 
         with branch[1]:
             render_html(
                 render_arch_node(
-                    "⌕", "BM25 Search", "lexical match", "retrieval"
+                    "", "BM25 Search", "lexical match", "retrieval"
                 )
             )
 
@@ -1234,19 +1378,19 @@ def _render_retrieval_pipeline_flow(retrieval: dict) -> None:
             if dense:
                 render_html(
                     render_arch_node(
-                        "◈", "Dense Search", "Chroma vectors", "retrieval"
+                        "", "Dense Search", "Chroma vectors", "retrieval"
                     )
                 )
             elif bm25:
                 render_html(
                     render_arch_node(
-                        "⌕", "BM25 Search", "lexical match", "retrieval"
+                        "", "BM25 Search", "lexical match", "retrieval"
                     )
                 )
             else:
                 render_html(
                     render_arch_node(
-                        "∅", "No retriever recorded", "", "retrieval"
+                        "", "No retriever recorded", "", "retrieval"
                     )
                 )
 
@@ -1258,7 +1402,7 @@ def _render_retrieval_pipeline_flow(retrieval: dict) -> None:
         if rrf:
             render_html(
                 render_arch_node(
-                    "◉",
+                    "",
                     "RRF Fusion",
                     f"k = {retrieval.get('rrf_k', 'N/A')}",
                     "retrieval",
@@ -1267,32 +1411,32 @@ def _render_retrieval_pipeline_flow(retrieval: dict) -> None:
         else:
             render_html(
                 render_arch_node(
-                    "◌", "RRF — Not used", "single retriever", "retrieval"
+                    "", "RRF  Not used", "single retriever", "retrieval"
                 )
             )
 
         render_html(render_arch_arrow())
         render_html(
             render_arch_node(
-                "⚖", "Evidence Gate", "sufficiency check", "decision"
+                "", "Evidence Gate", "sufficiency check", "decision"
             )
         )
         render_html(render_arch_arrow())
         render_html(
             render_arch_node(
-                "🗂", "Context Selection", "chunk budget", "processing"
+                "", "Context Selection", "chunk budget", "processing"
             )
         )
         render_html(render_arch_arrow())
         render_html(
             render_arch_node(
-                "✦", "Generation", "configured LLM", "generation"
+                "", "Generation", "configured LLM", "generation"
             )
         )
         render_html(render_arch_arrow())
         render_html(
             render_arch_node(
-                "◆", "Answer", "sources + trace", "generation"
+                "", "Answer", "sources + trace", "generation"
             )
         )
 
@@ -1309,7 +1453,7 @@ def _render_retrieval_lab(response) -> None:
 
     if not response:
         st.info(
-            "🔬 No retrieval trace available.\n\n"
+            " No retrieval trace available.\n\n"
             "Run a query from Mission Control to inspect the retrieval "
             "pipeline here."
         )
@@ -1347,7 +1491,7 @@ def _render_retrieval_lab(response) -> None:
     else:
         render_html(render_section_title("Reciprocal Rank Fusion"))
         st.info(
-            "RRF — Not used. Fusion applies to Hybrid mode only, where "
+            "RRF  Not used. Fusion applies to Hybrid mode only, where "
             "two ranked lists exist to combine."
         )
 
@@ -1367,7 +1511,7 @@ def _render_retrieval_lab(response) -> None:
 def _lab_section_grounding_chain(query: dict, grounding: dict) -> None:
     """Render the auditable Query -> Evidence -> Claim -> Citation chain."""
     render_html(render_section_title("Grounding chain"))
-    st.caption("Query → selected evidence passage → generated claim → citation verification")
+    st.caption("Query  selected evidence passage  generated claim  citation verification")
     rows = []
     for item in grounding.get("claim_to_citation", []):
         evidence = item.get("evidence", {})
@@ -1382,23 +1526,6 @@ def _lab_section_grounding_chain(query: dict, grounding: dict) -> None:
         st.dataframe(rows, use_container_width=True, hide_index=True)
     else:
         st.info("No generated claims were available for post-generation grounding.")
-
-
-def _render_observation_page(pipeline: RAGPipeline) -> None:
-    render_html(render_page_header("RUNTIME DIAGNOSTICS", "Observation & Evaluation", "Persistent, local records of query execution and explainable evaluation."))
-    rows = load_observations(pipeline.vectorstore_path)
-    if not rows:
-        st.info("No observations recorded yet. Run a query from Mission Control.")
-        return
-    choices = {f"{row['timestamp']} · {row['raw_query']}": row for row in rows}
-    selected = choices[st.selectbox("Recorded query", list(choices))]
-    trace = selected.get("trace", {})
-    snapshot = build_observatory_snapshot(trace)
-    st.json({"query_id": selected["query_id"], "normalized_query": selected["normalized_query"], "latency_ms": selected["latency_ms"], "embedding_model": selected["embedding_model"]})
-    st.subheader("Query → Dense/BM25/RRF → Evidence → Context → Answer")
-    st.json({"dense": snapshot.get("retrieval", {}).get("raw_dense", []), "bm25": snapshot.get("retrieval", {}).get("raw_bm25", []), "rrf": snapshot.get("retrieval", {}).get("rrf_calculation", []), "selected_evidence": trace.get("selected_evidence", []), "context": trace.get("context", {}), "grounding": trace.get("grounding", {})})
-    st.subheader("Evaluation and insights")
-    st.json({"retrieval": selected.get("evaluation", {}), "answer": selected.get("answer_evaluation", {})})
 
 
 def _render_dashboard_page(pipeline: RAGPipeline) -> None:
@@ -1422,7 +1549,7 @@ def _render_comparison_page(pipeline: RAGPipeline) -> None:
     if len(rows) < 2:
         st.info("Run at least two queries to compare observations.")
         return
-    labels = [f"{row['timestamp']} · {row['raw_query']}" for row in rows]
+    labels = [f"{row['timestamp']}  {row['raw_query']}" for row in rows]
     left, right = st.columns(2)
     with left:
         st.json(rows[labels.index(st.selectbox("First query", labels, key="compare_a"))])
@@ -1431,7 +1558,7 @@ def _render_comparison_page(pipeline: RAGPipeline) -> None:
 
 
 # ============================================================================
-# PAGE — INGESTION PIPELINE
+# PAGE  INGESTION PIPELINE
 # ============================================================================
 
 def _render_ingestion_architecture() -> None:
@@ -1440,53 +1567,53 @@ def _render_ingestion_architecture() -> None:
 
     with top[1]:
         render_html(
-            render_arch_node("📄", "Document", "TXT / MD", "storage")
+            render_arch_node("", "Document", "TXT / MD", "storage")
         )
         render_html(render_arch_arrow())
         render_html(
             render_arch_node(
-                "📥", "Document Loader", "read + detect", "processing"
+                "", "Document Loader", "read + detect", "processing"
             )
         )
         render_html(render_arch_arrow())
         render_html(
             render_arch_node(
-                "🧹", "Text Processing", "normalize", "processing"
+                "", "Text Processing", "normalize", "processing"
             )
         )
         render_html(render_arch_arrow())
         render_html(
             render_arch_node(
-                "✂", "Chunking", "size + overlap", "processing"
+                "", "Chunking", "size + overlap", "processing"
             )
         )
-        render_html(render_arch_arrow("╱  ╲"))
+        render_html(render_arch_arrow("  "))
 
     branch = st.columns(2)
 
     with branch[0]:
         render_html(
             render_arch_node(
-                "🧬", "Embedding Model", "vectorize", "processing"
+                "", "Embedding Model", "vectorize", "processing"
             )
         )
         render_html(render_arch_arrow())
         render_html(
             render_arch_node(
-                "🗄", "Chroma Vector Store", "dense index", "storage"
+                "", "Chroma Vector Store", "dense index", "storage"
             )
         )
 
     with branch[1]:
         render_html(
             render_arch_node(
-                "🔎", "BM25", "term weighting", "retrieval"
+                "", "BM25", "term weighting", "retrieval"
             )
         )
         render_html(render_arch_arrow())
         render_html(
             render_arch_node(
-                "📚", "BM25 Index", "lexical index", "storage"
+                "", "BM25 Index", "lexical index", "storage"
             )
         )
 
@@ -1500,17 +1627,17 @@ def _render_ingestion_simulation(pipeline: RAGPipeline) -> None:
     preview, so it cannot modify Chroma, BM25 or the knowledge base.
     """
     st.warning(
-        "EDUCATIONAL INGESTION SIMULATION — ILLUSTRATIVE ONLY. "
+        "EDUCATIONAL INGESTION SIMULATION  ILLUSTRATIVE ONLY. "
         "This walkthrough does not modify Chroma, BM25, the vectorstore "
         "or the knowledge base."
     )
 
-    render_html(render_simulation_tag("Simulation — no database writes"))
+    render_html(render_simulation_tag("Simulation  no database writes"))
 
     size, overlap = _chunk_config(pipeline)
     chunks = _load_chunks(pipeline)
 
-    if st.button("▶ Run simulation", key="sim_run"):
+    if st.button(" Run simulation", key="sim_run"):
         placeholder = st.empty()
         progress = st.progress(0.0)
 
@@ -1651,26 +1778,82 @@ def _render_ingestion_page(
 
 
 def _ingestion_tab_real(pipeline: RAGPipeline) -> None:
-    st.markdown("**Real ingestion**")
-    st.caption(
-        "This uses the backend's existing incremental ingestion. Existing "
-        "chunks are preserved and unchanged files are skipped. No "
-        "ingestion logic is duplicated in the UI."
-    )
+    st.markdown("### 📥 Ingest New Document")
+    st.caption("Upload a PDF, TXT, DOCX, or Markdown file. Large PDFs are supported. Duplicate files are automatically detected and skipped.")
 
     uploaded = st.file_uploader(
-        "Upload a TXT, Markdown, DOCX, or PDF file",
+        "Choose a file",
         type=["txt", "md", "docx", "pdf"],
         key="ingestion_page_uploader",
+        help="PDFs: chapter headings, sections, and page numbers are preserved. Large books are chunked intelligently.",
     )
 
     if uploaded is not None:
-        if st.button("Run ingestion", key="ingestion_page_run", **WIDE):
+        file_size_mb = len(uploaded.getvalue()) / (1024 * 1024)
+        st.info(f"📄 **{uploaded.name}** — {file_size_mb:.1f} MB")
+
+        col1, col2 = st.columns(2)
+        with col1:
+            run_btn = st.button("▶ Run Ingestion", key="ingestion_page_run", type="primary", use_container_width=True)
+        with col2:
+            st.caption("Existing chunks are preserved. Unchanged files are skipped automatically.")
+
+        if run_btn:
+            progress_bar = st.progress(0, text="Starting ingestion...")
+
+            import time as _time
+            t0 = _time.perf_counter()
+
+            progress_bar.progress(10, text="Reading file...")
             result = _ingest_uploaded_file(pipeline, uploaded, rerun=False)
+            elapsed = (_time.perf_counter() - t0) * 1000
+
+            progress_bar.progress(100, text="Complete!")
 
             if result is not None:
                 st.session_state.force_reload = True
-                st.success("Ingestion completed.")
+                if result.get("skipped"):
+                    st.warning(f"⏭ **{uploaded.name}** is already indexed — no changes made.")
+                else:
+                    st.success(f"✅ Ingestion complete in {elapsed:.0f} ms")
+                    r1, r2, r3, r4 = st.columns(4)
+                    r1.metric("Chunks Added", result.get("chunks_added", "—"))
+                    r2.metric("Total Indexed", result.get("collection_count", "—"))
+                    r3.metric("File Size", f"{file_size_mb:.1f} MB")
+                    r4.metric("Ingestion Time", f"{elapsed:.0f} ms")
+
+                    if result.get("chunks_created"):
+                        st.caption(f"📊 {result['chunks_created']} chunks created from this document")
+                    if result.get("pages_processed"):
+                        st.caption(f"📄 {result['pages_processed']} pages processed")
+
+    st.divider()
+    st.markdown("### 🗂 Batch Ingest All Files in Knowledge Base")
+    st.caption(f"Knowledge base directory: `{KNOWLEDGE_BASE_DIR}`")
+
+    kb_files = list_knowledge_files(Path(KNOWLEDGE_BASE_DIR))
+    if kb_files:
+        st.markdown(f"**{len(kb_files)} files** found in knowledge base:")
+        for f in kb_files:
+            size_mb = f.stat().st_size / (1024 * 1024)
+            st.caption(f"• {f.name} ({size_mb:.1f} MB)")
+
+        if st.button("▶ Ingest All Files", key="batch_ingest_btn", type="secondary"):
+            with st.spinner("Ingesting all knowledge base files..."):
+                import time as _t
+                t0 = _t.perf_counter()
+                try:
+                    result = pipeline.ingest_documents()
+                    elapsed = (_t.perf_counter() - t0) * 1000
+                    st.success(f"✅ Batch ingestion complete in {elapsed:.0f} ms")
+                    b1, b2, b3 = st.columns(3)
+                    b1.metric("Files Processed", result.get("files_processed", "—"))
+                    b2.metric("Chunks Indexed", result.get("chunks_indexed", "—"))
+                    b3.metric("Total in Index", result.get("collection_count", "—"))
+                except Exception as exc:
+                    st.error(f"Ingestion failed: {exc}")
+    else:
+        st.info("No files found in knowledge base. Upload a file above or place files in the knowledge_base/ directory.")
 
     # The KB management section is always shown, regardless of whether an
     # ingestion has been run in this session.
@@ -1733,7 +1916,7 @@ def _render_manage_knowledge_base(pipeline: RAGPipeline) -> None:
             chroma_del = result.get("deleted_from_chroma", 0)
             bm25_del = result.get("deleted_from_bm25", 0)
             st.success(
-                f"Removed **{selected_file}** — "
+                f"Removed **{selected_file}**  "
                 f"{chroma_del} chunk(s) deleted from Chroma, "
                 f"{bm25_del} chunk(s) removed from BM25."
             )
@@ -1744,11 +1927,11 @@ def _render_manage_knowledge_base(pipeline: RAGPipeline) -> None:
 
 
 # ==========================================================================
-# RETRIEVAL LAB — SECTIONS
+# RETRIEVAL LAB  SECTIONS
 # ==========================================================================
 
 def _lab_section_query(query: dict) -> None:
-    render_html(render_section_title("Section A — Query"))
+    render_html(render_section_title("Section A  Query"))
 
     render_html(
         render_trace_query_card(
@@ -1785,7 +1968,7 @@ def _lab_section_query(query: dict) -> None:
 
 
 def _lab_section_mode(retrieval: dict) -> None:
-    render_html(render_section_title("Section B — Retrieval mode"))
+    render_html(render_section_title("Section B  Retrieval mode"))
 
     render_html(render_mode_chip(retrieval.get("mode_label", "Unknown")))
 
@@ -1829,7 +2012,7 @@ def _lab_section_mode(retrieval: dict) -> None:
 
 
 def _lab_section_dense(retrieval: dict) -> None:
-    render_html(render_section_title("Vector retrieval — dense results"))
+    render_html(render_section_title("Vector retrieval  dense results"))
 
     rows = retrieval.get("raw_dense") or []
 
@@ -1856,7 +2039,7 @@ def _lab_section_dense(retrieval: dict) -> None:
 
 
 def _lab_section_bm25(retrieval: dict) -> None:
-    render_html(render_section_title("BM25 retrieval — lexical results"))
+    render_html(render_section_title("BM25 retrieval  lexical results"))
 
     rows = retrieval.get("raw_bm25") or []
 
@@ -1888,7 +2071,7 @@ def _lab_section_rrf(retrieval: dict) -> None:
     render_html(
         render_formula_card(
             "RRF formula",
-            "RRF(d) = Σ 1 / (k + rank)",
+            "RRF(d) =  1 / (k + rank)",
             f"Configured k = {k}",
         )
     )
@@ -2041,8 +2224,8 @@ def _lab_section_context(trace: dict, context: dict) -> None:
         for chunk in chunks:
             st.markdown(
                 f"**{chunk.get('position')}. "
-                f"{chunk.get('filename') or 'unknown'}** · "
-                f"`{chunk.get('chunk_id') or 'unknown'}` · "
+                f"{chunk.get('filename') or 'unknown'}**  "
+                f"`{chunk.get('chunk_id') or 'unknown'}`  "
                 f"{chunk.get('chars')} characters"
             )
             st.code(chunk.get("text", ""), language="text")
@@ -2088,7 +2271,7 @@ def _lab_section_generation(generation: dict) -> None:
 
 
 # ==========================================================================
-# PAGE — CHUNK MONITOR
+# PAGE  CHUNK MONITOR
 # ==========================================================================
 
 def _render_chunk_monitor(pipeline: RAGPipeline) -> None:
@@ -2100,17 +2283,24 @@ def _render_chunk_monitor(pipeline: RAGPipeline) -> None:
         )
     )
 
-    tab_chroma, tab_bm25, tab_chunks = st.tabs([
-        "🗄 Vector Chroma DB",
-        "📚 BM25 Lexical Index",
-        "📄 Document Chunks",
+    from src.ui.pages import render_chunk_explorer
+
+    tab_hierarchy, tab_chroma, tab_bm25, tab_chunks = st.tabs([
+        "📖 Book Hierarchy & Explorer",
+        "🔍 Vector Chroma DB",
+        "⚡ BM25 Lexical Index",
+        "📁 Document Files",
     ])
+
+    with tab_hierarchy:
+        chunks = _load_chunks(pipeline)
+        render_chunk_explorer(chunks, pipeline=pipeline)
 
     # ================================================================
     # TAB 1: VECTOR CHROMA DB
     # ================================================================
     with tab_chroma:
-        render_html(render_section_title("Chroma Vector Store — Live Vectors & Chunks"))
+        render_html(render_section_title("Chroma Vector Store  Live Vectors & Chunks"))
         try:
             col_count = pipeline.vector_store.get_collection_count()
             dim = pipeline.vector_store.get_collection_embedding_dimension()
@@ -2137,12 +2327,20 @@ def _render_chunk_monitor(pipeline: RAGPipeline) -> None:
                 for i, cid in enumerate(ids):
                     meta = metas[i] if i < len(metas) and isinstance(metas[i], dict) else {}
                     doc = docs[i] if i < len(docs) and docs[i] else ""
+                    p_start = meta.get("page_start") or meta.get("page_number")
+                    p_end = meta.get("page_end") or p_start
+                    p_str = f"{p_start}–{p_end}" if p_end and p_end != p_start else (str(p_start) if p_start else "-")
+                    ch_num = meta.get("chapter_num")
+                    ch_str = f"Ch. {ch_num}" if ch_num and int(ch_num) > 0 else "-"
                     chroma_rows.append({
-                        "Chunk ID": cid,
+                        "Chunk ID": meta.get("chunk_id") or cid,
+                        "Book": meta.get("book_title") or "Mind Management, Not Time Management",
+                        "Chapter": ch_str,
+                        "Section": meta.get("section_heading") or meta.get("section_title") or "-",
+                        "Pages": p_str,
+                        "Tokens": meta.get("token_count", 0),
                         "Filename": meta.get("filename", ""),
-                        "File Type": meta.get("file_type", ""),
-                        "Page": meta.get("page_number", 0) if meta.get("page_number") else "-",
-                        "Section Heading": meta.get("section_heading", ""),
+                        "File Type": meta.get("file_type", "pdf"),
                         "Characters": len(doc),
                         "Preview": (doc[:130] + "...") if len(doc) > 130 else doc,
                         "_full_text": doc,
@@ -2173,10 +2371,11 @@ def _render_chunk_monitor(pipeline: RAGPipeline) -> None:
                 _dataframe([
                     {
                         "Chunk ID": r["Chunk ID"],
-                        "Filename": r["Filename"],
-                        "Format": r["File Type"],
-                        "Page": r["Page"],
-                        "Heading": r["Section Heading"],
+                        "Book": r["Book"],
+                        "Chapter": r["Chapter"],
+                        "Section": r["Section"],
+                        "Pages": r["Pages"],
+                        "Tokens": r["Tokens"],
                         "Chars": r["Characters"],
                         "Preview": r["Preview"],
                     }
@@ -2197,7 +2396,7 @@ def _render_chunk_monitor(pipeline: RAGPipeline) -> None:
     # TAB 2: BM25 LEXICAL INDEX
     # ================================================================
     with tab_bm25:
-        render_html(render_section_title("BM25 Lexical Index — Vocabulary & Chunks"))
+        render_html(render_section_title("BM25 Lexical Index  Vocabulary & Chunks"))
         bm25_instance = getattr(pipeline, "bm25", None)
         if bm25_instance is None or not hasattr(bm25_instance, "_chunks") or not bm25_instance._chunks:
             st.info("BM25 lexical index is currently not loaded or empty. Ingest documents or sync the knowledge base.")
@@ -2214,17 +2413,21 @@ def _render_chunk_monitor(pipeline: RAGPipeline) -> None:
             bm25_rows = []
             for i, c in enumerate(bm25_chunks):
                 cid = c.get("chunk_id", f"chunk_{i}")
-                fname = c.get("filename", "")
-                ftype = c.get("file_type", "")
-                pnum = c.get("page_number", 0)
-                heading = c.get("section_heading", "")
+                p_start = c.get("page_start") or c.get("page_number")
+                p_end = c.get("page_end") or p_start
+                p_str = f"{p_start}–{p_end}" if p_end and p_end != p_start else (str(p_start) if p_start else "-")
+                ch_num = c.get("chapter_num")
+                ch_str = f"Ch. {ch_num}" if ch_num and int(ch_num) > 0 else "-"
                 txt = c.get("text", "")
                 bm25_rows.append({
                     "Chunk ID": cid,
-                    "Filename": fname,
-                    "Format": ftype,
-                    "Page": pnum if pnum and int(pnum) > 0 else "-",
-                    "Heading": heading,
+                    "Book": c.get("book_title") or "Mind Management, Not Time Management",
+                    "Chapter": ch_str,
+                    "Section": c.get("section_heading") or c.get("section_title") or "-",
+                    "Pages": p_str,
+                    "Tokens": c.get("token_count", 0),
+                    "Filename": c.get("filename", ""),
+                    "Format": c.get("file_type", "pdf"),
                     "Characters": len(txt),
                     "Preview": (txt[:130] + "...") if len(txt) > 130 else txt,
                     "_full_text": txt,
@@ -2261,10 +2464,11 @@ def _render_chunk_monitor(pipeline: RAGPipeline) -> None:
             _dataframe([
                 {
                     "Chunk ID": r["Chunk ID"],
-                    "Filename": r["Filename"],
-                    "Format": r["Format"],
-                    "Page": r["Page"],
-                    "Heading": r["Heading"],
+                    "Book": r["Book"],
+                    "Chapter": r["Chapter"],
+                    "Section": r["Section"],
+                    "Pages": r["Pages"],
+                    "Tokens": r["Tokens"],
                     "Chars": r["Characters"],
                     "Preview": r["Preview"],
                 }
@@ -2446,8 +2650,8 @@ def _render_chunk_monitor(pipeline: RAGPipeline) -> None:
         with st.expander(f"All chunks in {selected_name}"):
             for position, item in enumerate(selected_chunks):
                 st.markdown(
-                    f"**[ Chunk {position} ]** · "
-                    f"`{item.get('chunk_id', '')}` · "
+                    f"**[ Chunk {position} ]**  "
+                    f"`{item.get('chunk_id', '')}`  "
                     f"{len(item.get('text', ''))} characters"
                 )
                 st.code((item.get("text") or "")[:600], language="text")
@@ -2456,7 +2660,7 @@ def _render_chunk_monitor(pipeline: RAGPipeline) -> None:
 
 
 # ============================================================================
-# PAGE — SYSTEM ARCHITECTURE
+# PAGE  SYSTEM ARCHITECTURE
 # ============================================================================
 
 def _render_architecture_page(
@@ -2480,7 +2684,7 @@ def _render_architecture_page(
         )
     )
 
-    render_html(render_simulation_tag("Architecture diagram — illustrative"))
+    render_html(render_simulation_tag("Architecture diagram  illustrative"))
 
     st.caption(
         "This diagram represents the components that actually exist in "
@@ -2513,7 +2717,7 @@ def _render_architecture_page(
     # ----------------------------------------------------------------
     render_html(
         render_arch_plane_open(
-            "Knowledge Plane — Ingestion",
+            "Knowledge Plane  Ingestion",
             "Documents are loaded, cleaned and chunked once, then indexed "
             "twice: as vectors and as terms.",
         )
@@ -2524,7 +2728,7 @@ def _render_architecture_page(
     with row[0]:
         render_html(
             render_arch_node(
-                "📄",
+                "",
                 "Knowledge Sources",
                 f"{status.get('txt_files_found', 'N/A')} TXT / MD files",
                 "storage",
@@ -2532,31 +2736,31 @@ def _render_architecture_page(
         )
 
     with row[1]:
-        render_html(render_arch_arrow("▶"))
+        render_html(render_arch_arrow(""))
 
     with row[2]:
         render_html(
             render_arch_node(
-                "📥", "Document Loader", "read + detect", "processing"
+                "", "Document Loader", "read + detect", "processing"
             )
         )
 
     with row[3]:
-        render_html(render_arch_arrow("▶"))
+        render_html(render_arch_arrow(""))
 
     with row[4]:
         render_html(
             render_arch_node(
-                "🧹", "Text Processing", "normalize", "processing"
+                "", "Text Processing", "normalize", "processing"
             )
         )
 
     with row[5]:
-        render_html(render_arch_arrow("▶"))
+        render_html(render_arch_arrow(""))
 
     with row[6]:
         render_html(
-            render_arch_node("✂", "Chunking", chunk_tech, "processing")
+            render_arch_node("", "Chunking", chunk_tech, "processing")
         )
 
     st.caption("Chunking fans out into two independent indexes:")
@@ -2566,26 +2770,26 @@ def _render_architecture_page(
     with split[0]:
         render_html(
             render_arch_node(
-                "🧬", "Embedding Model", embedding_model, "processing"
+                "", "Embedding Model", embedding_model, "processing"
             )
         )
         render_html(render_arch_arrow())
         render_html(
             render_arch_node(
-                "🗄", "Chroma Vector Store", chunks_label, "storage"
+                "", "Chroma Vector Store", chunks_label, "storage"
             )
         )
 
     with split[1]:
         render_html(
             render_arch_node(
-                "🔎", "BM25", "term weighting", "retrieval"
+                "", "BM25", "term weighting", "retrieval"
             )
         )
         render_html(render_arch_arrow())
         render_html(
             render_arch_node(
-                "📚",
+                "",
                 "BM25 Index",
                 "persistent lexical index",
                 "storage",
@@ -2598,16 +2802,16 @@ def _render_architecture_page(
     bridge = st.columns(3)
 
     with bridge[1]:
-        render_html(render_arch_arrow("▼"))
+        render_html(render_arch_arrow(""))
         st.caption("Both indexes serve the query plane below")
-        render_html(render_arch_arrow("▼"))
+        render_html(render_arch_arrow(""))
 
     # ----------------------------------------------------------------
     # QUERY PLANE
     # ----------------------------------------------------------------
     render_html(
         render_arch_plane_open(
-            "Query Plane — Retrieval & Generation",
+            "Query Plane  Retrieval & Generation",
             "A question is prepared once, searched by one or both "
             "retrievers depending on the selected mode, then gated, "
             "trimmed and answered.",
@@ -2618,12 +2822,12 @@ def _render_architecture_page(
 
     with head[1]:
         render_html(
-            render_arch_node("👤", "User Query", "Mission Control", "processing")
+            render_arch_node("", "User Query", "Mission Control", "processing")
         )
         render_html(render_arch_arrow())
         render_html(
             render_arch_node(
-                "⚙",
+                "",
                 "Query Preparation",
                 "normalize / aliases",
                 "processing",
@@ -2640,14 +2844,14 @@ def _render_architecture_page(
     with search[0]:
         render_html(
             render_arch_node(
-                "◈", "Dense Search", "Chroma nearest vectors", "retrieval"
+                "", "Dense Search", "Chroma nearest vectors", "retrieval"
             )
         )
 
     with search[1]:
         render_html(
             render_arch_node(
-                "⌕", "BM25 Search", "lexical match", "retrieval"
+                "", "BM25 Search", "lexical match", "retrieval"
             )
         )
 
@@ -2657,7 +2861,7 @@ def _render_architecture_page(
         render_html(render_arch_arrow())
         render_html(
             render_arch_node(
-                "◉",
+                "",
                 "RRF Fusion",
                 "Hybrid mode only",
                 "retrieval",
@@ -2666,7 +2870,7 @@ def _render_architecture_page(
         render_html(render_arch_arrow())
         render_html(
             render_arch_node(
-                "⚖",
+                "",
                 "Evidence Gate",
                 "relevance / support",
                 "decision",
@@ -2675,7 +2879,7 @@ def _render_architecture_page(
         render_html(render_arch_arrow())
         render_html(
             render_arch_node(
-                "🗂",
+                "",
                 "Context Selection",
                 "chunk + char budget",
                 "processing",
@@ -2683,12 +2887,12 @@ def _render_architecture_page(
         )
         render_html(render_arch_arrow())
         render_html(
-            render_arch_node("✦", "Generation", llm_model, "generation")
+            render_arch_node("", "Generation", llm_model, "generation")
         )
         render_html(render_arch_arrow())
         render_html(
             render_arch_node(
-                "◆", "Answer", "response + sources", "generation"
+                "", "Answer", "response + sources", "generation"
             )
         )
 
@@ -2740,7 +2944,7 @@ def _render_sidebar(
     with st.sidebar:
         render_html(
             render_panel_card(
-                "✦ ASTRONOMY OBSERVATORY",
+                " ASTRONOMY OBSERVATORY",
                 render_kv_rows([("Knowledge Core", "ONLINE")]),
             )
         )
@@ -2759,7 +2963,7 @@ def _render_sidebar(
             for page_name, icon in items:
                 active = page_name == current
 
-                marker = "◉" if active else "◇"
+                marker = "" if active else ""
 
                 if st.button(
                     _sidebar_nav_label(marker, page_name, icon),
@@ -2828,7 +3032,7 @@ def _render_sidebar(
             st.rerun()
 
         if st.button("Sync Knowledge Base", key="ctl_sync", **WIDE):
-            with st.spinner("Embedding any missing chunks …"):
+            with st.spinner("Embedding any missing chunks "):
                 try:
                     result = pipeline.ingest_documents()
 
@@ -2848,7 +3052,7 @@ def _render_sidebar(
                     _service_error("INGESTION SERVICE UNAVAILABLE", exc)
 
         st.caption(
-            "Incremental — existing embeddings are preserved, never "
+            "Incremental  existing embeddings are preserved, never "
             "rebuilt from scratch."
         )
 
@@ -2866,8 +3070,8 @@ def _render_sidebar(
 
 def main() -> None:
     st.set_page_config(
-        page_title="Astronomy Observatory — Mission Control",
-        page_icon="🔭",
+        page_title="Astronomy Observatory  Mission Control",
+        page_icon="",
         layout="wide",
         initial_sidebar_state="expanded",
     )
@@ -2950,46 +3154,490 @@ def main() -> None:
 
 def _short_topic(query: str, index: int) -> str:
     words = [w for w in query.replace("?", "").split() if w.lower() not in {"what", "is", "are", "how", "does", "the", "and"}]
-    return f"Q{index:02d} · {' '.join(words[:3]) or 'query'}"
+    return f"Q{index:02d}  {' '.join(words[:3]) or 'query'}"
 
 
 def _render_observation_page(pipeline: RAGPipeline) -> None:
     render_html(render_page_header("RUNTIME DIAGNOSTICS", "Observation & Evaluation", "Persistent system insight dashboard. Live scores are heuristics, not accuracy."))
     rows = load_observations(pipeline.vectorstore_path)
     if not rows:
-        st.info("No observations recorded yet.")
+        st.info("No observations recorded yet. Run a query on the Ask page to record an observation.")
         return
-    dense = sum(len(r.get("trace", {}).get("retrieval", {}).get("raw_dense", [])) for r in rows)
-    bm25 = sum(len(r.get("trace", {}).get("retrieval", {}).get("raw_bm25", [])) for r in rows)
-    latencies = sorted(r["latency_ms"] for r in rows)
-    cols = st.columns(4)
-    cols[0].metric("Queries", len(rows)); cols[1].metric("Dense hits", dense); cols[2].metric("BM25 hits", bm25); cols[3].metric("Median latency", f"{latencies[len(latencies)//2]:.0f} ms")
-    st.subheader("Retrieval and evidence trends")
-    st.bar_chart({"Dense contribution": dense, "BM25 contribution": bm25})
-    sources = {}
-    for row in rows:
-        for c in row.get("trace", {}).get("selected_evidence", []):
-            sources[c.get("filename", "unknown")] = sources.get(c.get("filename", "unknown"), 0) + 1
-    if sources:
-        st.caption("Selected-evidence document distribution"); st.bar_chart(sources)
-    latest = rows[0]; criteria = latest.get("evaluation", {}).get("criteria", {})
-    agreement = criteria.get("retriever_agreement", {})
-    direct = criteria.get("direct_answer_support", {})
-    coverage = latest.get("answer_evaluation", {}).get("citation_coverage", {})
-    st.subheader("Explainable AI insights")
-    insights = [
-        ("What happened", f"Dense and BM25 agreed on {agreement.get('metrics', {}).get('overlapping_chunks_count', 'no')} candidate(s).", agreement.get("reason", ""), "Agreement is consensus only; it does not establish correctness."),
-        ("What happened", direct.get("reason", "Direct-answer support was not instrumented."), "Computed from the recorded candidate text, definitional patterns, term density, filename match, and term coverage.", "This distinguishes answer evidence from topical lexical overlap."),
-        ("What happened", f"End-to-end latency was {latest.get('latency_ms')} ms.", "Only end-to-end request timing is recorded.", "Stage-wise latency is Not instrumented; no attribution is invented."),
-        ("What happened", f"Citation coverage was {coverage.get('score', 'Not instrumented')}.", coverage.get("reason", "No citation result recorded."), "This is grounded-claim coverage, not answer accuracy."),
-    ]
-    for _, happened, why, meaning in insights:
-        with st.expander(happened, expanded=True):
-            st.write("**Why:**", why); st.write("**What it means:**", meaning)
-    with st.expander("Query drill-down"):
-        choices = {_short_topic(r["raw_query"], i): r for i, r in enumerate(rows, 1)}
-        selected = choices[st.selectbox("Recorded query", list(choices))]
-        st.json({"trace": selected.get("trace", {}), "evaluation": selected.get("evaluation", {}), "answer_evaluation": selected.get("answer_evaluation", {})})
+
+    # ── Tab layout ──────────────────────────────────────────────────────────
+    tab_overview, tab_deepeval, tab_citations, tab_langfuse, tab_auto, tab_drill = st.tabs([
+        "📊 Overview",
+        "🔬 DeepEval Metrics",
+        "📑 Citation Analysis",
+        "🔭 Langfuse Traces",
+        "💡 Automatic Observations",
+        "🔍 Query Drill-Down",
+    ])
+
+    # ── Helper: short label per row ─────────────────────────────────────────
+    def _row_label(row: dict, index: int) -> str:
+        return _short_topic(row.get("raw_query", ""), index)
+
+    row_labels = [_row_label(r, i) for i, r in enumerate(rows, 1)]
+
+    # ========================================================================
+    # TAB 1  OVERVIEW
+    # ========================================================================
+    with tab_overview:
+        latencies = [r["latency_ms"] for r in rows if isinstance(r.get("latency_ms"), (int, float))]
+        median_lat = sorted(latencies)[len(latencies) // 2] if latencies else 0
+
+        # Retrieval strength from evaluation criteria
+        strengths = []
+        for r in rows:
+            s = (r.get("evaluation") or {}).get("criteria", {}).get("retrieval_strength", {}).get("score")
+            if isinstance(s, (int, float)):
+                strengths.append(s)
+        avg_strength = sum(strengths) / len(strengths) if strengths else None
+
+        # Langfuse enabled?
+        has_langfuse = any(
+            r.get("trace", {}).get("langfuse_trace_id")
+            or (r.get("trace") or {}).get("observation", {}).get("langfuse_trace_id")
+            for r in rows
+        )
+
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Total Queries", len(rows))
+        c2.metric("Median Latency", f"{median_lat:.0f} ms" if median_lat else "—")
+        c3.metric("Avg Retrieval Strength", f"{avg_strength:.1f}" if avg_strength is not None else "—")
+        c4.metric("Langfuse", "✅ Enabled" if has_langfuse else "⬜ Not traced")
+
+        st.markdown("---")
+        st.markdown("#### Latency per Query")
+        latency_data = {label: r.get("latency_ms", 0) for label, r in zip(row_labels, rows)}
+        st.bar_chart(latency_data)
+
+        st.markdown("#### Retrieval Method Distribution")
+        mode_counts: dict[str, int] = {}
+        for r in rows:
+            mode = r.get("retrieval_mode") or (r.get("trace") or {}).get("retrieval", {}).get("mode") or "unknown"
+            mode_counts[mode] = mode_counts.get(mode, 0) + 1
+        if mode_counts:
+            st.bar_chart(mode_counts)
+        else:
+            st.caption("No retrieval mode information recorded.")
+
+        st.markdown("#### Top 5 Slowest Queries")
+        slowest = sorted(rows, key=lambda r: r.get("latency_ms", 0), reverse=True)[:5]
+        slow_table = [
+            {
+                "Query": r.get("raw_query", "")[:80],
+                "Latency (ms)": r.get("latency_ms", 0),
+                "Mode": r.get("retrieval_mode", "—"),
+                "Timestamp": r.get("timestamp", "")[:19],
+            }
+            for r in slowest
+        ]
+        st.dataframe(slow_table, hide_index=True, use_container_width=True)
+
+    # ========================================================================
+    # TAB 2  DEEPEVAL METRICS
+    # ========================================================================
+    with tab_deepeval:
+        # Metric thresholds and descriptions
+        _DE_THRESHOLDS: dict[str, float] = {
+            "faithfulness": 0.7,
+            "answer_relevancy": 0.7,
+            "contextual_relevancy": 0.6,
+            "contextual_precision": 0.6,
+            "contextual_recall": 0.6,
+            "answer_correctness": 0.7,
+            "answer_completeness": 0.7,
+            "citation_correctness": 0.7,
+            "citation_completeness": 0.7,
+            "groundedness": 0.7,
+            "noise_sensitivity": 0.7,
+            "visual_multimodal_grounding": 0.7,
+        }
+        _DE_HOW: dict[str, str] = {
+            "faithfulness": "LLM checks each claim in the answer against retrieved context (top 3). Score: 0=contradicts context, 1=fully grounded.",
+            "answer_relevancy": "LLM checks whether the answer directly responds to the query. Score: 0=completely irrelevant, 1=fully responsive.",
+            "contextual_relevancy": "LLM inspects each retrieved passage against the query topic and rates the proportion that are on-point. Score: 0=all off-topic, 1=all relevant.",
+            "contextual_precision": "LLM determines which chunks are relevant then checks if they appear before irrelevant ones (ranking quality). Score: 0=relevant chunks at bottom, 1=perfectly ranked.",
+            "contextual_recall": "LLM checks each factual statement in the answer against retrieved passages to estimate coverage. Score: 0=not supported, 1=fully covered.",
+            "answer_correctness": "LLM cross-checks specific claims in the answer against retrieved passages for factual accuracy. Score: 0=factually wrong, 1=fully correct.",
+            "answer_completeness": "LLM decomposes the query into components and checks if each part is addressed. Score: 0=major parts unanswered, 1=fully addressed.",
+            "citation_correctness": "LLM cross-references each [N] citation against chunk N to verify support. Score: 0=all citations misleading, 1=every citation accurate.",
+            "citation_completeness": "LLM counts major factual claims and checks what proportion carry a bracketed citation. Score: 0=no claims cited, 1=every claim cited.",
+            "groundedness": "LLM reads the answer and flags statements not found or inferable from context (hallucination check). Score: 0=full of hallucinations, 1=fully grounded.",
+            "noise_sensitivity": "LLM evaluates whether irrelevant retrieved context negatively affected the answer. Score: 0=degraded answer, 1=unaffected by noise.",
+            "visual_multimodal_grounding": "LLM checks if the answer correctly uses information from image metadata (PDF images, charts) generated by vision pipeline. Score: 0=incorrect usage, 1=perfect usage.",
+        }
+
+        # Categories for grouping in the UI
+        _DE_CATEGORIES = {
+            "Retrieval": ["contextual_relevancy", "contextual_precision", "contextual_recall", "noise_sensitivity"],
+            "Answer Quality": ["faithfulness", "answer_relevancy", "answer_correctness", "answer_completeness", "groundedness"],
+            "Citation": ["citation_correctness", "citation_completeness"],
+            "Multimodal": ["visual_multimodal_grounding"],
+        }
+
+
+        # Collect deepeval data from observations
+        # deepeval is stored as response["deepeval"]["by_retrieval_mode"][mode] = {status, scores}
+        # In observation records it lands in evaluation or directly in the trace
+        de_rows = []
+        for row in rows:
+            # Try multiple paths where deepeval scores might have been persisted
+            deepeval_data = (
+                (row.get("trace") or {}).get("deepeval")
+                or row.get("deepeval")
+                or {}
+            )
+            by_mode = deepeval_data.get("by_retrieval_mode") or {}
+            # Flatten: pick first mode with scores
+            scores_dict: dict[str, dict] = {}
+            mode_used = row.get("retrieval_mode", "hybrid")
+            for mode_key in [mode_used, *by_mode.keys()]:
+                entry = by_mode.get(mode_key, {})
+                if entry.get("scores"):
+                    scores_dict = entry["scores"]
+                    break
+            if scores_dict:
+                de_rows.append({
+                    "label": _row_label(row, rows.index(row) + 1),
+                    "query": row.get("raw_query", ""),
+                    "scores": scores_dict,
+                })
+
+        if not de_rows:
+            st.info(
+                "No DeepEval results found in recorded observations.\n\n"
+                "To enable DeepEval evaluation, set `ENABLE_DEEPEVAL=true` in your `.env` file "
+                "and restart the app. Scores will appear here after your next query."
+            )
+        else:
+            # Aggregate pass/fail
+            total_pass = total_fail = 0
+            for entry in de_rows:
+                for metric, threshold in _DE_THRESHOLDS.items():
+                    score_data = entry["scores"].get(metric)
+                    if score_data is not None:
+                        score = score_data.get("score", 0) if isinstance(score_data, dict) else float(score_data)
+                        if score >= threshold:
+                            total_pass += 1
+                        else:
+                            total_fail += 1
+            pc1, pc2 = st.columns(2)
+            pc1.metric("✅ Total Passes", total_pass)
+            pc2.metric("❌ Total Fails", total_fail)
+            st.markdown("---")
+
+            # Per-observation tables
+            query_choice = st.selectbox(
+                "Select query to inspect",
+                options=[e["label"] for e in de_rows],
+                key="deepeval_query_select",
+            )
+            selected_de = next((e for e in de_rows if e["label"] == query_choice), de_rows[0])
+            st.caption(f"Query: *{selected_de['query'][:120]}*")
+
+            # Add Performance explicitly to the UI
+            st.markdown("### Performance")
+            perf_rows = []
+            # Performance isn't an LLM metric, but we want to show it here.
+            # Get the query's base observation row.
+            base_row = next((r for r in rows if _row_label(r, rows.index(r)+1) == query_choice), None)
+            if base_row:
+                ret_ms = base_row.get("latency_ms") or 0
+                llm_ms = (base_row.get("trace") or {}).get("llm_ms") or base_row.get("llm_ms") or 0
+                perf_rows.append({"Metric": "Retrieval Latency", "Value": f"{ret_ms} ms", "Description": "Time taken to retrieve chunks."})
+                perf_rows.append({"Metric": "End-to-End Latency", "Value": f"{ret_ms + llm_ms} ms", "Description": "Total query-response time."})
+                st.dataframe(perf_rows, hide_index=True, use_container_width=True)
+
+            for category, metric_list in _DE_CATEGORIES.items():
+                st.markdown(f"### {category}")
+                table_rows = []
+                for metric_name in metric_list:
+                    threshold = _DE_THRESHOLDS.get(metric_name, 0.5)
+                    score_data = selected_de["scores"].get(metric_name)
+                    if score_data is None:
+                        continue
+                    if isinstance(score_data, dict):
+                        score = score_data.get("score", 0)
+                        reason = score_data.get("reason", "")
+                    else:
+                        score = float(score_data)
+                        reason = ""
+                    passed = "✅ Pass" if score >= threshold else "❌ Fail"
+                    table_rows.append({
+                        "Metric": metric_name.replace("_", " ").title(),
+                        "Score": round(score, 3),
+                        "Threshold": threshold,
+                        "Pass/Fail": passed,
+                        "Reason": reason[:120],
+                        "How Calculated": _DE_HOW.get(metric_name, ""),
+                    })
+                if table_rows:
+                    st.dataframe(table_rows, hide_index=True, use_container_width=True)
+                else:
+                    st.caption(f"No metrics recorded for {category}.")
+
+    # ========================================================================
+    # TAB 3  CITATION ANALYSIS
+    # ========================================================================
+    with tab_citations:
+        st.markdown("#### Citation Metrics per Query")
+
+        cit_labels: list[str] = []
+        cit_coverage_scores: list[float] = []
+
+        for i, row in enumerate(rows, 1):
+            ae = row.get("answer_evaluation") or {}
+            label = _row_label(row, i)
+            cov = ae.get("citation_coverage") or {}
+            grounding = ae.get("evidence_claim_grounding") or {}
+            correctness = ae.get("citation_correctness") or {}
+
+            cov_score = cov.get("score") if isinstance(cov, dict) else cov
+            grounding_score = grounding.get("score") if isinstance(grounding, dict) else grounding
+            correct_score = correctness.get("score") if isinstance(correctness, dict) else correctness
+
+            if cov_score is not None:
+                cit_labels.append(label)
+                cit_coverage_scores.append(float(cov_score))
+
+            with st.expander(f"{label}", expanded=(i == 1)):
+                st.caption(f"*{row.get('raw_query', '')[:100]}*")
+                cc1, cc2, cc3 = st.columns(3)
+                cc1.metric(
+                    "Citation Coverage",
+                    f"{float(cov_score):.2f}" if cov_score is not None else "—",
+                )
+                cc2.metric(
+                    "Evidence Grounding",
+                    f"{float(grounding_score):.2f}" if grounding_score is not None else "—",
+                )
+                cc3.metric(
+                    "Citation Correctness",
+                    f"{float(correct_score):.2f}" if correct_score is not None else "—",
+                )
+                if isinstance(cov, dict) and cov.get("reason"):
+                    st.caption(f"Coverage reason: {cov['reason']}")
+                if isinstance(grounding, dict) and grounding.get("reason"):
+                    st.caption(f"Grounding reason: {grounding['reason']}")
+                if isinstance(correctness, dict) and correctness.get("reason"):
+                    st.caption(f"Correctness reason: {correctness['reason']}")
+
+                # Supported vs unsupported claims
+                citation_map = row.get("citation_map") or []
+                if citation_map:
+                    supported = [c for c in citation_map if c.get("status") == "supported" or c.get("direct_answer_support")]
+                    unsupported = [c for c in citation_map if c.get("status") not in ("supported",) and not c.get("direct_answer_support")]
+                    st.caption(f"Claims: {len(supported)} supported, {len(unsupported)} unsupported (from recorded citation map)")
+
+        if cit_coverage_scores:
+            st.markdown("---")
+            st.markdown("#### Citation Coverage Scores Across Queries")
+            st.bar_chart(dict(zip(cit_labels, cit_coverage_scores)))
+        elif not rows:
+            st.info("No observations recorded yet.")
+        else:
+            st.info("No citation analysis data found in recorded observations.")
+
+    # ========================================================================
+    # TAB 4  LANGFUSE TRACES
+    # ========================================================================
+    with tab_langfuse:
+        # Check if any trace IDs are present
+        trace_rows = []
+        for i, row in enumerate(rows, 1):
+            tid = (
+                (row.get("trace") or {}).get("langfuse_trace_id")
+                or (row.get("trace") or {}).get("observation", {}).get("langfuse_trace_id")
+            )
+            if tid:
+                trace_rows.append({"row": row, "trace_id": tid, "label": _row_label(row, i)})
+
+        if not trace_rows:
+            st.info(
+                "No Langfuse trace IDs found in recorded observations.\n\n"
+                "To enable Langfuse tracing, set `LANGFUSE_PUBLIC_KEY` and `LANGFUSE_SECRET_KEY` "
+                "in your `.env` file and restart the app."
+            )
+        else:
+            st.markdown("#### Langfuse Trace Links")
+            for entry in trace_rows:
+                st.markdown(f"- {entry['label']}: [View trace](https://cloud.langfuse.com/trace/{entry['trace_id']})")
+
+        st.markdown("---")
+        st.markdown("#### Latency Breakdown per Query")
+        latency_rows = []
+        for i, row in enumerate(rows, 1):
+            retrieval = (row.get("trace") or {}).get("retrieval") or {}
+            timings = retrieval.get("timings_ms") or {}
+            ret_ms = retrieval.get("retrieval_ms") or retrieval.get("dense_ms") or timings.get("dense_ms")
+            llm_ms = (row.get("trace") or {}).get("llm_ms") or timings.get("llm_ms")
+            latency_rows.append({
+                "Query": _row_label(row, i),
+                "Retrieval (ms)": round(float(ret_ms), 1) if isinstance(ret_ms, (int, float)) else None,
+                "LLM (ms)": round(float(llm_ms), 1) if isinstance(llm_ms, (int, float)) else None,
+                "Total (ms)": row.get("latency_ms"),
+            })
+        st.dataframe(latency_rows, hide_index=True, use_container_width=True)
+
+        # Stacked bar chart: retrieval_ms vs llm_ms over time
+        ret_series = {_row_label(r, i): (r.get("trace") or {}).get("retrieval", {}).get("retrieval_ms") or 0
+                      for i, r in enumerate(rows, 1)}
+        llm_series = {_row_label(r, i): (r.get("trace") or {}).get("llm_ms") or 0
+                      for i, r in enumerate(rows, 1)}
+        has_data = any(v > 0 for v in list(ret_series.values()) + list(llm_series.values()))
+        if has_data:
+            st.markdown("#### Retrieval vs LLM Latency Over Time")
+            import pandas as _pd
+            chart_df = _pd.DataFrame({
+                "Retrieval ms": list(ret_series.values()),
+                "LLM ms": list(llm_series.values()),
+            }, index=list(ret_series.keys()))
+            st.bar_chart(chart_df)
+        else:
+            st.caption("Stage-level timing not available — only end-to-end latency is recorded.")
+
+    # ========================================================================
+    # TAB 5  AUTOMATIC OBSERVATIONS
+    # ========================================================================
+    with tab_auto:
+        st.markdown("#### Automatically Generated Observations")
+        st.caption("Derived from recorded observations — no values are hardcoded or estimated.")
+
+        latencies_all = [r.get("latency_ms", 0) for r in rows]
+        median_all = sorted(latencies_all)[len(latencies_all) // 2] if latencies_all else 0
+
+        # Best retrieval method
+        mode_strengths: dict[str, list[float]] = {}
+        for r in rows:
+            mode = r.get("retrieval_mode") or "unknown"
+            s = (r.get("evaluation") or {}).get("criteria", {}).get("retrieval_strength", {}).get("score")
+            if isinstance(s, (int, float)):
+                mode_strengths.setdefault(mode, []).append(s)
+        if mode_strengths:
+            best_mode = max(mode_strengths, key=lambda m: sum(mode_strengths[m]) / len(mode_strengths[m]))
+            best_avg = sum(mode_strengths[best_mode]) / len(mode_strengths[best_mode])
+            with st.expander(f"🏆 Best Retrieval Method: **{best_mode}** (avg strength {best_avg:.1f})", expanded=True):
+                for mode, vals in mode_strengths.items():
+                    st.caption(f"• {mode}: avg {sum(vals)/len(vals):.1f} over {len(vals)} queries")
+
+        # Weak queries
+        weak = [
+            r for r in rows
+            if r.get("latency_ms", 0) > 5000
+            or (r.get("evaluation") or {}).get("criteria", {}).get("retrieval_strength", {}).get("score", 100) < 40
+        ]
+        with st.expander(f"⚠️ Weak Queries ({len(weak)} found)", expanded=bool(weak)):
+            if weak:
+                for r in weak:
+                    latency = r.get("latency_ms", 0)
+                    strength = (r.get("evaluation") or {}).get("criteria", {}).get("retrieval_strength", {}).get("score")
+                    reason = []
+                    if latency > 5000:
+                        reason.append(f"latency {latency:.0f} ms")
+                    if isinstance(strength, (int, float)) and strength < 40:
+                        reason.append(f"retrieval strength {strength:.1f}")
+                    st.caption(f"• *{r.get('raw_query', '')[:80]}* — {', '.join(reason)}")
+            else:
+                st.caption("No weak queries detected.")
+
+        # Citation issues
+        citation_issues = []
+        for r in rows:
+            ae = r.get("answer_evaluation") or {}
+            cov = ae.get("citation_coverage") or {}
+            score = cov.get("score") if isinstance(cov, dict) else cov
+            if isinstance(score, (int, float)) and score < 0.5:
+                citation_issues.append((r, score))
+        with st.expander(f"📋 Citation Issues ({len(citation_issues)} queries with coverage < 0.5)", expanded=bool(citation_issues)):
+            if citation_issues:
+                for r, score in citation_issues:
+                    st.caption(f"• *{r.get('raw_query', '')[:80]}* — citation coverage {score:.2f}")
+            else:
+                st.caption("No citation coverage issues detected.")
+
+        # Hallucination risks (from deepeval faithfulness)
+        hallucination_risks = []
+        for i, row in enumerate(rows, 1):
+            deepeval_data = (row.get("trace") or {}).get("deepeval") or row.get("deepeval") or {}
+            by_mode = deepeval_data.get("by_retrieval_mode") or {}
+            for entry in by_mode.values():
+                faith_data = (entry.get("scores") or {}).get("faithfulness") or {}
+                faith_score = faith_data.get("score") if isinstance(faith_data, dict) else None
+                if isinstance(faith_score, (int, float)) and faith_score < 0.6:
+                    hallucination_risks.append((row, faith_score))
+                    break
+        with st.expander(f"🚨 Hallucination Risks ({len(hallucination_risks)} queries with faithfulness < 0.6)", expanded=bool(hallucination_risks)):
+            if hallucination_risks:
+                for r, score in hallucination_risks:
+                    st.caption(f"• *{r.get('raw_query', '')[:80]}* — faithfulness {score:.2f}")
+            else:
+                st.caption("No hallucination risks detected (or DeepEval not yet enabled).")
+
+        # Latency outliers (> 2× median)
+        if median_all > 0:
+            outliers = [(r, r.get("latency_ms", 0)) for r in rows if r.get("latency_ms", 0) > 2 * median_all]
+        else:
+            outliers = []
+        with st.expander(f"⏱ Latency Outliers ({len(outliers)} queries > 2× median {median_all:.0f} ms)", expanded=bool(outliers)):
+            if outliers:
+                for r, lat in outliers:
+                    st.caption(f"• *{r.get('raw_query', '')[:80]}* — {lat:.0f} ms")
+            else:
+                st.caption("No latency outliers detected.")
+
+    # ========================================================================
+    # TAB 6  QUERY DRILL-DOWN
+    # ========================================================================
+    with tab_drill:
+        choices = {_row_label(r, i): r for i, r in enumerate(rows, 1)}
+        selected_label = st.selectbox("Select a recorded query", list(choices.keys()), key="drill_query_select")
+        selected = choices[selected_label]
+
+        st.caption(f"**Query:** {selected.get('raw_query', '')}")
+        st.caption(f"**Timestamp:** {selected.get('timestamp', '')[:19]}  |  **Latency:** {selected.get('latency_ms', '—')} ms  |  **Mode:** {selected.get('retrieval_mode', '—')}")
+
+        st.markdown("---")
+        st.markdown("#### Evaluation Scores")
+        eval_data = {**(selected.get("evaluation") or {}).get("criteria", {}), **(selected.get("answer_evaluation") or {})}
+        if eval_data:
+            score_rows = []
+            for name, metric in eval_data.items():
+                if isinstance(metric, dict):
+                    score_rows.append({
+                        "Metric": name.replace("_", " ").title(),
+                        "Score": metric.get("score", "—"),
+                        "Reason": str(metric.get("reason", ""))[:120],
+                    })
+            if score_rows:
+                st.dataframe(score_rows, hide_index=True, use_container_width=True)
+        else:
+            st.caption("No evaluation scores recorded for this query.")
+
+        st.markdown("#### Context Chunks Sent to LLM")
+        ctx = (selected.get("trace") or {}).get("context") or {}
+        final_chunks = ctx.get("final_chunks") or []
+        if final_chunks:
+            _render_chunk_list(final_chunks if isinstance(final_chunks, list) else [])
+        else:
+            context_summary = selected.get("context") or {}
+            if context_summary:
+                st.caption(
+                    f"Context summary: {context_summary.get('chunks', '—')} chunks, "
+                    f"{context_summary.get('chars', '—')} chars, "
+                    f"sources: {', '.join(context_summary.get('sources', []))}"
+                )
+            else:
+                st.caption("No context chunk detail recorded for this query.")
+
+        with st.expander("Full Trace JSON", expanded=False):
+            st.json({
+                "trace": selected.get("trace", {}),
+                "evaluation": selected.get("evaluation", {}),
+                "answer_evaluation": selected.get("answer_evaluation", {}),
+            })
 
 
 def _render_dashboard_page(pipeline: RAGPipeline) -> None:
@@ -2999,17 +3647,17 @@ def _render_dashboard_page(pipeline: RAGPipeline) -> None:
         st.info("No observations recorded yet."); return
     data = {**rows[0].get("evaluation", {}).get("criteria", {}), **rows[0].get("answer_evaluation", {})}
     formulas = {
-        "retrieval_strength": "60 + min(35, relative_gap×75), plus 5 when top candidate is in both retrievers; clamped 10–100.",
-        "direct_answer_support": "Maximum top-6 candidate support: definitional 50 + up to 30, or density path 30 + up to 20; +15 filename match; +15×term coverage; clamped 5–100.",
-        "evidence_relevance": "(direct×100 + broad×55 + tangential×10)/inspected, +10 when directly relevant evidence exists.",
-        "retriever_agreement": "50% Jaccard(Dense,BM25) + 50% top-3 overlap ratio×100.",
-        "ranking_stability": "Average top-3 Dense/BM25 survival in RRF top-5 ×100; clamped 20–100.",
-        "evidence_sufficiency": "Simple: 95/75/40 based on direct support ≥70/≥45/else; complex: term coverage×70 + min(20,chunks×6).",
+        "retrieval_strength": "60 + min(35, relative_gap75), plus 5 when top candidate is in both retrievers; clamped 10100.",
+        "direct_answer_support": "Maximum top-6 candidate support: definitional 50 + up to 30, or density path 30 + up to 20; +15 filename match; +15term coverage; clamped 5100.",
+        "evidence_relevance": "(direct100 + broad55 + tangential10)/inspected, +10 when directly relevant evidence exists.",
+        "retriever_agreement": "50% Jaccard(Dense,BM25) + 50% top-3 overlap ratio100.",
+        "ranking_stability": "Average top-3 Dense/BM25 survival in RRF top-5 100; clamped 20100.",
+        "evidence_sufficiency": "Simple: 95/75/40 based on direct support 70/45/else; complex: term coverage70 + min(20,chunks6).",
         "evidence_coherence": "Rule-based source concentration and source/query-term alignment.",
-        "facet_coverage": "Evidence-covered detected live facets / detected facets ×100.",
-        "evidence_claim_grounding": "Supported citations / citations ×100.",
-        "citation_coverage": "Fully supported claims / extracted claims ×100.",
-        "citation_correctness": "Citations with direct answer support / citations ×100.",
+        "facet_coverage": "Evidence-covered detected live facets / detected facets 100.",
+        "evidence_claim_grounding": "Supported citations / citations 100.",
+        "citation_coverage": "Fully supported claims / extracted claims 100.",
+        "citation_correctness": "Citations with direct answer support / citations 100.",
     }
     for name, metric in data.items():
         with st.expander(f"{metric.get('label', name.replace('_', ' ').title())}: {metric.get('score', 'Not instrumented')}"):
@@ -3036,7 +3684,7 @@ def _render_comparison_page(pipeline: RAGPipeline) -> None:
         return {"Latency ms": row.get("latency_ms"), "Retrieval strength": c.get("retrieval_strength", {}).get("score"), "Agreement": c.get("retriever_agreement", {}).get("score"), "Evidence support": c.get("direct_answer_support", {}).get("score"), "Grounding": a.get("evidence_claim_grounding", {}).get("score"), "Citation coverage": a.get("citation_coverage", {}).get("score")}
     left, right = metrics(first), metrics(second)
     st.dataframe([{"Metric": key, labels[rows.index(first)]: left[key], labels[rows.index(second)]: right[key]} for key in left], hide_index=True, use_container_width=True)
-    changed = [f"{key}: {left[key]} → {right[key]}" for key in left if left[key] != right[key]]
+    changed = [f"{key}: {left[key]}  {right[key]}" for key in left if left[key] != right[key]]
     st.subheader("What changed?"); st.write("; ".join(changed) if changed else "No recorded metric difference.")
 
 
@@ -3110,7 +3758,7 @@ def _render_chat_history_page(pipeline: RAGPipeline) -> None:
             label_visibility="collapsed",
         )
     with top_col3:
-        if turns and st.button("🗑 Clear All History", key="clear_all_chat_hist", **WIDE):
+        if turns and st.button(" Clear All History", key="clear_all_chat_hist", **WIDE):
             _clear_persistent_chat_history(pipeline.vectorstore_path)
             st.session_state.chat_history = []
             st.success("Chat history cleared.")
@@ -3135,7 +3783,7 @@ def _render_chat_history_page(pipeline: RAGPipeline) -> None:
         timestamp = user_msg.get("timestamp", "")
         q_text = user_msg.get("content", "")
         with st.expander(
-            f"Q: {q_text[:85]}{'...' if len(q_text) > 85 else ''} {('· ' + timestamp) if timestamp else ''}",
+            f"Q: {q_text[:85]}{'...' if len(q_text) > 85 else ''} {(' ' + timestamp) if timestamp else ''}",
             expanded=(idx == 1),
         ):
             st.markdown(f"**Question:**\n{q_text}")
@@ -3149,5 +3797,7 @@ def _render_chat_history_page(pipeline: RAGPipeline) -> None:
 
 if __name__ == "__main__":
     main()
+
+
 
 

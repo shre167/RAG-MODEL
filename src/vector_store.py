@@ -9,10 +9,12 @@ try:
     import chromadb
     from chromadb.config import Settings
     _HAS_CHROMADB = True
-except Exception:  # pragma: no cover - optional dependency fallback
+    _CHROMADB_IMPORT_ERROR: Exception | None = None
+except Exception as exc:  # pragma: no cover - optional dependency fallback
     chromadb = None  # type: ignore
     Settings = None  # type: ignore
     _HAS_CHROMADB = False
+    _CHROMADB_IMPORT_ERROR = exc
 
 from src.config import VECTORSTORE_DIR
 
@@ -39,8 +41,10 @@ class ChromaVectorStore:
     def __init__(self, collection_name: str = "knowledge_base", persist_directory: str | Path = VECTORSTORE_DIR):
         if not _HAS_CHROMADB:
             raise ImportError(
-                "chromadb is required for the vector store. Install with `pip install chromadb`"
-            )
+                "ChromaDB could not be imported. Install project requirements with "
+                "`pip install -r requirements.txt`. Original import error: "
+                f"{_CHROMADB_IMPORT_ERROR}"
+            ) from _CHROMADB_IMPORT_ERROR
         self.persist_directory = str(Path(persist_directory).resolve())
         if hasattr(chromadb, "PersistentClient"):
             self.client = chromadb.PersistentClient(

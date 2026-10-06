@@ -393,17 +393,46 @@ def build_context(
         )
 
         metadata = candidate.metadata or {}
+        image_desc = metadata.get("image_description") or ""
+        if image_desc:
+            text = text + f"\n\n[Visual content on this page: {image_desc}]"
+
         file_type = metadata.get("file_type") or (Path(filename).suffix.lstrip(".").lower() if filename else "")
-        page_num = metadata.get("page_number")
+        page_num = metadata.get("page_number") or metadata.get("page_start")
         try:
             page_number = int(page_num) if page_num and int(page_num) > 0 else None
         except (ValueError, TypeError):
             page_number = None
 
-        if (file_type == "pdf" or filename.lower().endswith(".pdf")) and page_number is not None:
-            source_display = f"{filename} — p. {page_number}"
+        book_title = (
+            metadata.get("book_title")
+            or metadata.get("book_name")
+            or filename
+        )
+        if book_title.lower().endswith(".pdf"):
+            clean_title = book_title[:-4].replace(" (1)", "").strip()
         else:
-            source_display = filename
+            clean_title = book_title.replace(" (1)", "").strip()
+
+        chapter_num = metadata.get("chapter_num")
+        page_start = metadata.get("page_start") or page_number
+        page_end = metadata.get("page_end") or page_start
+
+        parts = []
+        if clean_title and clean_title != "unknown":
+            parts.append(clean_title)
+        if chapter_num and int(chapter_num) > 0:
+            parts.append(f"Chapter {chapter_num}")
+        if page_start and int(page_start) > 0:
+            if page_end and int(page_end) > int(page_start):
+                parts.append(f"Pages {page_start}–{page_end}")
+            else:
+                parts.append(f"Page {page_start}")
+
+        if parts:
+            source_display = " — ".join(parts)
+        else:
+            source_display = filename if filename != "unknown" else "Mind Management, Not Time Management"
 
         if source_display not in seen_sources:
             seen_sources.add(source_display)
@@ -414,11 +443,36 @@ def build_context(
             f"{text}"
         )
 
+        page_range_str = ""
+        if page_start and int(page_start) > 0:
+            if page_end and int(page_end) > int(page_start):
+                page_range_str = f"{page_start}–{page_end}"
+            else:
+                page_range_str = str(page_start)
+
         retrieved_chunks.append(
             {
                 "rank": index,
                 "filename": filename,
+                "book": clean_title,
+                "book_title": clean_title,
+                "book_name": metadata.get("book_name") or filename,
+                "book_id": metadata.get("book_id", ""),
+                "chapter": chapter_num if chapter_num and int(chapter_num) > 0 else None,
+                "chapter_num": chapter_num,
+                "chapter_title": metadata.get("chapter_title", ""),
+                "section": metadata.get("section_heading") or metadata.get("section_title") or "",
+                "section_heading": metadata.get("section_heading") or metadata.get("section_title") or "",
+                "section_title": metadata.get("section_title") or metadata.get("section_heading") or "",
+                "page_start": page_start,
+                "page_end": page_end,
+                "page_range": page_range_str,
+                "token_count": metadata.get("token_count", 0),
+                "character_count": len(text),
                 "chunk_id": candidate.chunk_id,
+                "chunk_index": metadata.get("chunk_index", 0),
+                "prev_chunk_id": metadata.get("prev_chunk_id", ""),
+                "next_chunk_id": metadata.get("next_chunk_id", ""),
                 "text": text,
                 "metadata": metadata,
                 "file_type": file_type,

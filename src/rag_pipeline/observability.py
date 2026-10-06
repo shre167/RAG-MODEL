@@ -7,9 +7,11 @@ from typing import Any
 
 from src.rag_pipeline.langfuse_tracing import emit_langfuse_trace
 from src.rag_pipeline.observability_config import (
+    langfuse_enabled,
     deepeval_compare_all_retrievers,
     deepeval_enabled,
     deepeval_eval_modes,
+    deepeval_metrics,
     ragas_compare_all_retrievers,
     ragas_eval_enabled,
     ragas_eval_modes,
@@ -90,8 +92,6 @@ def _run_observation_background(
     """
     deepeval_by_mode: dict[str, dict[str, Any]] = {}
     ragas_by_mode: dict[str, dict[str, Any]] = {}
-    timings = (response.get("trace") or {}).get("retrieval", {}).get("timings_ms") or {}
-
     if use_deepeval:
         # DeepEval evaluation path
         modes = deepeval_eval_modes()
@@ -135,6 +135,7 @@ def _run_observation_background(
                     answer=answer,
                     retrieved_contexts=contexts,
                     retrieval_mode=mode,  # type: ignore[arg-type]
+                    metrics=deepeval_metrics(),
                 )
             except Exception:
                 logger.exception("DeepEval evaluation failed for mode=%s", mode)
@@ -149,6 +150,21 @@ def _run_observation_background(
         response["deepeval"] = {
             "by_retrieval_mode": deepeval_by_mode,
         }
+        observation_id = (response.get("observation") or {}).get("query_id")
+        if observation_id:
+            try:
+                from src.rag_pipeline.observation_store import update_observation_fields
+
+                update_observation_fields(
+                    pipeline.vectorstore_path,
+                    observation_id,
+                    {"deepeval": response["deepeval"]},
+                )
+            except Exception:
+                logger.exception(
+                    "Could not persist DeepEval results for query_id=%s",
+                    observation_id,
+                )
 
     elif ragas_eval_enabled():
         # RAGAS evaluation path (legacy)
@@ -186,19 +202,9 @@ def _run_observation_background(
             "metrics_plan": ragas_by_mode.get(retrieval_mode, {}).get("metrics_plan"),
         }
 
-    trace_id = emit_langfuse_trace(
-        query=question,
-        retrieval_mode=retrieval_mode,  # type: ignore[arg-type]
-        response=response,
-        total_latency_ms=total_latency_ms,
-        retrieval_timings_ms=timings,
-        deepeval_by_mode=deepeval_by_mode or None,
-        ragas_by_mode=ragas_by_mode or None,
-    )
-    if trace_id:
-        response.setdefault("observability", {})["langfuse_trace_id"] = trace_id
+    trace_id = (response.get("observability") or {}).get("langfuse_trace_id")
 
-    # Print terminal output (runs in background thread — that's fine)
+    # Print terminal output (runs in the background thread).
     if use_deepeval and deepeval_enabled() and retrieval_mode in deepeval_by_mode:
         current_eval = deepeval_by_mode.get(retrieval_mode, {})
         _format_terminal_output(
@@ -229,25 +235,68 @@ def observe_pipeline_answer(
     response: dict[str, Any],
     total_latency_ms: float,
     labels: dict[str, Any] | None = None,
+    start_evaluation: bool = True,
 ) -> dict[str, Any]:
     """
-    Attach Langfuse trace and optional DeepEval/RAGAS scores to a completed
-    pipeline response.
+    Attach a Langfuse trace and schedule optional DeepEval/RAGAS evaluation
+    for a completed pipeline response.
 
-    When neither DeepEval nor Langfuse is enabled the function returns
-    immediately (fast path unchanged).
-
-    When evaluation is enabled the heavy work (extra pipeline passes,
-    LLM metric calls, Langfuse upload) runs in a background daemon thread
-    so the caller gets the response back without blocking.  The response
-    dict is mutated in-place by the background thread once it finishes;
-    scores therefore appear in the next Observatory observation record
-    rather than the current one.
+    Langfuse upload runs before returning so trace failures are visible and
+    the trace ID can be stored with the local observation. Evaluation runs
+    in a background daemon thread and mutates the response when it completes.
     """
     use_deepeval = deepeval_enabled()
+    use_ragas = ragas_eval_enabled()
+    use_langfuse = langfuse_enabled()
 
-    # Fast path: nothing enabled — return immediately, no thread overhead.
-    if not use_deepeval and not ragas_eval_enabled():
+    if use_langfuse:
+        try:
+            timings = (
+                (response.get("trace") or {})
+                .get("retrieval", {})
+                .get("timings_ms")
+                or {}
+            )
+            trace_id = emit_langfuse_trace(
+                query=question,
+                retrieval_mode=retrieval_mode,  # type: ignore[arg-type]
+                response=response,
+                total_latency_ms=total_latency_ms,
+                retrieval_timings_ms=timings,
+            )
+            if trace_id:
+                response.setdefault("observability", {})["langfuse_trace_id"] = trace_id
+                response.setdefault("trace", {})["langfuse_trace_id"] = trace_id
+        except Exception:
+            logger.exception("Langfuse trace upload failed.")
+
+    # Fast path: nothing enabled — skip thread overhead.
+    if not start_evaluation or (not use_deepeval and not use_ragas):
+        return response
+
+    return schedule_observation_evaluation(
+        pipeline=pipeline,
+        question=question,
+        retrieval_mode=retrieval_mode,
+        response=response,
+        total_latency_ms=total_latency_ms,
+        labels=labels,
+    )
+
+
+def schedule_observation_evaluation(
+    *,
+    pipeline: Any,
+    question: str,
+    retrieval_mode: str,
+    response: dict[str, Any],
+    total_latency_ms: float,
+    labels: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Start background evaluation after its observation row has been saved."""
+    use_deepeval = deepeval_enabled()
+    use_ragas = ragas_eval_enabled()
+    if not use_deepeval and not use_ragas:
         return response
 
     # Pre-populate the deepeval key so UI code never crashes on a missing key.
@@ -270,3 +319,4 @@ def observe_pipeline_answer(
     t.start()
 
     return response
+

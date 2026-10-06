@@ -1962,47 +1962,101 @@ def get_context_chunks(
             row.get("text", "")
         )
 
+        meta = row.get("metadata", {}) if isinstance(row.get("metadata"), dict) else {}
+        book = (
+            row.get("book")
+            or row.get("book_title")
+            or meta.get("book_title")
+            or meta.get("book_name")
+            or row.get("filename", "")
+        )
+        if str(book).lower().endswith(".pdf"):
+            book = str(book)[:-4].replace(" (1)", "").strip()
+
+        ch_num = row.get("chapter") or row.get("chapter_num") or meta.get("chapter_num")
+        sec = row.get("section") or row.get("section_heading") or meta.get("section_heading") or meta.get("section_title") or ""
+        p_start = row.get("page_start") or row.get("page_number") or meta.get("page_start") or meta.get("page_number")
+        p_end = row.get("page_end") or meta.get("page_end") or p_start
+        p_range = row.get("page_range")
+        if not p_range and p_start:
+            p_range = f"{p_start}–{p_end}" if p_end and p_end != p_start else str(p_start)
+
         results.append(
             {
                 "position": index,
-
-                "filename": row.get(
-                    "filename",
-                    "",
-                ),
-
-                "chunk_id": row.get(
-                    "chunk_id",
-                    "",
-                ),
-
+                "rank": row.get("rank", index),
+                "filename": row.get("filename") or meta.get("filename") or "",
+                "book": book,
+                "book_title": book,
+                "book_name": row.get("book_name") or meta.get("book_name") or row.get("filename", ""),
+                "chapter": ch_num if ch_num and int(ch_num) > 0 else None,
+                "chapter_num": ch_num,
+                "chapter_title": row.get("chapter_title") or meta.get("chapter_title", ""),
+                "section": sec,
+                "section_heading": sec,
+                "page_start": p_start,
+                "page_end": p_end,
+                "page_range": p_range or "-",
+                "token_count": row.get("token_count") or meta.get("token_count", 0),
+                "chunk_id": row.get("chunk_id", ""),
                 "text": text,
-
                 "chars": len(text),
-
-                "section_heading": row.get(
-                    "section_heading",
-                    "",
-                ),
-
-                "score": _round(
-                    row.get(
-                        "rrf_score",
-                        row.get("score"),
-                    )
-                ),
-
-                "dense_rank": row.get(
-                    "dense_rank"
-                ),
-
-                "bm25_rank": row.get(
-                    "bm25_rank"
-                ),
+                "score": _round(row.get("rrf_score", row.get("score"))),
+                "rrf_score": _round(row.get("rrf_score")),
+                "dense_rank": row.get("dense_rank"),
+                "dense_distance": _round(row.get("dense_distance")),
+                "bm25_rank": row.get("bm25_rank"),
+                "bm25_score": _round(row.get("bm25_score")),
+                "source_label": row.get("source_label", ""),
+                "metadata": meta,
             }
         )
 
+    # Back-fill source_label using rich formatting on the assembled rows
+    for r in results:
+        if not r.get("source_label"):
+            r["source_label"] = _rich_source_label(r)
+
     return results
+
+
+def _rich_source_label(row: Dict[str, Any]) -> str:
+    """Build a human-readable source label from chunk metadata."""
+    book = (
+        row.get("book_title")
+        or row.get("book_name")
+        or row.get("book")
+        or row.get("filename")
+        or "Unknown"
+    )
+    if str(book).lower().endswith(".pdf"):
+        book = str(book)[:-4].replace(" (1)", "").strip()
+    parts = [book]
+    ch = row.get("chapter_num") or row.get("chapter")
+    ch_title = row.get("chapter_title") or ""
+    if ch:
+        try:
+            ch_int = int(ch)
+            if ch_int > 0:
+                ch_part = f"Chapter {ch_int}"
+                if ch_title:
+                    ch_part += f" — {ch_title}"
+                parts.append(ch_part)
+        except (ValueError, TypeError):
+            pass
+    p_start = row.get("page_start")
+    p_end = row.get("page_end")
+    if p_start:
+        try:
+            p_start_i = int(p_start)
+            p_end_i = int(p_end) if p_end else p_start_i
+            if p_end_i > p_start_i:
+                parts.append(f"Pages {p_start_i}–{p_end_i}")
+            else:
+                parts.append(f"Page {p_start_i}")
+        except (ValueError, TypeError):
+            pass
+    return " — ".join(parts)
 
 
 def get_supporting_sources(
@@ -2021,13 +2075,9 @@ def get_supporting_sources(
     ordered: List[str] = []
 
     for row in chunks:
-
-        filename = _text(
-            row.get("filename")
-        )
-
-        if filename and filename not in ordered:
-            ordered.append(filename)
+        label = _rich_source_label(row)
+        if label and label not in ordered:
+            ordered.append(label)
 
     if ordered:
         return ordered
@@ -2041,8 +2091,10 @@ def get_supporting_sources(
     if isinstance(unique, list):
 
         for item in unique:
-
-            filename = _text(item)
+            if isinstance(item, dict):
+                filename = _rich_source_label(item)
+            else:
+                filename = _text(item)
 
             if filename and filename not in ordered:
                 ordered.append(filename)
@@ -2055,7 +2107,10 @@ def get_supporting_sources(
     for item in _as_list(
         response.get("sources")
     ):
-        filename = _text(item)
+        if isinstance(item, dict):
+            filename = _rich_source_label(item)
+        else:
+            filename = _text(item)
 
         if filename and filename not in ordered:
             ordered.append(filename)

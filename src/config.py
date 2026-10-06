@@ -30,6 +30,9 @@ class Config:
 
     EMBEDDING_MODEL: str = _raw_embed_model.strip() if _raw_embed_model else ""
     LLM_MODEL: str = _raw_llm_model.strip() if _raw_llm_model else ""
+    _raw_image_model = os.getenv("IMAGE_ANALYSIS_MODEL")
+    IMAGE_ANALYSIS_MODEL: str = _raw_image_model.strip() if _raw_image_model else ""
+    ENABLE_IMAGE_ANALYSIS: bool = os.getenv("ENABLE_IMAGE_ANALYSIS", "false").lower() in ("1", "true", "yes")
 
     # ==================== PATHS ====================
     BASE_DIR: Path = BASE_DIR
@@ -200,6 +203,8 @@ RERANK_TOP_K = Config.RERANK_TOP_K
 MIN_CHUNK_LENGTH = Config.MIN_CHUNK_LENGTH
 MIN_RERANK_SCORE = Config.MIN_RERANK_SCORE
 RERANKER_MODEL = Config.RERANKER_MODEL
+IMAGE_ANALYSIS_MODEL = Config.IMAGE_ANALYSIS_MODEL
+ENABLE_IMAGE_ANALYSIS = Config.ENABLE_IMAGE_ANALYSIS
 
 # Validate on import (print warning but don't crash)
 try:

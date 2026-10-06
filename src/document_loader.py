@@ -1,549 +1,3137 @@
+# src/document_loader.py
+
 from __future__ import annotations
 
-import io
+import hashlib
+import os
 import re
+import unicodedata
+from collections import Counter
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
-try:
-    import pypdf
-except ImportError:
-    pypdf = None
+import fitz  # PyMuPDF
 
-try:
-    import docx
-    import docx.table
-    import docx.text.paragraph
-except ImportError:
-    docx = None
 
-try:
-    from langchain_text_splitters import RecursiveCharacterTextSplitter
-    _HAS_LANGCHAIN = True
-except Exception:
-    RecursiveCharacterTextSplitter = None  # type: ignore
-    _HAS_LANGCHAIN = False
+BASE_DIR = Path(__file__).resolve().parent.parent
+KNOWLEDGE_BASE_DIR = BASE_DIR / "knowledge_base"
 
-from src.config import CHUNK_OVERLAP, CHUNK_SIZE, KNOWLEDGE_BASE_DIR
+TARGET_TOKENS = int(os.getenv("CHUNK_TARGET_TOKENS", "350"))
+MAX_TOKENS = int(os.getenv("CHUNK_MAX_TOKENS", "450"))
+MIN_TOKENS = int(os.getenv("CHUNK_MIN_TOKENS", "80"))
+
+# Only used when one individual paragraph is too large.
+OVERSIZED_PARAGRAPH_OVERLAP = int(
+    os.getenv("OVERSIZED_PARAGRAPH_OVERLAP", "40")
+)
+
+MERGE_SLACK = int(os.getenv("CHUNK_MERGE_SLACK", "30"))
+
+# OCR_MODE is intentionally NOT cached at module level â€”
+# read it dynamically so callers can set the env var after import.
+def _get_ocr_mode() -> str:
+    return os.getenv("OCR_MODE", "auto").strip().lower()
+
+
+# Keep a module-level alias for code that reads it directly (e.g. _ocr_pages).
+# All new code should call _get_ocr_mode() instead.
+OCR_MODE = os.getenv("OCR_MODE", "auto").strip().lower()
+
+# Windows multiprocessing + OCR can be fragile.
+# Default to 1 worker on Windows for reliability.
+DEFAULT_OCR_WORKERS = 1 if os.name == "nt" else max(
+    1, min(4, (os.cpu_count() or 2) - 1)
+)
+
+OCR_WORKERS = int(
+    os.getenv("OCR_WORKERS", str(DEFAULT_OCR_WORKERS))
+)
+
+OCR_LANGUAGE = os.getenv("OCR_LANGUAGE", "eng")
+
+OCR_MIN_TEXT_CHARS = int(
+    os.getenv("OCR_MIN_TEXT_CHARS", "30")
+)
+
+# Optional tokenizer.
+TOKENIZER_NAME = os.getenv(
+    "CHUNK_TOKENIZER",
+    "BAAI/bge-small-en-v1.5"
+).strip()
 
 
 # ============================================================
-# ASTRONOMY DOMAIN CATEGORY KEYWORDS
+# REGEX
 # ============================================================
 
-CATEGORY_KEYWORDS: dict[str, list[str]] = {
-    "Planetary Science": [
-        "planet", "orbit", "atmosphere", "moon", "asteroid", "comet", "crater",
-        "solar system", "mercury", "venus", "mars", "jupiter", "saturn",
-        "uranus", "neptune", "dwarf", "pluto",
-    ],
-    "Stars & Astrophysics": [
-        "star", "sun", "solar", "black hole", "singularity", "event horizon",
-        "supernova", "neutron", "pulsar", "white dwarf", "red giant", "stellar",
-        "fusion", "luminosity", "spectral", "main sequence",
-    ],
-    "Galaxies & Cosmology": [
-        "galaxy", "galaxies", "milky way", "universe", "expansion", "big bang",
-        "dark matter", "dark energy", "cosmic", "cosmology", "redshift",
-        "quasar", "hubble constant",
-    ],
-    "Space Missions": [
-        "isro", "chandrayaan", "pragyan", "vikram", "nasa", "apollo", "artemis",
-        "voyager", "rover", "mission", "launch", "rocket", "lander", "orbiter",
-        "probe", "iss", "spacex", "esa", "jaxa",
-    ],
-    "Space Technology": [
-        "telescope", "jwst", "hubble", "satellite", "optics", "spectroscopy",
-        "infrared", "launch vehicle", "thruster", "propulsion", "detector",
-        "imaging", "radio telescope", "instrument",
-    ],
+_CONTROL_RE = re.compile(
+    r"[\x00-\x08\x0b\x0c\x0e-\x1f\u200b\u200c\u200d\ufeff\u00ad]"
+)
+
+_PAGE_NUMBER_RE = re.compile(
+    r"^(?:page\s+)?(?:\d{1,4}|[ivxlcdm]{1,8})$",
+    re.IGNORECASE,
+)
+
+_CHAPTER_RE = re.compile(
+    r"^(?:chapter|ch\.)\s+"
+    r"(\d{1,3}|[ivxlcdm]{1,8})"
+    r"\s*"
+    r"[:.\-\u2013\u2014]?\s*"
+    r"(.*)$",
+    re.IGNORECASE,
+)
+
+_BARE_CHAPTER_RE = re.compile(
+    r"^(?:chapter|ch\.)\s+"
+    r"(\d{1,3}|[ivxlcdm]{1,8})"
+    r"\s*$",
+    re.IGNORECASE,
+)
+
+# Matches "C H A P T E R N" (spaced-letter format used in book body pages)
+_SPACED_CHAPTER_RE = re.compile(
+    r"^C\s+H\s+A\s+P\s+T\s+E\s+R\s+"
+    r"(\d{1,3}|[ivxlcdm]{1,8})"
+    r"\s*$",
+    re.IGNORECASE,
+)
+
+
+def _normalize_chapter_line(line: str) -> str:
+    """Normalize spaced-letter chapter headings to standard form."""
+
+    match = _SPACED_CHAPTER_RE.match(line.strip())
+
+    if match:
+        return f"CHAPTER {match.group(1).strip()}"
+
+    return line
+
+
+_SECTION_NUMBER_RE = re.compile(
+    r"^(?:\d+(?:\.\d+)*|[IVXLC]+(?:\.[IVXLC]+)*)[.)]?\s+.+$",
+    re.IGNORECASE,
+)
+
+_TOC_DOT_LEADER_RE = re.compile(r"\.{2,}\s*\d+\s*$")
+_TOC_PAGE_NUMBER_RE = re.compile(r"\s+\d{1,3}\s*$")
+
+_SENTENCE_SPLIT_RE = re.compile(
+    r'(?:(?<=[.!?])|(?<=[.!?][\u201d"\u2019)]))\s+'
+    r'(?=[A-Z0-9\u201c"\u2018\'(])'
+)
+
+_BACK_MATTER_RE = re.compile(
+    r"^(?:acknowledg(?:e)?ments|about the author|notes|endnotes|"
+    r"references|works cited|bibliography|index)$",
+    re.IGNORECASE,
+)
+
+_COMMON_ABBREVIATIONS = {
+    "mr.", "mrs.", "ms.", "dr.", "prof.", "sr.", "jr.", "etc.",
+    "e.g.", "i.e.", "vs.", "fig.", "no.", "approx.", "inc.",
+    "jan.", "feb.", "mar.", "apr.", "jun.", "jul.", "aug.",
+    "sep.", "sept.", "oct.", "nov.", "dec.",
 }
 
 
-def classify_document_by_filename(
-    filename: str, content: str | None = None
-) -> str | None:
-    """Return category based on filename or content keywords."""
-    fname = filename.lower()
-    text = (content or "").lower()
+# ============================================================
+# TOKENIZER
+# ============================================================
 
-    scores: dict[str, int] = {}
-    for category, keywords in CATEGORY_KEYWORDS.items():
-        score = sum(1 for kw in keywords if kw in fname or kw in text)
-        if score > 0:
-            scores[category] = score
-
-    return max(scores, key=scores.get) if scores else None  # type: ignore[arg-type]
+_TOKENIZER = None
+_TOKENIZER_FAILED = False
 
 
-def list_txt_files(base_dir: str | Path = KNOWLEDGE_BASE_DIR) -> list[Path]:
-    """Return all .txt files under the knowledge_base directory."""
-    folder = Path(base_dir)
-    if not folder.exists():
-        return []
-    return sorted(p for p in folder.rglob("*.txt") if p.is_file())
-
-
-SUPPORTED_EXTENSIONS: set[str] = {".txt", ".md", ".docx", ".pdf"}
-
-
-def detect_file_type(
-    path_or_name: str | Path,
-    content: bytes | str | None = None,
-) -> str:
-    """Detect file format among 'txt', 'md', 'docx', 'pdf'.
-
-    Checks extension first, with content magic-byte verification.
+def _get_tokenizer():
     """
-    fname = str(path_or_name).lower()
-    suffix = Path(fname).suffix.lower()
+    Load the tokenizer lazily.
 
-    if isinstance(content, bytes):
-        if content.startswith(b"%PDF-"):
-            return "pdf"
-        if content.startswith(b"PK\x03\x04") and (b"word/" in content or suffix == ".docx"):
-            return "docx"
-    elif isinstance(content, str):
-        if content.startswith("%PDF-"):
-            return "pdf"
+    This prevents importing/loading transformers just to use
+    basic PDF utilities.
+    """
+    global _TOKENIZER
+    global _TOKENIZER_FAILED
 
-    if suffix in SUPPORTED_EXTENSIONS:
-        return suffix.lstrip(".")
+    if _TOKENIZER is not None:
+        return _TOKENIZER
 
-    path = Path(path_or_name)
-    if path.exists() and path.is_file():
+    if _TOKENIZER_FAILED:
+        return None
+
+    try:
+        from transformers import AutoTokenizer
+
+        _TOKENIZER = AutoTokenizer.from_pretrained(
+            TOKENIZER_NAME,
+            local_files_only=False,
+        )
+
+        return _TOKENIZER
+
+    except Exception as exc:
+        _TOKENIZER_FAILED = True
+
+        print(
+            f"[TOKENIZER] Warning: could not load {TOKENIZER_NAME}: {exc}"
+        )
+
+        return None
+
+
+def count_tokens(text: str) -> int:
+    """
+    Count tokens using the actual tokenizer when available.
+
+    Falls back to a conservative word/punctuation estimate.
+    """
+    if not text:
+        return 0
+
+    tokenizer = _get_tokenizer()
+
+    if tokenizer is not None:
         try:
-            with open(path, "rb") as f:
-                header = f.read(2048)
-            if header.startswith(b"%PDF-"):
-                return "pdf"
-            if header.startswith(b"PK\x03\x04") and b"word/" in header:
-                return "docx"
+            backend_tokenizer = getattr(
+                tokenizer,
+                "backend_tokenizer",
+                None,
+            )
+
+            if backend_tokenizer is not None:
+                return len(
+                    backend_tokenizer.encode(
+                        text,
+                        add_special_tokens=False,
+                    ).ids
+                )
+
+            return len(tokenizer._tokenize(text))
         except Exception:
             pass
 
-    return "txt"
+    pieces = re.findall(
+        r"\w+|[^\w\s]",
+        text,
+        flags=re.UNICODE,
+    )
+
+    return max(
+        1,
+        int(len(pieces) * 1.15),
+    )
 
 
-def extract_text_from_txt(source: Path | str | bytes) -> str:
-    """Extract clean text from a TXT file."""
-    if isinstance(source, bytes):
-        return source.decode("utf-8", errors="ignore")
-    path = Path(source)
-    return path.read_text(encoding="utf-8", errors="ignore")
+# ============================================================
+# TEXT CLEANING
+# ============================================================
 
+def clean_line(text: str) -> str:
+    if not text:
+        return ""
 
-def extract_text_from_md(source: Path | str | bytes) -> str:
-    """Extract clean text from a Markdown file."""
-    if isinstance(source, bytes):
-        return source.decode("utf-8", errors="ignore")
-    path = Path(source)
-    return path.read_text(encoding="utf-8", errors="ignore")
+    text = unicodedata.normalize("NFKC", text)
 
+    text = _CONTROL_RE.sub("", text)
 
-def extract_text_from_docx(source: Path | str | bytes | io.BytesIO) -> str:
-    """Extract clean text from a DOCX file preserving headings and tables."""
-    if docx is None:
-        raise ImportError("python-docx is required to extract DOCX files.")
+    text = text.replace("\u00a0", " ")
+    text = text.replace("\u2010", "-")
+    text = text.replace("\u2011", "-")
 
-    if isinstance(source, bytes):
-        stream: Any = io.BytesIO(source)
-    elif isinstance(source, (str, Path)):
-        stream = str(source)
-    elif isinstance(source, io.BytesIO):
-        stream = source
-    else:
-        raise ValueError(f"Unsupported source type for DOCX: {type(source)}")
-
-    doc = docx.Document(stream)
-    text_parts: list[str] = []
-
-    for child in doc.element.body:
-        if child.tag.endswith("p"):
-            p = docx.text.paragraph.Paragraph(child, doc)
-            txt = p.text.strip()
-            if not txt:
-                continue
-            style_name = getattr(getattr(p, "style", None), "name", "") or ""
-            if style_name.startswith("Heading"):
-                try:
-                    level = int(style_name.split()[-1])
-                except (ValueError, IndexError):
-                    level = 2
-                hashes = "#" * min(max(level, 1), 6)
-                text_parts.append(f"\n{hashes} {txt}\n")
-            else:
-                text_parts.append(txt)
-        elif child.tag.endswith("tbl"):
-            t = docx.table.Table(child, doc)
-            for row in t.rows:
-                cells = [cell.text.strip() for cell in row.cells if cell.text.strip()]
-                if cells:
-                    text_parts.append(" | ".join(cells))
-
-    if not text_parts and doc.paragraphs:
-        for p in doc.paragraphs:
-            txt = p.text.strip()
-            if txt:
-                text_parts.append(txt)
-
-    return "\n\n".join(text_parts)
-
-
-def extract_text_from_pdf(source: Path | str | bytes | io.BytesIO) -> list[tuple[int, str]]:
-    """Extract page text from a PDF, returning [(1-based page_number, clean_text), ...]."""
-    if pypdf is None:
-        raise ImportError("pypdf is required to extract PDF files.")
-
-    if isinstance(source, bytes):
-        stream: Any = io.BytesIO(source)
-    elif isinstance(source, (str, Path)):
-        stream = open(source, "rb")
-    elif isinstance(source, io.BytesIO):
-        stream = source
-    else:
-        raise ValueError(f"Unsupported source type for PDF: {type(source)}")
-
-    pages: list[tuple[int, str]] = []
-    try:
-        reader = pypdf.PdfReader(stream)
-        for idx, page in enumerate(reader.pages):
-            page_text = page.extract_text() or ""
-            cleaned = clean_text(page_text)
-            if cleaned:
-                pages.append((idx + 1, cleaned))
-    finally:
-        if isinstance(source, (str, Path)):
-            stream.close()
-
-    return pages
-
-
-def list_knowledge_files(base_dir: str | Path = KNOWLEDGE_BASE_DIR) -> list[Path]:
-    """Return all supported knowledge files (.txt, .md, .docx, .pdf) under the directory."""
-    folder = Path(base_dir)
-    if not folder.exists():
-        return []
-    all_files: list[Path] = []
-    for ext in SUPPORTED_EXTENSIONS:
-        all_files.extend(p for p in folder.rglob(f"*{ext}") if p.is_file())
-    return sorted(set(all_files))
-
-
-def clean_text(raw_text: str) -> str:
-    """Normalize whitespace while keeping meaningful formatting."""
-    text = raw_text.replace("\r\n", "\n").replace("\r", "\n")
-    text = re.sub(r"\n{3,}", "\n\n", text)
     text = re.sub(r"[ \t]+", " ", text)
-    text = re.sub(r" *\n *", "\n", text)
-    text = re.sub(r"\n\s*\n+", "\n\n", text)
+
     return text.strip()
 
 
-def load_document(
-    path_or_name: Path | str,
-    content: str | bytes | None = None,
-) -> list[dict[str, Any]]:
-    """Load and extract clean text from a file (TXT, MD, DOCX, or PDF).
+def clean_text(text: str) -> str:
+    if not text:
+        return ""
 
-    Returns a list of document dicts with keys:
-    - filename: str
-    - source_path: str
-    - content: str
-    - file_type: str ('txt' | 'md' | 'docx' | 'pdf')
-    - page_number: int | None (1-based for PDF, None for non-PDF)
+    text = unicodedata.normalize("NFKC", text)
+
+    text = _CONTROL_RE.sub("", text)
+
+    text = text.replace("\u00a0", " ")
+
+    # Normalize whitespace.
+    text = re.sub(r"\s+", " ", text)
+
+    # Remove spaces before punctuation.
+    text = re.sub(
+        r"(?<=\w) +([,.;:!?])",
+        r"\1",
+        text,
+    )
+
+    # Normalize quote/bracket spacing.
+    text = re.sub(
+        r"([\u201c\u2018(\[])\s+",
+        r"\1",
+        text,
+    )
+
+    text = re.sub(
+        r"\s+([\u201d)\]])",
+        r"\1",
+        text,
+    )
+
+    return text.strip()
+
+
+def normalize_hyphenation(
+    previous: str,
+    current: str,
+    vocabulary: set[str] | None = None,
+) -> str:
     """
-    path = Path(path_or_name)
-    filename = path.name
-    source_path = str(path)
+    Join PDF line/page hyphenation conservatively.
 
-    raw_bytes: bytes | None = None
-    if content is not None:
-        if isinstance(content, bytes):
-            raw_bytes = content
-        else:
-            raw_bytes = content.encode("utf-8")
-    else:
-        if not path.exists():
-            return []
+    Example:
+        manage-
+        ment
+
+    -> management
+    """
+
+    if not previous:
+        return current
+
+    if not current:
+        return previous
+
+    if not previous.endswith("-"):
+        return f"{previous} {current}"
+
+    left = previous[:-1].rstrip()
+    right = current.lstrip()
+
+    if not left or not right:
+        return f"{left} {right}".strip()
+
+    candidate = left + right
+
+    # If we have a vocabulary, only join when the combined word
+    # looks legitimate.
+    if vocabulary:
+        candidate_lower = candidate.lower()
+
+        if candidate_lower in vocabulary:
+            return candidate
+
+        # Common English suffixes where PDF hyphenation is safe.
+        if right.lower().startswith(
+            (
+                "ing",
+                "ed",
+                "er",
+                "est",
+                "ly",
+                "tion",
+                "sion",
+                "ment",
+                "ness",
+                "ful",
+                "less",
+                "able",
+                "ible",
+            )
+        ):
+            return candidate
+
+        return f"{left} {right}"
+    # Without vocabulary, join only when both sides look like
+    # normal alphabetic word fragments.
+    if re.fullmatch(r"[A-Za-z]{2,}", left) and re.fullmatch(
+        r"[A-Za-z]{2,}",
+        right,
+    ):
+        return candidate
+
+    return f"{left} {right}"
+
+
+def build_vocabulary(documents: list[dict[str, Any]]) -> set[str]:
+    """
+    Build a lightweight vocabulary from extracted text.
+
+    This is used only for conservative dehyphenation.
+    """
+    vocabulary: set[str] = set()
+
+    for doc in documents:
+        text = doc.get("text", "")
+
+        for word in re.findall(
+            r"\b[A-Za-z]{3,}\b",
+            text,
+        ):
+            vocabulary.add(word.lower())
+
+    return vocabulary
+
+
+# ============================================================
+# SENTENCE SPLITTING
+# ============================================================
+
+def split_sentences(text: str) -> list[str]:
+    if not text:
+        return []
+
+    # Protect common abbreviations.
+    protected = text
+
+    replacements: dict[str, str] = {}
+
+    for index, abbreviation in enumerate(_COMMON_ABBREVIATIONS):
+        marker = f"__ABBR_{index}__"
+        protected = protected.replace(
+            abbreviation,
+            marker,
+        )
+        replacements[marker] = abbreviation
+
+    parts = _SENTENCE_SPLIT_RE.split(protected)
+
+    result: list[str] = []
+
+    for part in parts:
+        part = part.strip()
+
+        for marker, abbreviation in replacements.items():
+            part = part.replace(
+                marker,
+                abbreviation,
+            )
+
+        if part:
+            result.append(part)
+
+    return result
+
+
+# ============================================================
+# PAGE / BLOCK EXTRACTION
+# ============================================================
+
+def _extract_page_blocks(
+    page: fitz.Page,
+) -> list[dict[str, Any]]:
+    """
+    Extract text blocks while preserving approximate vertical
+    ordering and image presence.
+    """
+
+    blocks: list[dict[str, Any]] = []
+
+    try:
+        raw_blocks = page.get_text("blocks")
+    except Exception:
+        raw_blocks = []
+
+    for raw in raw_blocks:
+        if len(raw) < 5:
+            continue
+
+        x0, y0, x1, y1, text = raw[:5]
+
+        if not isinstance(text, str):
+            continue
+
+        text = text.strip()
+
+        if not text:
+            continue
+
+        blocks.append(
+            {
+                "text": text,
+                "x0": float(x0),
+                "y0": float(y0),
+                "x1": float(x1),
+                "y1": float(y1),
+            }
+        )
+
+    blocks.sort(
+        key=lambda item: (
+            item["y0"],
+            item["x0"],
+        )
+    )
+
+    return blocks
+
+
+def _page_has_images(page: fitz.Page) -> bool:
+    try:
+        return bool(page.get_images(full=True))
+    except Exception:
+        return False
+
+
+def _extract_page_native(
+    pdf_path: str,
+    page_index: int,
+) -> dict[str, Any]:
+    """
+    Worker-safe native PDF extraction.
+    """
+
+    document = fitz.open(pdf_path)
+
+    try:
+        page = document[page_index]
+
+        blocks = _extract_page_blocks(page)
+
+        text_parts = [
+            clean_line(block["text"])
+            for block in blocks
+            if clean_line(block["text"])
+        ]
+
+        text = "\n".join(text_parts)
+
+        return {
+            "page": page_index + 1,
+            "text": text,
+            "blocks": blocks,
+            "has_images": _page_has_images(page),
+            "native_text_chars": len(text),
+        }
+
+    finally:
+        document.close()
+
+
+# ============================================================
+# OCR
+# ============================================================
+
+def _ocr_single_page(
+    args: tuple[str, int, str],
+) -> dict[str, Any]:
+    """
+    OCR one PDF page.
+
+    Kept as a top-level function so it is safe with
+    ProcessPoolExecutor on Windows.
+    """
+
+    pdf_path, page_index, language = args
+
+    try:
+        import fitz
+        import pytesseract
+        from PIL import Image
+        import io
+
+        document = fitz.open(pdf_path)
+
         try:
-            raw_bytes = path.read_bytes()
-        except OSError:
+            page = document[page_index]
+
+            pixmap = page.get_pixmap(
+                matrix=fitz.Matrix(2.0, 2.0),
+                alpha=False,
+            )
+
+            image_bytes = pixmap.tobytes("png")
+
+        finally:
+            document.close()
+
+        image = Image.open(
+            io.BytesIO(image_bytes)
+        )
+
+        text = pytesseract.image_to_string(
+            image,
+            lang=language,
+        )
+
+        text = clean_text(text)
+
+        return {
+            "page": page_index + 1,
+            "text": text,
+            "success": bool(text),
+        }
+
+    except Exception as exc:
+        return {
+            "page": page_index + 1,
+            "text": "",
+            "success": False,
+            "error": str(exc),
+        }
+
+
+def _ocr_pages(
+    pdf_path: str,
+    page_indexes: list[int],
+) -> dict[int, str]:
+    """
+    OCR only pages where native extraction failed.
+
+    On Windows the default is sequential processing to avoid
+    multiprocessing/spawn failures.
+    """
+
+    if not page_indexes:
+        return {}
+
+    if OCR_MODE == "off":
+        return {}
+
+    if OCR_MODE not in {"auto", "on"}:
+        return {}
+
+    try:
+        import pytesseract  # noqa: F401
+        from PIL import Image  # noqa: F401
+    except Exception as exc:
+        print(
+            f"[OCR] OCR unavailable: {exc}"
+        )
+        return {}
+
+    workers = max(1, OCR_WORKERS)
+
+    print(
+        f"[OCR] {len(page_indexes)} page(s) to OCR "
+        f"with {workers} worker(s)..."
+    )
+
+    tasks = [
+        (
+            pdf_path,
+            page_index,
+            OCR_LANGUAGE,
+        )
+        for page_index in page_indexes
+    ]
+
+    results: dict[int, str] = {}
+
+    # Sequential on Windows by default.
+    if workers == 1:
+        for task in tasks:
+            result = _ocr_single_page(task)
+
+            if result.get("success"):
+                results[result["page"]] = result["text"]
+
+            elif result.get("error"):
+                print(
+                    f"[OCR] Page {result['page']} failed: "
+                    f"{result['error']}"
+                )
+
+        return results
+
+    # Multiprocessing only when explicitly configured.
+    try:
+        with ProcessPoolExecutor(
+            max_workers=workers
+        ) as executor:
+
+            futures = [
+                executor.submit(
+                    _ocr_single_page,
+                    task,
+                )
+                for task in tasks
+            ]
+
+            for future in as_completed(futures):
+                result = future.result()
+
+                if result.get("success"):
+                    results[result["page"]] = result["text"]
+
+                elif result.get("error"):
+                    print(
+                        f"[OCR] Page {result['page']} failed: "
+                        f"{result['error']}"
+                    )
+
+    except Exception as exc:
+        print(
+            f"[OCR] Parallel OCR failed: {exc}"
+        )
+
+    return results
+
+
+# ============================================================
+# ACTIVE FILE SELECTION
+# ============================================================
+
+def _get_active_kb_files_raw() -> str:
+    """
+    IMPORTANT:
+    Read ACTIVE_KB_FILES dynamically.
+
+    Do NOT store this in a module-level constant because the
+    user may set the environment variable after importing this
+    module.
+    """
+
+    return os.getenv(
+        "ACTIVE_KB_FILES",
+        "",
+    ).strip()
+
+
+def _normalise_filename(value: str) -> str:
+    value = value.strip()
+
+    # Allow values written as:
+    # "book.pdf"
+    # 'book.pdf'
+    value = value.strip('"').strip("'")
+
+    return value.casefold()
+
+
+def get_active_files(
+    kb_dir: Path | None = None,
+) -> list[Path]:
+    """
+    Return only the knowledge-base files explicitly requested
+    through ACTIVE_KB_FILES.
+
+    Matching is done against the exact filename, case-insensitively.
+    """
+    if kb_dir is None:
+        kb_dir = KNOWLEDGE_BASE_DIR
+
+    if not kb_dir.exists():
+        print(f"[KB] Knowledge base directory not found: {kb_dir}")
+        return []
+
+    files = [
+        p for p in kb_dir.iterdir()
+        if p.is_file() and p.suffix.lower() in {".pdf", ".txt", ".md"}
+    ]
+
+    requested_raw = os.getenv("ACTIVE_KB_FILES", "").strip()
+
+    if not requested_raw:
+        print(f"[KB] Found {len(files)} knowledge file(s)")
+        return files
+
+    # Try exact match first for filenames with commas
+    exact_match = next(
+        (p for p in files if p.name.casefold() == requested_raw.casefold()),
+        None
+    )
+    
+    if exact_match:
+        active_files = [exact_match]
+    else:
+        # Fall back to delimiter-based matching
+        delimiter = ';' if ';' in requested_raw else ','
+        requested = {
+            name.strip().casefold()
+            for name in requested_raw.split(delimiter)
+            if name.strip()
+        }
+        
+        active_files = [
+            p for p in files
+            if p.name.casefold() in requested
+        ]
+
+    print(f"[KB] Found {len(active_files)} active knowledge file(s)")
+    print(f"[KB] ACTIVE_KB_FILES requested: {requested_raw}")
+
+    if not active_files:
+        print("[KB] Available files:")
+        for p in files:
+            print(f"     - {p.name}")
+
+    return active_files
+
+
+# ============================================================
+# RUNNING HEADER / FOOTER REMOVAL
+# ============================================================
+
+def _normalise_for_comparison(text: str) -> str:
+    text = clean_text(text).lower()
+
+    # Remove page numbers.
+    text = re.sub(r"\bpage\s+\d+\b", "", text)
+    text = re.sub(r"\b\d{1,4}\b", "", text)
+
+    return re.sub(
+        r"\s+",
+        " ",
+        text,
+    ).strip()
+
+
+def remove_running_headers_footers(
+    pages: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+
+    if len(pages) < 5:
+        return pages
+
+    top_counter: Counter[str] = Counter()
+    bottom_counter: Counter[str] = Counter()
+
+    page_lines: dict[int, list[str]] = {}
+
+    for page in pages:
+        page_number = page["page"]
+
+        lines = [
+            clean_line(line)
+            for line in page.get("text", "").splitlines()
+        ]
+
+        lines = [
+            line
+            for line in lines
+            if line
+        ]
+
+        page_lines[page_number] = lines
+
+        if lines:
+            top_counter[
+                _normalise_for_comparison(lines[0])
+            ] += 1
+
+            bottom_counter[
+                _normalise_for_comparison(lines[-1])
+            ] += 1
+
+    threshold = max(
+        3,
+        int(len(pages) * 0.12),
+    )
+
+    repeated_top = {
+        value
+        for value, count in top_counter.items()
+        if value and count >= threshold
+    }
+
+    repeated_bottom = {
+        value
+        for value, count in bottom_counter.items()
+        if value and count >= threshold
+    }
+
+    cleaned_pages: list[dict[str, Any]] = []
+
+    for page in pages:
+
+        lines = page_lines[page["page"]][:]
+
+        if lines:
+            first = _normalise_for_comparison(lines[0])
+
+            if (
+                first in repeated_top
+                or _PAGE_NUMBER_RE.fullmatch(lines[0])
+            ):
+                lines.pop(0)
+
+        if lines:
+            last = _normalise_for_comparison(lines[-1])
+
+            if (
+                last in repeated_bottom
+                or _PAGE_NUMBER_RE.fullmatch(lines[-1])
+            ):
+                lines.pop()
+
+        page_copy = dict(page)
+
+        page_copy["text"] = "\n".join(lines)
+
+        cleaned_pages.append(page_copy)
+
+    return cleaned_pages
+
+
+# ============================================================
+# TABLE OF CONTENTS DETECTION
+# ============================================================
+
+def _is_toc_line(line: str) -> bool:
+    line = clean_line(line)
+
+    if not line:
+        return False
+
+    if _TOC_DOT_LEADER_RE.search(line):
+        return True
+
+    # Typical:
+    # "Welcome to the Creative Age 12"
+    if _TOC_PAGE_NUMBER_RE.search(line):
+        stripped = re.sub(
+            r"\s+\d{1,3}\s*$",
+            "",
+            line,
+        )
+
+        if len(stripped.split()) >= 2:
+            return True
+
+    return False
+
+
+def _toc_score(text: str) -> int:
+    lines = [
+        clean_line(line)
+        for line in text.splitlines()
+        if clean_line(line)
+    ]
+
+    if not lines:
+        return 0
+
+    score = 0
+
+    for line in lines:
+
+        if _is_toc_line(line):
+            score += 1
+
+        norm = _normalize_chapter_line(line)
+        if _CHAPTER_RE.match(norm):
+            score += 2
+
+        if "contents" in line.lower():
+            score += 4
+
+    return score
+
+
+def _looks_like_toc_page(page: dict[str, Any]) -> bool:
+    text = page.get("text", "")
+
+    lines = [
+        clean_line(line)
+        for line in text.splitlines()
+        if clean_line(line)
+    ]
+
+    if not lines:
+        return False
+
+    if any(
+        re.search(r"\b(?:table of )?contents\b", line, re.IGNORECASE)
+        for line in lines
+    ):
+        return True
+
+    chapter_count = sum(
+        1
+        for line in lines
+        if _CHAPTER_RE.match(_normalize_chapter_line(line))
+        or _BARE_CHAPTER_RE.match(_normalize_chapter_line(line))
+    )
+
+    if chapter_count >= 2:
+        return True
+
+    toc_entries = [
+        line
+        for line in lines
+        if _is_toc_line(line)
+        and not _CHAPTER_RE.match(_normalize_chapter_line(line))
+        and not _BARE_CHAPTER_RE.match(_normalize_chapter_line(line))
+    ]
+
+    dot_leader_entries = sum(
+        1
+        for line in lines
+        if _TOC_DOT_LEADER_RE.search(line)
+    )
+
+    return (
+        dot_leader_entries >= 2
+        or (
+            len(toc_entries) >= 4
+            and len(toc_entries) / len(lines) >= 0.35
+        )
+    )
+
+
+# ============================================================
+# CHAPTER PARSING
+# ============================================================
+
+def _parse_chapter_number(value: str) -> int | None:
+    value = value.strip().lower()
+
+    if value.isdigit():
+        return int(value)
+
+    roman_map = {
+        "i": 1,
+        "ii": 2,
+        "iii": 3,
+        "iv": 4,
+        "v": 5,
+        "vi": 6,
+        "vii": 7,
+        "viii": 8,
+        "ix": 9,
+        "x": 10,
+        "xi": 11,
+        "xii": 12,
+        "xiii": 13,
+        "xiv": 14,
+        "xv": 15,
+        "xvi": 16,
+        "xvii": 17,
+        "xviii": 18,
+        "xix": 19,
+        "xx": 20,
+    }
+
+    return roman_map.get(value)
+
+
+def parse_chapter_line(
+    line: str,
+) -> tuple[int, str | None] | None:
+
+    line = clean_line(line)
+
+    if not line:
+        return None
+
+    # Normalize "C H A P T E R N" â†’ "CHAPTER N" before matching.
+    line = _normalize_chapter_line(line)
+
+    match = _CHAPTER_RE.match(line)
+
+    if not match:
+        return None
+
+    chapter_number = _parse_chapter_number(
+        match.group(1)
+    )
+
+    if chapter_number is None:
+        return None
+
+    title = clean_line(
+        match.group(2)
+    )
+
+    title = title.rstrip(".:;-â€“â€” ")
+
+    return (
+        chapter_number,
+        title or None,
+    )
+
+
+def parse_bare_chapter_line(
+    line: str,
+) -> int | None:
+
+    line = clean_line(line)
+
+    # Normalize "C H A P T E R N" â†’ "CHAPTER N" before matching.
+    line = _normalize_chapter_line(line)
+
+    match = _BARE_CHAPTER_RE.match(line)
+
+    if not match:
+        return None
+
+    return _parse_chapter_number(
+        match.group(1)
+    )
+
+
+def _looks_like_real_chapter_heading(
+    lines: list[str],
+    index: int,
+    expected_chapter: int | None,
+) -> tuple[int, str | None] | None:
+
+    line = lines[index]
+
+    parsed = parse_chapter_line(line)
+
+    if parsed:
+        chapter_number, title = parsed
+
+        if (
+            expected_chapter is not None
+            and chapter_number != expected_chapter
+        ):
+            return None
+
+        # A chapter heading with a useful title is strong evidence.
+        if title:
+            return (
+                chapter_number,
+                title,
+            )
+
+        # If title is missing, use the next short line as title.
+        if index + 1 < len(lines):
+            next_line = clean_line(
+                lines[index + 1]
+            )
+
+            if (
+                next_line
+                and len(next_line) <= 120
+                and not parse_chapter_line(next_line)
+                and not _is_toc_line(next_line)
+            ):
+                return (
+                    chapter_number,
+                    next_line,
+                )
+
+        return (
+            chapter_number,
+            None,
+        )
+
+    bare_number = parse_bare_chapter_line(line)
+
+    if bare_number is not None:
+
+        if (
+            expected_chapter is not None
+            and bare_number != expected_chapter
+        ):
+            return None
+
+        if index + 1 < len(lines):
+            next_line = clean_line(
+                lines[index + 1]
+            )
+
+            if (
+                next_line
+                and len(next_line) <= 120
+                and not _is_toc_line(next_line)
+                and not parse_chapter_line(next_line)
+            ):
+                return (
+                    bare_number,
+                    next_line,
+                )
+
+        return (
+            bare_number,
+            None,
+        )
+
+    return None
+
+
+# ============================================================
+# SECTION DETECTION
+# ============================================================
+
+def _is_probable_section_heading(
+    line: str,
+) -> bool:
+    """
+    Conservatively classify a text fragment as a section heading.
+
+    Returns True only when there is good evidence the line is a
+    heading â€” numbered sections or ALL-CAPS short phrases.
+
+    Title-case heuristics are intentionally NOT used here because
+    they produce too many false positives with normal prose that
+    starts with a capitalized word.
+    """
+
+    line = clean_line(line)
+
+    if not line:
+        return False
+
+    if len(line) < 3 or len(line) > 120:
+        return False
+
+    if _PAGE_NUMBER_RE.fullmatch(line):
+        return False
+
+    norm = _normalize_chapter_line(line)
+
+    if _CHAPTER_RE.match(norm):
+        return False
+
+    if _BARE_CHAPTER_RE.match(norm):
+        return False
+
+    if _is_toc_line(line):
+        return False
+
+    words = line.split()
+
+    if len(words) > 12:
+        return False
+
+    # Numbered sections are strong candidates.
+    if _SECTION_NUMBER_RE.match(line):
+        return True
+
+    # ALL CAPS headings â€” the only reliable signal for this book.
+    letters = [char for char in line if char.isalpha()]
+
+    if letters:
+        uppercase_ratio = sum(
+            char.isupper() for char in letters
+        ) / len(letters)
+
+        if uppercase_ratio >= 0.90 and len(words) <= 10:
+            return True
+
+    return False
+
+
+
+# ============================================================
+# PARAGRAPH RECONSTRUCTION
+# ============================================================
+
+def _is_paragraph_boundary(
+    previous_line: str,
+    current_line: str,
+) -> bool:
+
+    previous_line = previous_line.strip()
+    current_line = current_line.strip()
+
+    if not previous_line or not current_line:
+        return True
+
+    # A new sentence beginning with a capital letter after a
+    # paragraph-like ending is usually safe.
+    if previous_line.endswith(
+        (".", "!", "?", '"', "'", "â€", "â€™", ")")
+    ):
+        if current_line[:1].isupper():
+            return True
+
+    return False
+
+
+def reconstruct_paragraphs(
+    page: dict[str, Any],
+    vocabulary: set[str] | None = None,
+) -> list[dict[str, Any]]:
+    """
+    Convert a page's block list into a list of paragraph dicts.
+
+    Each fitz "blocks" entry is already a semantic paragraph unit.
+    Lines within a block are joined with conservative dehyphenation.
+
+    We also detect multi-line ALL-CAPS fragments that form section
+    headings (e.g. the block "THE END OF TIME\\nMANAGEMENT" should
+    become the heading "THE END OF TIME MANAGEMENT").
+    """
+
+    blocks = page.get("blocks", [])
+
+    def is_all_caps_heading_fragment(text: str) -> bool:
+        lines = [
+            clean_line(line)
+            for line in text.splitlines()
+            if clean_line(line)
+        ]
+
+        if lines and parse_bare_chapter_line(lines[0]) is not None:
+            lines = lines[1:]
+
+        if not lines or len(lines) > 5:
+            return False
+
+        if sum(len(line.split()) for line in lines) > 12:
+            return False
+
+        for line in lines:
+            if (
+                parse_chapter_line(line)
+                or parse_bare_chapter_line(line) is not None
+                or len(line.split()) > 8
+            ):
+                return False
+
+            letters = [char for char in line if char.isalpha()]
+
+            if (
+                not letters
+                or sum(char.isupper() for char in letters) / len(letters) < 0.90
+            ):
+                return False
+
+        return True
+
+    merged_blocks: list[dict[str, Any]] = []
+
+    for block in blocks:
+        current = dict(block)
+
+        if merged_blocks and is_all_caps_heading_fragment(
+            str(merged_blocks[-1].get("text", ""))
+        ) and is_all_caps_heading_fragment(
+            str(current.get("text", ""))
+        ):
+            previous = merged_blocks[-1]
+            close_blocks = True
+
+            if "y1" in previous and "y0" in current:
+                gap = float(current["y0"]) - float(previous["y1"])
+                close_blocks = -5 <= gap <= 18
+
+            if close_blocks:
+                previous["text"] = (
+                    f"{str(previous.get('text', '')).strip()} "
+                    f"{str(current.get('text', '')).strip()}"
+                )
+
+                if "y1" in current:
+                    previous["y1"] = current["y1"]
+
+                continue
+
+        merged_blocks.append(current)
+
+    blocks = merged_blocks
+    page_number = page["page"]
+    has_images = page.get("has_images", False)
+    paragraphs: list[dict[str, Any]] = []
+
+    # ----------------------------------------------------------------
+    # If no block list is available, fall back to the text string.
+    # ----------------------------------------------------------------
+    if not blocks:
+        text = page.get("text", "")
+        raw_lines = [
+            clean_line(line)
+            for line in text.splitlines()
+            if clean_line(line)
+        ]
+        if not raw_lines:
             return []
+        # Treat the whole page as one paragraph.
+        para_text = clean_text(" ".join(raw_lines))
+        if para_text:
+            paragraphs.append({
+                "text": para_text,
+                "page_start": page_number,
+                "page_end": page_number,
+                "has_images": has_images,
+            })
+        return paragraphs
 
-    file_type = detect_file_type(path_or_name, raw_bytes)
-    documents: list[dict[str, Any]] = []
+    for block in blocks:
+        raw_block_text = block.get("text", "").strip()
+        if not raw_block_text:
+            continue
 
-    if file_type == "pdf":
-        source_input = raw_bytes if raw_bytes is not None else path
-        pages = extract_text_from_pdf(source_input)
-        for page_num, page_text in pages:
-            documents.append(
-                {
-                    "filename": filename,
-                    "source_path": source_path,
-                    "content": page_text,
-                    "file_type": "pdf",
-                    "page_number": page_num,
-                }
-            )
-    elif file_type == "docx":
-        source_input = raw_bytes if raw_bytes is not None else path
-        text = extract_text_from_docx(source_input)
-        cleaned = clean_text(text)
-        if cleaned:
-            documents.append(
-                {
-                    "filename": filename,
-                    "source_path": source_path,
-                    "content": cleaned,
-                    "file_type": "docx",
-                    "page_number": None,
-                }
-            )
-    elif file_type == "md":
-        text = raw_bytes.decode("utf-8", errors="ignore") if raw_bytes else ""
-        cleaned = clean_text(text)
-        if cleaned:
-            documents.append(
-                {
-                    "filename": filename,
-                    "source_path": source_path,
-                    "content": cleaned,
-                    "file_type": "md",
-                    "page_number": None,
-                }
-            )
-    else:  # txt
-        text = raw_bytes.decode("utf-8", errors="ignore") if raw_bytes else ""
-        cleaned = clean_text(text)
-        if cleaned:
-            documents.append(
-                {
-                    "filename": filename,
-                    "source_path": source_path,
-                    "content": cleaned,
-                    "file_type": "txt",
-                    "page_number": None,
-                }
+        # Split the block into its constituent lines and clean them.
+        block_lines = [
+            clean_line(ln)
+            for ln in raw_block_text.splitlines()
+            if clean_line(ln)
+        ]
+
+        if not block_lines:
+            continue
+
+        # ----------------------------------------------------------------
+        # Detect multi-line ALL-CAPS section headings within a block.
+        # Example: "THE END OF TIME\nMANAGEMENT" â†’ one heading.
+        # We recognise this pattern when:
+        #   â€¢ The block has â‰¤ 5 lines
+        #   â€¢ Every line is short (â‰¤ 6 words each)
+        #   â€¢ Every line is predominantly ALL CAPS
+        # ----------------------------------------------------------------
+        def _line_is_all_caps(ln: str) -> bool:
+            letters = [c for c in ln if c.isalpha()]
+            if not letters:
+                return False
+            return (
+                sum(c.isupper() for c in letters) / len(letters) >= 0.90
+                and len(ln.split()) <= 8
             )
 
-    return documents
+        norm_first = _normalize_chapter_line(block_lines[0])
+        is_chapter_block = (
+            _CHAPTER_RE.match(norm_first)
+            or _BARE_CHAPTER_RE.match(norm_first)
+        )
+
+        if not is_chapter_block and len(block_lines) <= 5 and all(
+            _line_is_all_caps(ln) for ln in block_lines
+        ):
+            # Join ALL-CAPS lines into a single heading phrase.
+            joined = " ".join(block_lines)
+            # Verify the whole joined text qualifies as a heading.
+            if _is_probable_section_heading(joined):
+                paragraphs.append({
+                    "text": joined,
+                    "page_start": page_number,
+                    "page_end": page_number,
+                    "is_heading_candidate": True,
+                    "has_images": has_images,
+                })
+                continue
+
+        # ----------------------------------------------------------------
+        # Standard block processing.
+        # Join lines within the block using dehyphenation.
+        # ----------------------------------------------------------------
+        if len(block_lines) == 1:
+            line = block_lines[0]
+            norm = _normalize_chapter_line(line)
+
+            if (
+                _CHAPTER_RE.match(norm)
+                or _BARE_CHAPTER_RE.match(norm)
+                or _is_probable_section_heading(line)
+            ):
+                paragraphs.append({
+                    "text": norm if norm != line else line,
+                    "page_start": page_number,
+                    "page_end": page_number,
+                    "is_heading_candidate": True,
+                    "has_images": has_images,
+                })
+            else:
+                cleaned = clean_text(line)
+                if cleaned:
+                    paragraphs.append({
+                        "text": cleaned,
+                        "page_start": page_number,
+                        "page_end": page_number,
+                        "has_images": has_images,
+                    })
+            continue
+
+        # Multi-line block â€” check if it's a chapter heading block
+        # (e.g. "C H A P T E R 2\nCREATIVE SWEET SPOT").
+        norm_first = _normalize_chapter_line(block_lines[0])
+        if _BARE_CHAPTER_RE.match(norm_first):
+            # The next line may be the chapter title.
+            chapter_title_line = (
+                block_lines[1]
+                if len(block_lines) > 1
+                else None
+            )
+            # Emit chapter line; remaining lines are prose.
+            paragraphs.append({
+                "text": norm_first,
+                "page_start": page_number,
+                "page_end": page_number,
+                "is_heading_candidate": True,
+                "has_images": has_images,
+            })
+            remaining = block_lines[1:]
+        else:
+            remaining = block_lines
+
+        if not remaining:
+            continue
+
+        # Join remaining lines with dehyphenation.
+        para_text = remaining[0]
+        for ln in remaining[1:]:
+            para_text = normalize_hyphenation(
+                para_text, ln, vocabulary
+            )
+
+        para_text = clean_text(para_text)
+        if not para_text:
+            continue
+
+        # Check if the joined text is a section heading.
+        norm_para = _normalize_chapter_line(para_text)
+        if (
+            _CHAPTER_RE.match(norm_para)
+            or _BARE_CHAPTER_RE.match(norm_para)
+            or _is_probable_section_heading(para_text)
+        ):
+            paragraphs.append({
+                "text": norm_para if norm_para != para_text else para_text,
+                "page_start": page_number,
+                "page_end": page_number,
+                "is_heading_candidate": True,
+                "has_images": has_images,
+            })
+        else:
+            paragraphs.append({
+                "text": para_text,
+                "page_start": page_number,
+                "page_end": page_number,
+                "has_images": has_images,
+            })
+
+    return paragraphs
 
 
-def load_documents(base_dir: str | Path = KNOWLEDGE_BASE_DIR) -> list[dict[str, Any]]:
-    """Load every knowledge file (.txt, .md, .docx, .pdf) and preserve source metadata."""
-    documents: list[dict[str, Any]] = []
-    for path in list_knowledge_files(base_dir):
-        docs = load_document(path)
-        documents.extend(docs)
-    return documents
 
+def merge_cross_page_paragraphs(
+    paragraphs: list[dict[str, Any]],
+    vocabulary: set[str] | None = None,
+) -> list[dict[str, Any]]:
+
+    if not paragraphs:
+        return []
+
+    merged: list[dict[str, Any]] = []
+
+    for paragraph in paragraphs:
+
+        if not merged:
+            merged.append(dict(paragraph))
+            continue
+
+        previous = merged[-1]
+
+        # Headings must remain separate.
+        if paragraph.get("is_heading_candidate"):
+            merged.append(dict(paragraph))
+            continue
+
+        if previous.get("is_heading_candidate"):
+            merged.append(dict(paragraph))
+            continue
+
+        # Merge only when the previous paragraph appears to be
+        # an unfinished paragraph.
+        previous_text = previous.get(
+            "text",
+            "",
+        ).strip()
+
+        if (
+            previous["page_end"] < paragraph["page_start"]
+            and previous_text
+            and not previous_text.endswith(
+                (".", "!", "?", '"', "'", "â€", "â€™", ")")
+            )
+        ):
+            previous["text"] = normalize_hyphenation(
+                previous_text,
+                paragraph["text"],
+                vocabulary,
+            )
+
+            previous["page_end"] = paragraph[
+                "page_end"
+            ]
+
+            previous["has_images"] = bool(
+                previous.get("has_images")
+                or paragraph.get("has_images")
+            )
+
+        else:
+            merged.append(dict(paragraph))
+
+    return merged
+
+
+# ============================================================
+# OVERSIZED PARAGRAPH SPLITTING
+# ============================================================
+
+def _split_by_words(
+    text: str,
+    max_tokens: int,
+) -> list[str]:
+
+    words = text.split()
+
+    if not words:
+        return []
+
+    pieces: list[str] = []
+    current: list[str] = []
+
+    for word in words:
+
+        candidate = (
+            " ".join(current + [word])
+        )
+
+        if (
+            current
+            and count_tokens(candidate) > max_tokens
+        ):
+            pieces.append(
+                " ".join(current)
+            )
+
+            current = [word]
+
+        else:
+            current.append(word)
+
+    if current:
+        pieces.append(
+            " ".join(current)
+        )
+
+    return pieces
+
+
+def split_oversized_paragraph(
+    paragraph: dict[str, Any],
+) -> list[dict[str, Any]]:
+
+    text = paragraph.get(
+        "text",
+        "",
+    ).strip()
+
+    if not text:
+        return []
+
+    if count_tokens(text) <= MAX_TOKENS:
+        return [paragraph]
+
+    sentences = split_sentences(text)
+
+    if not sentences:
+        sentences = [text]
+
+    pieces: list[str] = []
+    current: list[str] = []
+
+    for sentence in sentences:
+
+        candidate = " ".join(
+            current + [sentence]
+        )
+
+        if (
+            current
+            and count_tokens(candidate) > MAX_TOKENS
+        ):
+            pieces.append(
+                " ".join(current)
+            )
+
+            current = [sentence]
+
+        else:
+            current.append(sentence)
+
+    if current:
+        pieces.append(
+            " ".join(current)
+        )
+
+    # A single sentence may itself exceed MAX_TOKENS.
+    final_pieces: list[str] = []
+
+    for piece in pieces:
+
+        if count_tokens(piece) <= MAX_TOKENS:
+            final_pieces.append(piece)
+        else:
+            final_pieces.extend(
+                _split_by_words(
+                    piece,
+                    MAX_TOKENS,
+                )
+            )
+
+    result: list[dict[str, Any]] = []
+
+    for index, piece in enumerate(final_pieces):
+
+        piece = clean_text(piece)
+
+        if not piece:
+            continue
+
+        if (
+            index > 0
+            and OVERSIZED_PARAGRAPH_OVERLAP > 0
+        ):
+            previous_words = final_pieces[
+                index - 1
+            ].split()
+
+            overlap_words: list[str] = []
+
+            for word in reversed(
+                previous_words
+            ):
+                candidate_overlap = " ".join(
+                    [word] + overlap_words
+                )
+
+                if count_tokens(candidate_overlap) > OVERSIZED_PARAGRAPH_OVERLAP:
+                    break
+
+                overlap_words.insert(
+                    0,
+                    word,
+                )
+
+            if overlap_words:
+                overlapped_piece = (
+                    " ".join(overlap_words)
+                    + " "
+                    + piece
+                )
+
+                while (
+                    overlap_words
+                    and count_tokens(overlapped_piece) > MAX_TOKENS
+                ):
+                    overlap_words.pop(0)
+                    overlapped_piece = (
+                        " ".join(overlap_words)
+                        + " "
+                        + piece
+                    )
+
+                if count_tokens(overlapped_piece) <= MAX_TOKENS:
+                    piece = overlapped_piece
+
+        item = dict(paragraph)
+
+        item["text"] = piece
+
+        result.append(item)
+
+    return result
+
+
+# ============================================================
+# CHUNK CREATION
+# ============================================================
+
+def _flush_chunk(
+    chunks: list[dict[str, Any]],
+    paragraphs: list[dict[str, Any]],
+    book_id: str,
+    chapter_num: int | None,
+    chapter_title: str | None,
+    section_title: str | None,
+    book_name: str = "",
+) -> None:
+
+    if not paragraphs:
+        return
+
+    text = clean_text(
+        "\n\n".join(
+            paragraph["text"]
+            for paragraph in paragraphs
+            if paragraph.get("text")
+        )
+    )
+
+    if not text:
+        return
+
+    chunk_section_title = next(
+        (
+            paragraph.get("section_title")
+            for paragraph in paragraphs
+            if paragraph.get("section_title")
+        ),
+        section_title,
+    )
+
+    page_start = min(
+        paragraph["page_start"]
+        for paragraph in paragraphs
+    )
+
+    page_end = max(
+        paragraph["page_end"]
+        for paragraph in paragraphs
+    )
+
+    has_images = any(
+        paragraph.get(
+            "has_images",
+            False,
+        )
+        for paragraph in paragraphs
+    )
+
+    chunks.append(
+        {
+            "text": text,
+            "book_id": book_id,
+            "book_name": book_name,
+            "chapter_num": chapter_num,
+            "chapter_title": chapter_title,
+            "section_title": chunk_section_title,
+            "page_start": page_start,
+            "page_end": page_end,
+            "token_count": count_tokens(text),
+            "has_images": has_images,
+        }
+    )
+
+
+def _make_chunk_id(
+    chunk: dict[str, Any],
+) -> str:
+
+    raw = "|".join(
+        [
+            str(chunk.get("book_id", "")),
+            str(chunk.get("chapter_num", "")),
+            str(chunk.get("page_start", "")),
+            str(chunk.get("page_end", "")),
+            chunk.get("text", ""),
+        ]
+    )
+
+    digest = hashlib.sha1(
+        raw.encode(
+            "utf-8",
+            errors="ignore",
+        )
+    ).hexdigest()[:16]
+
+    return (
+        f"{chunk.get('book_id', 'book')}:"
+        f"{digest}"
+    )
+
+
+def _merge_small_chunks(
+    chunks: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+
+    if not chunks:
+        return []
+
+    result: list[dict[str, Any]] = []
+
+    for chunk in chunks:
+
+        if not result:
+            result.append(chunk)
+            continue
+
+        previous = result[-1]
+
+        same_chapter = (
+            previous.get("chapter_num")
+            == chunk.get("chapter_num")
+        )
+
+        same_book = (
+            previous.get("book_id")
+            == chunk.get("book_id")
+        )
+
+        combined_text = (
+            previous.get("text", "")
+            + "\n\n"
+            + chunk.get("text", "")
+        )
+
+        combined_tokens = count_tokens(
+            combined_text
+        )
+
+        # Only merge small chunks.
+        if (
+            same_chapter
+            and same_book
+            and previous.get("token_count", 0)
+            < MIN_TOKENS
+            and combined_tokens <= MAX_TOKENS
+        ):
+            previous["text"] = clean_text(
+                combined_text
+            )
+
+            previous["page_end"] = max(
+                previous["page_end"],
+                chunk["page_end"],
+            )
+
+            previous["token_count"] = combined_tokens
+
+            previous["has_images"] = bool(
+                previous.get("has_images")
+                or chunk.get("has_images")
+            )
+
+        else:
+            result.append(chunk)
+
+    return result
+
+
+def _book_id_from_path(
+    path: Path,
+) -> str:
+
+    stem = path.stem.lower()
+
+    stem = re.sub(
+        r"[^a-z0-9]+",
+        "_",
+        stem,
+    )
+
+    stem = stem.strip("_")
+
+    return stem or "book"
+
+
+def _chunk_book(
+    pages: list[dict[str, Any]],
+    book_path: Path,
+) -> list[dict[str, Any]]:
+
+    if not pages:
+        return []
+
+    book_id = _book_id_from_path(
+        book_path
+    )
+
+    book_name = book_path.name
+
+    # --------------------------------------------------------
+    # Remove TOC/front matter until genuine Chapter 1.
+    # --------------------------------------------------------
+
+    start_index: int | None = None
+
+    expected_chapter = 1
+
+    for page_index, page in enumerate(pages):
+
+        if _looks_like_toc_page(page):
+            continue
+
+        lines = [
+            _normalize_chapter_line(clean_line(line))
+            for line in page.get(
+                "text",
+                "",
+            ).splitlines()
+            if clean_line(line)
+        ]
+
+        for line_index in range(len(lines)):
+
+            candidate = _looks_like_real_chapter_heading(
+                lines,
+                line_index,
+                expected_chapter,
+            )
+
+            if candidate is None:
+                continue
+
+            chapter_number, title = candidate
+
+            if chapter_number == 1:
+                start_index = page_index
+                break
+
+        if start_index is not None:
+            break
+
+    if start_index is None:
+        print(
+            f"[CHUNK] Warning: could not identify "
+            f"the start of Chapter 1 in {book_path.name}"
+        )
+
+        # Safer fallback: don't throw away the entire document.
+        # Start from the first page containing substantial text.
+        for index, page in enumerate(pages):
+            if len(page.get("text", "").strip()) >= 300:
+                start_index = index
+                break
+
+    if start_index is None:
+        return []
+
+    pages = pages[start_index:]
+
+    # --------------------------------------------------------
+    # Build vocabulary for conservative dehyphenation.
+    # --------------------------------------------------------
+
+    vocabulary = build_vocabulary(
+        pages
+    )
+
+    # --------------------------------------------------------
+    # Convert pages to paragraphs.
+    # --------------------------------------------------------
+
+    paragraphs: list[dict[str, Any]] = []
+
+    for page in pages:
+        page_paragraphs = reconstruct_paragraphs(
+            page,
+            vocabulary,
+        )
+
+        paragraphs.extend(
+            page_paragraphs
+        )
+
+    paragraphs = merge_cross_page_paragraphs(
+        paragraphs,
+        vocabulary,
+    )
+
+    # --------------------------------------------------------
+    # Chapter/section state.
+    # --------------------------------------------------------
+
+    chunks: list[dict[str, Any]] = []
+
+    current_chunk_paragraphs: list[
+        dict[str, Any]
+    ] = []
+
+    current_chapter: int | None = None
+    current_chapter_title: str | None = None
+    current_section: str | None = None
+
+    # --------------------------------------------------------
+    # Iterate paragraphs.
+    # --------------------------------------------------------
+
+    for paragraph in paragraphs:
+
+        text = clean_text(
+            paragraph.get(
+                "text",
+                "",
+            )
+        )
+
+        if not text:
+            continue
+
+        if _BACK_MATTER_RE.fullmatch(text):
+            _flush_chunk(
+                chunks,
+                current_chunk_paragraphs,
+                book_id,
+                current_chapter,
+                current_chapter_title,
+                current_section,
+                book_name,
+            )
+            current_chunk_paragraphs = []
+            break
+
+        # ----------------------------------------------------
+        # Chapter heading.
+        # ----------------------------------------------------
+
+        chapter_parsed = parse_chapter_line(
+            text
+        )
+
+        if chapter_parsed:
+
+            chapter_number, chapter_title = (
+                chapter_parsed
+            )
+
+            if current_chapter == 7:
+                continue
+
+            expected_chapter = (
+                1
+                if current_chapter is None
+                else current_chapter + 1
+            )
+
+            if chapter_number != expected_chapter or chapter_number > 7:
+                continue
+
+            _flush_chunk(
+                chunks,
+                current_chunk_paragraphs,
+                book_id,
+                current_chapter,
+                current_chapter_title,
+                current_section,
+                book_name,
+            )
+
+            current_chunk_paragraphs = []
+
+            current_chapter = chapter_number
+            current_chapter_title = chapter_title
+            current_section = None
+
+            continue
+
+        # ----------------------------------------------------
+        # Bare chapter heading.
+        # ----------------------------------------------------
+
+        bare_chapter = parse_bare_chapter_line(
+            text
+        )
+
+        if bare_chapter is not None:
+
+            if current_chapter == 7:
+                continue
+
+            expected_chapter = (
+                1
+                if current_chapter is None
+                else current_chapter + 1
+            )
+
+            if bare_chapter != expected_chapter or bare_chapter > 7:
+                continue
+
+            _flush_chunk(
+                chunks,
+                current_chunk_paragraphs,
+                book_id,
+                current_chapter,
+                current_chapter_title,
+                current_section,
+                book_name,
+            )
+
+            current_chunk_paragraphs = []
+
+            current_chapter = bare_chapter
+            current_chapter_title = None
+            current_section = None
+
+            continue
+
+        # ----------------------------------------------------
+        # Ignore anything before Chapter 1.
+        # ----------------------------------------------------
+
+        if current_chapter is None:
+            continue
+
+        # ----------------------------------------------------
+        # Section heading.
+        # ----------------------------------------------------
+
+        if paragraph.get(
+            "is_heading_candidate",
+            False,
+        ) and _is_probable_section_heading(text):
+            current_section = text
+
+            continue
+
+        # ----------------------------------------------------
+        # Normal paragraph.
+        # ----------------------------------------------------
+
+        normal_paragraph = dict(
+            paragraph
+        )
+
+        normal_paragraph[
+            "text"
+        ] = text
+        normal_paragraph["section_title"] = current_section
+
+        # If paragraph is oversized, split it before packing.
+        split_parts = (
+            split_oversized_paragraph(
+                normal_paragraph
+            )
+        )
+
+        for part in split_parts:
+
+            part_tokens = count_tokens(
+                part["text"]
+            )
+
+            candidate_text = clean_text(
+                "\n\n".join(
+                    [p["text"] for p in current_chunk_paragraphs]
+                    + [part["text"]]
+                )
+            )
+            candidate_tokens = count_tokens(candidate_text)
+
+            if (
+                current_chunk_paragraphs
+                and candidate_tokens > MAX_TOKENS
+            ):
+                _flush_chunk(
+                    chunks,
+                    current_chunk_paragraphs,
+                    book_id,
+                    current_chapter,
+                    current_chapter_title,
+                    current_section,
+                    book_name,
+                )
+
+                current_chunk_paragraphs = []
+                candidate_tokens = part_tokens
+
+            current_chunk_paragraphs.append(
+                part
+            )
+
+            # Stop close to target size.
+            if candidate_tokens >= TARGET_TOKENS:
+                _flush_chunk(
+                    chunks,
+                    current_chunk_paragraphs,
+                    book_id,
+                    current_chapter,
+                    current_chapter_title,
+                    current_section,
+                    book_name,
+                )
+
+                current_chunk_paragraphs = []
+
+    # Final chunk.
+    _flush_chunk(
+        chunks,
+        current_chunk_paragraphs,
+        book_id,
+        current_chapter,
+        current_chapter_title,
+        current_section,
+        book_name,
+    )
+
+    # Merge accidental tiny chunks.
+    chunks = _merge_small_chunks(
+        chunks
+    )
+
+    # --------------------------------------------------------
+    # Add stable IDs and neighbor links.
+    # --------------------------------------------------------
+
+    for index, chunk in enumerate(chunks):
+
+        chunk["chunk_index"] = index
+
+        chunk["chunk_id"] = _make_chunk_id(
+            chunk
+        )
+
+        chunk["token_count"] = count_tokens(
+            chunk["text"]
+        )
+
+    for index, chunk in enumerate(chunks):
+        chunk["prev_chunk_id"] = (
+            chunks[index - 1]["chunk_id"]
+            if index > 0
+            else None
+        )
+
+        chunk["next_chunk_id"] = (
+            chunks[index + 1]["chunk_id"]
+            if index + 1 < len(chunks)
+            else None
+        )
+
+    return chunks
+
+
+# ============================================================
+# PUBLIC DOCUMENT LOADER
+# ============================================================
+
+def load_documents(
+    knowledge_base_dir: Path | None = None,
+) -> list[dict[str, Any]]:
+
+    kb_dir = (
+        Path(knowledge_base_dir)
+        if knowledge_base_dir is not None
+        else KNOWLEDGE_BASE_DIR
+    )
+
+    active_files = get_active_files(
+        kb_dir
+    )
+
+    print(
+        f"[KB] Found {len(active_files)} active knowledge file(s)"
+    )
+
+    if not active_files:
+        active_raw = _get_active_kb_files_raw()
+
+        if active_raw:
+            print(
+                f"[KB] ACTIVE_KB_FILES requested: {active_raw}"
+            )
+
+        return []
+
+    all_documents: list[dict[str, Any]] = []
+
+    for file_path in active_files:
+
+        print(
+            f"[KB] Loading: {file_path.name}"
+        )
+
+        suffix = file_path.suffix.lower()
+
+        if suffix == ".pdf":
+
+            try:
+                document = fitz.open(
+                    str(file_path)
+                )
+
+            except Exception as exc:
+                print(
+                    f"[KB] Failed to open "
+                    f"{file_path.name}: {exc}"
+                )
+                continue
+
+            try:
+                page_count = len(document)
+
+            finally:
+                document.close()
+
+            native_pages: list[
+                dict[str, Any]
+            ] = []
+
+            for page_index in range(
+                page_count
+            ):
+                try:
+                    page_data = _extract_page_native(
+                        str(file_path),
+                        page_index,
+                    )
+
+                    native_pages.append(
+                        page_data
+                    )
+
+                except Exception as exc:
+                    print(
+                        f"[PDF] Page {page_index + 1} "
+                        f"failed: {exc}"
+                    )
+
+                    native_pages.append(
+                        {
+                            "page": page_index + 1,
+                            "text": "",
+                            "blocks": [],
+                            "has_images": False,
+                            "native_text_chars": 0,
+                        }
+                    )
+
+            empty_pages = [
+                index
+                for index, page in enumerate(
+                    native_pages
+                )
+                if len(
+                    page.get(
+                        "text",
+                        "",
+                    ).strip()
+                ) < OCR_MIN_TEXT_CHARS
+            ]
+
+            if empty_pages:
+
+                if OCR_MODE in {
+                    "auto",
+                    "on",
+                }:
+                    ocr_results = _ocr_pages(
+                        str(file_path),
+                        empty_pages,
+                    )
+
+                    for page_number, ocr_text in (
+                        ocr_results.items()
+                    ):
+                        if not ocr_text:
+                            continue
+
+                        page = native_pages[
+                            page_number - 1
+                        ]
+
+                        # Only replace native extraction if OCR
+                        # produced meaningful text.
+                        if len(
+                            ocr_text.strip()
+                        ) > len(
+                            page.get(
+                                "text",
+                                "",
+                            ).strip()
+                        ):
+                            page["text"] = ocr_text
+                            page["ocr_used"] = True
+
+                else:
+                    print(
+                        f"[KB] WARNING: "
+                        f"{len(empty_pages)}/{page_count} "
+                        f"pages have no text "
+                        f"(OCR_MODE={OCR_MODE})"
+                    )
+
+            remaining_empty = sum(
+                1
+                for page in native_pages
+                if len(
+                    page.get(
+                        "text",
+                        "",
+                    ).strip()
+                ) < OCR_MIN_TEXT_CHARS
+            )
+
+            if remaining_empty:
+                print(
+                    f"[KB] WARNING: "
+                    f"{remaining_empty}/{page_count} "
+                    f"pages still have little/no text"
+                )
+
+            # Remove repeated headers/footers.
+            native_pages = remove_running_headers_footers(
+                native_pages
+            )
+
+            for page in native_pages:
+                page["source"] = file_path.name
+                page["path"] = str(file_path)
+
+            all_documents.extend(
+                native_pages
+            )
+
+            print(
+                f"[KB] Loaded {page_count} page/document units "
+                f"from {file_path.name}"
+            )
+
+        elif suffix in {
+            ".txt",
+            ".md",
+        }:
+
+            try:
+                text = file_path.read_text(
+                    encoding="utf-8",
+                    errors="ignore",
+                )
+
+            except Exception as exc:
+                print(
+                    f"[KB] Failed to read "
+                    f"{file_path.name}: {exc}"
+                )
+                continue
+
+            all_documents.append(
+                {
+                    "page": 1,
+                    "text": clean_text(text),
+                    "source": file_path.name,
+                    "path": str(file_path),
+                    "has_images": False,
+                }
+            )
+
+            print(
+                f"[KB] Loaded text file: "
+                f"{file_path.name}"
+            )
+
+    return all_documents
+
+
+# ============================================================
+# INTERNAL BOOK GROUPING
+# ============================================================
+
+def _documents_by_source(
+    documents: list[dict[str, Any]],
+) -> dict[str, list[dict[str, Any]]]:
+
+    grouped: dict[
+        str,
+        list[dict[str, Any]]
+    ] = {}
+
+    for document in documents:
+
+        source = document.get(
+            "source",
+            "unknown",
+        )
+
+        grouped.setdefault(
+            source,
+            [],
+        ).append(document)
+
+    for source in grouped:
+        grouped[source].sort(
+            key=lambda item: item.get(
+                "page",
+                0,
+            )
+        )
+
+    return grouped
+
+
+# ============================================================
+# PUBLIC CHUNKING API
+# ============================================================
 
 def chunk_documents(
     documents: list[dict[str, Any]],
-    chunk_size: int = CHUNK_SIZE,
-    chunk_overlap: int = CHUNK_OVERLAP,
+    **kwargs: Any,
 ) -> list[dict[str, Any]]:
-    """Split documents into overlapping chunks with section headings prepended.
 
-    Heading detection supports:
-    - Numbered section patterns:  "1. OVERVIEW", "2.3. MOONS"
-    - Markdown-style headings:    "# Title", "## Subsection"
-    - ALL-CAPS lines ≥ 2 words, ≤ 120 chars
-    - Lines ending with ':' followed by a blank line
-    """
-    chunks: list[dict[str, Any]] = []
+    if not documents:
+        print(
+            "[CHUNKING] No documents supplied"
+        )
+        return []
 
-    def _is_heading(
-        line: str,
-        next_line: str | None = None,
-        prev_line: str | None = None,
-    ) -> bool:
-        ln = line.strip()
-        if not ln or len(ln) < 3:
-            return False
+    grouped = _documents_by_source(
+        documents
+    )
 
-        # Markdown headings (#, ##, ###)
-        if re.match(r"^#{1,4}\s+\S", ln):
-            return True
+    all_chunks: list[
+        dict[str, Any]
+    ] = []
 
-        # Numbered section headings: "1.", "2.3.", "10."
-        if re.match(r"^\d+(\.\d+)*\.\s+\S", ln) and not re.search(r"[.!?]\s*$", ln):
-            return True
+    for source, pages in grouped.items():
 
-        # ALL CAPS substantial headings (≥ 2 words, ≤ 120 chars)
-        if ln.isupper() and 8 < len(ln) <= 120 and len(ln.split()) >= 2:
-            return True
-
-        # Colon-ended lines followed by a blank line
-        if ln.endswith(":") and next_line is not None and not next_line.strip():
-            return True
-
-        # Common section markers in astronomy / science text files
-        markers = [
-            "OVERVIEW", "INTRODUCTION", "HISTORY", "DISCOVERY",
-            "EXPLORATION", "PHYSICAL PROPERTIES", "COMPOSITION",
-            "ATMOSPHERE", "SURFACE", "STRUCTURE", "FORMATION",
-            "CHARACTERISTICS", "MISSIONS", "OBSERVATIONS",
-            "CLASSIFICATION", "TYPES", "REFERENCES", "SUMMARY",
-            "SECTION", "CHAPTER", "APPENDIX",
-        ]
-        if any(m in ln.upper() for m in markers) and len(ln.split()) <= 8:
-            return True
-
-        return False
-
-    def _strip_heading_marker(line: str) -> str:
-        ln = line.strip()
-        # Remove markdown #
-        ln = re.sub(r"^#{1,4}\s+", "", ln)
-        # Remove trailing colon
-        ln = ln.rstrip(":")
-        return ln.strip()
-
-    def _split_section(
-        text: str,
-        heading: str,
-        filename: str,
-        source_path: str,
-        section_index: int,
-        section_path: list[str],
-        file_type: str = "txt",
-        page_number: int | None = None,
-    ) -> list[dict[str, Any]]:
-        heading_prefix = f"## {heading}\n\n" if heading else ""
-        text_with_heading = heading_prefix + text
-
-        if _HAS_LANGCHAIN and RecursiveCharacterTextSplitter is not None:
-            splitter = RecursiveCharacterTextSplitter(
-                chunk_size=chunk_size,
-                chunk_overlap=chunk_overlap,
-                length_function=len,
-                separators=["\n\n", "\n", ". ", " ", ""],
+        book_path = Path(
+            pages[0].get(
+                "path",
+                source,
             )
-            segments = splitter.split_text(text_with_heading)
-        else:
-            def _simple_split(t: str, size: int, overlap: int) -> list[str]:
-                if len(t) <= size:
-                    return [t]
-                parts: list[str] = []
-                start = 0
-                step = max(1, size - overlap)
-                while start < len(t):
-                    end = start + size
-                    parts.append(t[start:end])
-                    if end >= len(t):
-                        break
-                    start += step
-                return parts
+        )
 
-            segments = _simple_split(text_with_heading, chunk_size, chunk_overlap)
+        book_chunks = _chunk_book(
+            pages,
+            book_path,
+        )
 
-        out: list[dict[str, Any]] = []
-        for idx, seg in enumerate(segments):
-            cleaned = clean_text(seg)
-            if not cleaned or len(cleaned) < 10:
-                continue
-            category = classify_document_by_filename(filename, cleaned)
-            if page_number is not None and page_number > 0:
-                chunk_id = f"{filename}_p{page_number}_{section_index}_{idx}"
-            else:
-                chunk_id = f"{filename}_{section_index}_{idx}"
+        all_chunks.extend(
+            book_chunks
+        )
 
-            out.append(
-                {
-                    "filename": filename,
-                    "source_path": source_path,
-                    "chunk_id": chunk_id,
-                    "text": cleaned,
-                    "section_heading": heading,
-                    "section_path": section_path,
-                    "section_level": len(section_path),
-                    "category": category,
-                    "has_heading": bool(heading),
-                    "chunk_index": idx,
-                    "total_section_chunks": 0,  # Filled below
-                    "file_type": file_type,
-                    "page_number": page_number if page_number is not None else 0,
-                }
-            )
-        for chunk in out:
-            chunk["total_section_chunks"] = len(out)
-        return out
+    # Re-number globally.
+    for index, chunk in enumerate(
+        all_chunks
+    ):
 
-    for document in documents:
-        text = document.get("content", "")
-        filename = document["filename"]
-        source_path = document.get("source_path", str(filename))
-        file_type = document.get("file_type") or Path(filename).suffix.lstrip(".").lower() or "txt"
-        page_number = document.get("page_number")
-        if page_number is not None:
-            try:
-                page_number = int(page_number)
-            except (ValueError, TypeError):
-                page_number = None
+        chunk["chunk_index"] = index
 
-        lines = text.splitlines()
+        chunk["chunk_id"] = _make_chunk_id(
+            chunk
+        )
 
-        sections: list[dict[str, Any]] = []
-        current_heading = ""
-        current_buf: list[str] = []
-        section_path: list[str] = []
+    # Rebuild neighbor links after global numbering.
+    for index, chunk in enumerate(
+        all_chunks
+    ):
 
-        for i, line in enumerate(lines):
-            next_line = lines[i + 1] if i + 1 < len(lines) else None
-            prev_line = lines[i - 1] if i > 0 else None
+        chunk["prev_chunk_id"] = (
+            all_chunks[index - 1]["chunk_id"]
+            if index > 0
+            else None
+        )
 
-            if _is_heading(line, next_line, prev_line):
-                if current_buf:
-                    sections.append(
-                        {
-                            "heading": current_heading,
-                            "text": "\n".join(current_buf),
-                            "path": section_path.copy(),
-                        }
+        chunk["next_chunk_id"] = (
+            all_chunks[index + 1]["chunk_id"]
+            if index + 1 < len(all_chunks)
+            else None
+        )
+
+    print(
+        f"[CHUNKING] Created "
+        f"{len(all_chunks)} canonical chunks"
+    )
+
+    return all_chunks
+
+
+# ============================================================
+# CHUNK STATISTICS
+# ============================================================
+
+def get_chunk_statistics(
+    chunks: list[dict[str, Any]],
+) -> dict[str, Any]:
+
+    if not chunks:
+        return {
+            "chunks": 0,
+            "min_tokens": 0,
+            "max_tokens": 0,
+            "avg_tokens": 0.0,
+            "chapters": [],
+            "sections": [],
+            "books": [],
+            "over_max": 0,
+            "under_min": 0,
+            "no_chapter": 0,
+            "no_section": 0,
+        }
+
+    token_counts = [
+        int(
+            chunk.get(
+                "token_count",
+                count_tokens(
+                    chunk.get(
+                        "text",
+                        "",
                     )
-                    current_buf = []
-                current_heading = _strip_heading_marker(line)
-                section_path = [current_heading]
-            else:
-                current_buf.append(line)
-
-        if current_buf:
-            sections.append(
-                {
-                    "heading": current_heading,
-                    "text": "\n".join(current_buf),
-                    "path": section_path.copy(),
-                }
+                ),
             )
+        )
+        for chunk in chunks
+    ]
 
-        if not sections:
-            base_heading = re.sub(r"\.(txt|md|docx|pdf)$", "", filename, flags=re.I).replace("_", " ").title()
-            if page_number is not None and page_number > 0:
-                default_heading = f"{base_heading} Page {page_number}"
-            else:
-                default_heading = base_heading
-            sections = [
-                {
-                    "heading": default_heading,
-                    "text": text,
-                    "path": [default_heading],
-                }
-            ]
+    chapters = sorted(
+        {
+            chunk.get("chapter_num")
+            for chunk in chunks
+            if chunk.get("chapter_num")
+            is not None
+        }
+    )
 
-        for sidx, sec in enumerate(sections):
-            sec_chunks = _split_section(
-                sec.get("text", ""),
-                sec.get("heading", ""),
-                filename,
-                source_path,
-                sidx,
-                sec.get("path", []),
-                file_type=file_type,
-                page_number=page_number,
+    sections = sorted(
+        {
+            chunk.get("section_title")
+            for chunk in chunks
+            if chunk.get("section_title")
+        }
+    )
+
+    books = sorted(
+        {
+            chunk.get("book_id")
+            for chunk in chunks
+            if chunk.get("book_id")
+        }
+    )
+
+    over_max = sum(
+        1
+        for count in token_counts
+        if count > MAX_TOKENS
+    )
+
+    under_min = sum(
+        1
+        for count in token_counts
+        if count < MIN_TOKENS
+    )
+
+    no_chapter = sum(
+        1
+        for chunk in chunks
+        if chunk.get("chapter_num") is None
+    )
+
+    no_section = sum(
+        1
+        for chunk in chunks
+        if not chunk.get("section_title")
+    )
+
+    return {
+        "chunks": len(chunks),
+        "min_tokens": min(token_counts),
+        "max_tokens": max(token_counts),
+        "avg_tokens": round(
+            sum(token_counts)
+            / len(token_counts),
+            2,
+        ),
+        "chapters": chapters,
+        "sections": sections,
+        "books": books,
+        "over_max": over_max,
+        "under_min": under_min,
+        "no_chapter": no_chapter,
+        "no_section": no_section,
+    }
+
+
+def print_chunk_statistics(
+    chunks: list[dict[str, Any]],
+) -> dict[str, Any]:
+
+    stats = get_chunk_statistics(
+        chunks
+    )
+
+    print("\n=== CHUNK STATISTICS ===")
+
+    print(
+        f"Chunks: {stats['chunks']}"
+    )
+
+    print(
+        f"Token range: "
+        f"{stats['min_tokens']} - "
+        f"{stats['max_tokens']}"
+    )
+
+    print(
+        f"Average tokens: "
+        f"{stats['avg_tokens']}"
+    )
+
+    print(
+        f"Chapters: "
+        f"{stats['chapters']}"
+    )
+
+    print(
+        f"Sections detected: "
+        f"{len(stats['sections'])}"
+    )
+
+    print(
+        f"Books: "
+        f"{stats['books']}"
+    )
+
+    print(
+        f"Over MAX_TOKENS ({MAX_TOKENS}): "
+        f"{stats['over_max']}"
+    )
+
+    print(
+        f"Under MIN_TOKENS ({MIN_TOKENS}): "
+        f"{stats['under_min']}"
+    )
+
+    print(
+        f"Without chapter metadata: "
+        f"{stats['no_chapter']}"
+    )
+
+    print(
+        f"Without section metadata: "
+        f"{stats['no_section']}"
+    )
+
+    return stats
+
+
+# ============================================================
+# CHROMA RECORD CONVERSION
+# ============================================================
+
+def chunk_to_chroma_record(
+    chunk: dict[str, Any],
+) -> dict[str, Any]:
+
+    metadata: dict[str, Any] = {
+        "book_id": chunk.get(
+            "book_id",
+            "",
+        ),
+        "source": chunk.get(
+            "source",
+            chunk.get(
+                "book_id",
+                "",
+            ),
+        ),
+        "chunk_index": int(
+            chunk.get(
+                "chunk_index",
+                0,
             )
-            chunks.extend(sec_chunks)
+        ),
+        "page_start": int(
+            chunk.get(
+                "page_start",
+                0,
+            )
+        ),
+        "page_end": int(
+            chunk.get(
+                "page_end",
+                0,
+            )
+        ),
+        "token_count": int(
+            chunk.get(
+                "token_count",
+                0,
+            )
+        ),
+        "has_images": bool(
+            chunk.get(
+                "has_images",
+                False,
+            )
+        ),
+    }
 
-    return chunks
+    if chunk.get("image_description"):
+        metadata["image_description"] = str(chunk["image_description"])[:1000]
+
+    if chunk.get("chapter_num") is not None:
+        metadata["chapter_num"] = int(
+            chunk["chapter_num"]
+        )
+
+    if chunk.get("chapter_title"):
+        metadata[
+            "chapter_title"
+        ] = str(
+            chunk["chapter_title"]
+        )
+
+    if chunk.get("section_title"):
+        metadata[
+            "section_title"
+        ] = str(
+            chunk["section_title"]
+        )
+
+    if chunk.get("prev_chunk_id"):
+        metadata[
+            "prev_chunk_id"
+        ] = str(
+            chunk["prev_chunk_id"]
+        )
+
+    if chunk.get("next_chunk_id"):
+        metadata[
+            "next_chunk_id"
+        ] = str(
+            chunk["next_chunk_id"]
+        )
+
+    return {
+        "id": chunk.get(
+            "chunk_id"
+        ),
+        "document": chunk.get(
+            "text",
+            "",
+        ),
+        "metadata": metadata,
+    }
+
+
+# ============================================================
+# NEIGHBOR EXPANSION
+# ============================================================
+
+def expand_neighbor_chunks(
+    chunks: list[dict[str, Any]],
+    selected_indexes: Iterable[int],
+    radius: int = 1,
+) -> list[dict[str, Any]]:
+
+    if not chunks:
+        return []
+
+    indexes = set()
+
+    for index in selected_indexes:
+
+        if not isinstance(
+            index,
+            int,
+        ):
+            continue
+
+        start = max(
+            0,
+            index - radius,
+        )
+
+        end = min(
+            len(chunks),
+            index + radius + 1,
+        )
+
+        indexes.update(
+            range(
+                start,
+                end,
+            )
+        )
+
+    return [
+        chunks[index]
+        for index in sorted(indexes)
+    ]
+
+
+# ============================================================
+# DEBUG PREVIEW
+# ============================================================
+
+def preview_chunks(
+    chunks: list[dict[str, Any]],
+    limit: int = 10,
+) -> None:
+
+    print(
+        f"\n=== FIRST {min(limit, len(chunks))} CHUNKS ==="
+    )
+
+    for index, chunk in enumerate(
+        chunks[:limit]
+    ):
+
+        print(
+            "\n"
+            + "=" * 80
+        )
+
+        print(
+            f"Chunk: {index}"
+            f" | ID: {chunk.get('chunk_id')}"
+            f" | Pages: "
+            f"{chunk.get('page_start')}-"
+            f"{chunk.get('page_end')}"
+            f" | Tokens: "
+            f"{chunk.get('token_count')}"
+            f" | Chapter: "
+            f"{chunk.get('chapter_num')}"
+            f" | Section: "
+            f"{chunk.get('section_title')}"
+        )
+
+        print("-" * 80)
+
+        print(
+            chunk.get(
+                "text",
+                "",
+            )[:1000]
+        )
+
+
+# ============================================================
+# OPTIONAL COMPATIBILITY HELPERS
+# ============================================================
+
+def get_chunk_text(
+    chunk: dict[str, Any],
+) -> str:
+
+    return str(
+        chunk.get(
+            "text",
+            "",
+        )
+    )
+
+
+def get_chunk_metadata(
+    chunk: dict[str, Any],
+) -> dict[str, Any]:
+
+    return chunk_to_chroma_record(
+        chunk
+    )["metadata"]
+
+
+
+# ============================================================
+# PIPELINE COMPATIBILITY SHIMS
+# These expose the names the RAG pipeline imports.
+# Do NOT remove.  Do NOT modify chunking logic above.
+# ============================================================
+
+def list_knowledge_files(
+    knowledge_base_dir: Path | None = None,
+) -> list[Path]:
+    """Return all active KB files; respects ACTIVE_KB_FILES."""
+    return get_active_files(knowledge_base_dir)
+
+
+def list_txt_files(
+    knowledge_base_dir: Path | None = None,
+) -> list[Path]:
+    """Return active .txt files only (used by pipeline status())."""
+    return [
+        p for p in get_active_files(knowledge_base_dir)
+        if p.suffix.lower() == ".txt"
+    ]
+
+
+def load_document(
+    file_path: "Path | str",
+    content: "bytes | None" = None,
+) -> "list[dict[str, Any]]":
+    """
+    Load pages from a single file, with OCR fallback for image-based PDFs.
+
+    Mirrors the extraction path in load_documents (plural) so that files
+    ingested via the UI (ingest_file) receive the same quality treatment as
+    files ingested via the batch ingest_documents path.
+    """
+    file_path = Path(file_path)
+    suffix = file_path.suffix.lower()
+
+    if suffix == ".pdf":
+        try:
+            doc = fitz.open(str(file_path))
+            page_count = len(doc)
+            doc.close()
+        except Exception as exc:
+            print(f"[load_document] Failed to open {file_path.name}: {exc}")
+            return []
+
+        pages: list[dict[str, Any]] = []
+        for idx in range(page_count):
+            try:
+                pages.append(_extract_page_native(str(file_path), idx))
+            except Exception as exc:
+                print(f"[load_document] Page {idx + 1} failed: {exc}")
+                pages.append({
+                    "page": idx + 1, "text": "", "blocks": [],
+                    "has_images": False, "native_text_chars": 0,
+                })
+
+        # -------------------------------------------------------------------
+        # OCR FALLBACK: same logic as load_documents (plural).
+        # Any page where native extraction yielded too few characters is sent
+        # through OCR so that scanned / image-based PDFs are not silently
+        # rejected as "No usable content".
+        # -------------------------------------------------------------------
+        empty_page_indexes = [
+            idx
+            for idx, page in enumerate(pages)
+            if len((page.get("text") or "").strip()) < OCR_MIN_TEXT_CHARS
+        ]
+
+        if empty_page_indexes:
+            print(
+                f"[load_document] {file_path.name}: "
+                f"{len(empty_page_indexes)} page(s) need OCR "
+                f"(native text < {OCR_MIN_TEXT_CHARS} chars)"
+            )
+            try:
+                ocr_results = _ocr_pages(str(file_path), empty_page_indexes)
+                for idx, ocr_text in ocr_results.items():
+                    if ocr_text.strip():
+                        pages[idx]["text"] = ocr_text
+                        pages[idx]["native_text_chars"] = len(ocr_text)
+            except Exception as exc:
+                print(f"[load_document] OCR failed for {file_path.name}: {exc}")
+
+        pages = remove_running_headers_footers(pages)
+        for p in pages:
+            p["source"] = file_path.name
+            p["path"] = str(file_path)
+        return pages
+
+    if suffix in {".txt", ".md"}:
+        try:
+            text = file_path.read_text(encoding="utf-8", errors="ignore")
+        except Exception as exc:
+            print(f"[load_document] Failed to read {file_path.name}: {exc}")
+            return []
+        return [{"page": 1, "text": clean_text(text),
+                 "source": file_path.name, "path": str(file_path),
+                 "has_images": False}]
+
+    print(f"[load_document] Unsupported type: {file_path.suffix}")
+    return []
+
+
+
+# ============================================================
+# MAIN DEBUG ENTRY
+# ============================================================
+
+if __name__ == "__main__":
+
+    print(
+        "document_loader.py loaded successfully."
+    )
+
+    print(
+        f"Knowledge base: "
+        f"{KNOWLEDGE_BASE_DIR}"
+    )
+
+    print(
+        f"Target tokens: "
+        f"{TARGET_TOKENS}"
+    )
+
+    print(
+        f"Maximum tokens: "
+        f"{MAX_TOKENS}"
+    )
+
+    print(
+        f"Minimum tokens: "
+        f"{MIN_TOKENS}"
+    )
+
+    print(
+        f"OCR mode: "
+        f"{OCR_MODE}"
+    )
+
+    print(
+        f"OCR workers: "
+        f"{OCR_WORKERS}"
+    )

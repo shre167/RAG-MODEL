@@ -23,6 +23,11 @@ logger = logging.getLogger(__name__)
 def _safe_langfuse_import() -> Any | None:
     """Safely import Langfuse SDK with error handling."""
     try:
+        # Use the operating system trust store (including locally installed CA
+        # certificates) so HTTPS verification works on managed Windows hosts.
+        import truststore
+
+        truststore.inject_into_ssl()
         from langfuse import get_client
         return get_client
     except ImportError:

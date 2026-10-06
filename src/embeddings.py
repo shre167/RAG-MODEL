@@ -8,7 +8,18 @@ from typing import Callable, List, Optional, TypeVar
 import requests
 
 try:
+    from google import genai
+    from google.genai import types
+
+    _HAS_GOOGLE_GENAI = True
+except ImportError:  # pragma: no cover
+    genai = None  # type: ignore
+    types = None  # type: ignore
+    _HAS_GOOGLE_GENAI = False
+
+try:
     from openai import OpenAI as OpenAIClient, APIStatusError
+
     _HAS_OPENAI = True
 except ImportError:  # pragma: no cover
     OpenAIClient = None  # type: ignore
@@ -29,19 +40,27 @@ logger = logging.getLogger(__name__)
 T = TypeVar("T")
 
 
+# ======================================================================
+# ERROR / RETRY HELPERS
+# ======================================================================
+
 class RateLimitError(RuntimeError):
-    """Raised when embedding API rate limits are exceeded after all retries."""
+    """Raised when embedding API rate limits are exceeded."""
 
 
 def _is_rate_limit_error(exc: Exception) -> bool:
     if _HAS_OPENAI and isinstance(exc, APIStatusError):
         if getattr(exc, "status_code", None) == 429:
             return True
+
     if isinstance(exc, requests.HTTPError):
         response = getattr(exc, "response", None)
+
         if response is not None and response.status_code == 429:
             return True
+
     message = str(exc).lower()
+
     return (
         "429" in message
         or "rate limit" in message
@@ -51,29 +70,54 @@ def _is_rate_limit_error(exc: Exception) -> bool:
     )
 
 
-def _get_retry_after_seconds(exc: Exception) -> Optional[float]:
+def _get_retry_after_seconds(
+    exc: Exception,
+) -> Optional[float]:
+
     if _HAS_OPENAI and isinstance(exc, APIStatusError):
+
         response = getattr(exc, "response", None)
-        headers = getattr(response, "headers", None) if response is not None else None
+
+        headers = (
+            getattr(response, "headers", None)
+            if response is not None
+            else None
+        )
+
         if headers:
-            retry_after = headers.get("retry-after") or headers.get("Retry-After")
+
+            retry_after = (
+                headers.get("retry-after")
+                or headers.get("Retry-After")
+            )
+
             if retry_after is not None:
+
                 try:
                     return float(retry_after)
+
                 except (TypeError, ValueError):
                     pass
 
     if isinstance(exc, requests.HTTPError):
+
         response = getattr(exc, "response", None)
+
         if response is not None:
-            retry_after = response.headers.get("Retry-After") or response.headers.get(
-                "retry-after"
+
+            retry_after = (
+                response.headers.get("Retry-After")
+                or response.headers.get("retry-after")
             )
+
             if retry_after is not None:
+
                 try:
                     return float(retry_after)
+
                 except (TypeError, ValueError):
                     pass
+
     return None
 
 
@@ -84,47 +128,98 @@ def _execute_with_retry(
     max_retries: Optional[int] = None,
     base_delay: Optional[float] = None,
 ) -> T:
-    retries = max_retries if max_retries is not None else EMBEDDING_MAX_RETRIES
-    delay_base = base_delay if base_delay is not None else EMBEDDING_RETRY_BASE_DELAY
+
+    retries = (
+        max_retries
+        if max_retries is not None
+        else EMBEDDING_MAX_RETRIES
+    )
+
+    delay_base = (
+        base_delay
+        if base_delay is not None
+        else EMBEDDING_RETRY_BASE_DELAY
+    )
+
     last_exc: Optional[Exception] = None
 
     for attempt in range(retries + 1):
+
         try:
             return func()
+
         except Exception as exc:
+
             if not _is_rate_limit_error(exc):
                 raise
+
             last_exc = exc
+
             if attempt >= retries:
                 break
+
             retry_after = _get_retry_after_seconds(exc)
-            delay = retry_after if retry_after is not None else delay_base * (2 ** attempt)
+
+            delay = (
+                retry_after
+                if retry_after is not None
+                else delay_base * (2 ** attempt)
+            )
+
             delay += random.uniform(0, 0.5)
+
             logger.warning(
-                "Rate limit (429) on %s, attempt %d/%d. Retrying in %.1fs.",
+                "Rate limit on %s, attempt %d/%d. "
+                "Retrying in %.1fs.",
                 operation_name,
                 attempt + 1,
                 retries,
                 delay,
             )
+
             time.sleep(delay)
 
     raise RateLimitError(
-        f"Rate limit exceeded after {retries} retries during {operation_name}: {last_exc}"
+        f"Rate limit exceeded after {retries} retries "
+        f"during {operation_name}: {last_exc}"
     ) from last_exc
 
 
+# ======================================================================
+# EMBEDDING SERVICE
+# ======================================================================
+
 class EmbeddingService:
-    """Create embeddings using an OpenAI-compatible endpoint.
-
-    Uses the OpenAI SDK client when available (handles Bearer auth cleanly).
-    Falls back to a raw requests.post() call ONLY when the OpenAI client
-    itself cannot be initialised (not when an API call fails with a 4xx).
-
-    This eliminates the previous double-request pattern where a failed
-    client call fell through to a redundant requests.post() with the same
-    payload, causing every error to generate two network round-trips.
     """
+    Flexible embedding service.
+
+    Supported modes:
+
+    1. Gemini:
+       EMBEDDING_MODEL=gemini-embedding-2
+
+       Uses Google's native google-genai SDK.
+
+    2. Local:
+       EMBEDDING_MODEL=local:BAAI/bge-small-en-v1.5
+
+       Uses Sentence Transformers locally.
+
+       IMPORTANT:
+       Sentence Transformers is imported ONLY when local mode
+       is selected.
+
+    3. OpenAI-compatible:
+       Any other embedding model.
+
+       Uses the existing OpenAI-compatible implementation.
+    """
+
+    # Gemini native batch size.
+    GEMINI_BATCH_SIZE = 50
+
+    # Local embedding batch size.
+    LOCAL_BATCH_SIZE = 32
 
     def __init__(
         self,
@@ -132,243 +227,982 @@ class EmbeddingService:
         model: Optional[str] = None,
         base_url: Optional[str] = None,
     ):
-        self.api_key = api_key or GE_API_KEY or LLM_API_KEY
-        self.model = model or EMBEDDING_MODEL
-        self.base_url = (base_url or LLM_BASE_URL or "").rstrip("/")
 
+        self.api_key = (
+            api_key
+            or GE_API_KEY
+            or LLM_API_KEY
+        )
+
+        self.model = (
+            model
+            or EMBEDDING_MODEL
+        )
+
+        self.base_url = (
+            base_url
+            or LLM_BASE_URL
+            or "https://generativelanguage.googleapis.com/v1beta/openai"
+        ).rstrip("/")
+
+        self._google_client = None
         self._client: Optional["OpenAIClient"] = None
-        if _HAS_OPENAI and self.api_key and self.base_url:
+        self._local_model = None
+
+        self.dimension: Optional[int] = None
+
+        # ==============================================================
+        # LOCAL EMBEDDING MODE
+        # ==============================================================
+
+        if self.model.startswith("local:"):
+
+            local_model_name = (
+                self.model.replace("local:", "", 1)
+                .strip()
+            )
+
+            if not local_model_name:
+
+                raise ValueError(
+                    "Local embedding model name is missing. "
+                    "Example: local:BAAI/bge-small-en-v1.5"
+                )
+
             try:
+
+                # IMPORTANT:
+                # This import happens ONLY in local mode.
+                from sentence_transformers import (
+                    SentenceTransformer
+                )
+
+            except ImportError as exc:
+
+                raise RuntimeError(
+                    "Local embeddings require "
+                    "sentence-transformers.\n\n"
+                    "Install it with:\n"
+                    "pip install sentence-transformers"
+                ) from exc
+
+            try:
+
+                logger.info(
+                    "Loading LOCAL embedding model: %s",
+                    local_model_name,
+                )
+
+                self._local_model = (
+                    SentenceTransformer(
+                        local_model_name
+                    )
+                )
+
+                self.dimension = (
+                    self._local_model
+                    .get_sentence_embedding_dimension()
+                )
+
+                logger.info(
+                    "Local embedding model loaded "
+                    "(dimension=%s).",
+                    self.dimension,
+                )
+
+                print(
+                    f"LOCAL EMBEDDINGS ENABLED: "
+                    f"{local_model_name}"
+                )
+
+                print(
+                    f"Embedding dimension: "
+                    f"{self.dimension}"
+                )
+
+            except Exception as exc:
+
+                raise RuntimeError(
+                    f"Failed to load local embedding model "
+                    f"'{local_model_name}': {exc}"
+                ) from exc
+
+            # IMPORTANT:
+            #
+            # Stop initialization here.
+            #
+            # No Gemini client.
+            # No OpenAI client.
+            # No embedding API calls.
+
+            return
+
+        # ==============================================================
+        # GEMINI NATIVE EMBEDDING MODE
+        # ==============================================================
+
+        if (
+            self.model.startswith("gemini-embedding")
+            and _HAS_GOOGLE_GENAI
+            and self.api_key
+        ):
+
+            try:
+
+                self._google_client = (
+                    genai.Client(
+                        api_key=self.api_key
+                    )
+                )
+
+                logger.info(
+                    "Native Google GenAI embedding client "
+                    "enabled (model=%s).",
+                    self.model,
+                )
+
+                print(
+                    f"GEMINI EMBEDDINGS ENABLED: "
+                    f"{self.model}"
+                )
+
+            except Exception as exc:
+
+                logger.error(
+                    "Failed to initialize Google GenAI "
+                    "client: %s",
+                    exc,
+                )
+
+                self._google_client = None
+
+        # ==============================================================
+        # EXISTING OPENAI-COMPATIBLE MODE
+        # ==============================================================
+
+        if (
+            not self.model.startswith("gemini-embedding")
+            and _HAS_OPENAI
+            and self.api_key
+            and self.base_url
+        ):
+
+            try:
+
                 import httpx
-                http_client = httpx.Client(verify=False, timeout=httpx.Timeout(20.0, connect=6.0))
+
+                http_client = httpx.Client(
+                    verify=False,
+                    timeout=httpx.Timeout(
+                        20.0,
+                        connect=6.0,
+                    ),
+                )
+
                 try:
-                    self._client = OpenAIClient(
-                        api_key=self.api_key,
-                        base_url=self.base_url,
-                        default_headers={"x-api-key": self.api_key},
-                        http_client=http_client,
+
+                    self._client = (
+                        OpenAIClient(
+                            api_key=self.api_key,
+                            base_url=self.base_url,
+                            default_headers={
+                                "x-api-key": self.api_key
+                            },
+                            http_client=http_client,
+                        )
                     )
+
                 except TypeError:
-                    # older openai SDK versions don't support default_headers
-                    self._client = OpenAIClient(
-                        api_key=self.api_key,
-                        base_url=self.base_url,
-                        http_client=http_client,
+
+                    self._client = (
+                        OpenAIClient(
+                            api_key=self.api_key,
+                            base_url=self.base_url,
+                            http_client=http_client,
+                        )
                     )
-            except Exception:
+
+            except Exception as exc:
+
+                logger.error(
+                    "Failed to initialize OpenAI client: %s",
+                    exc,
+                )
+
                 self._client = None
 
-    # ------------------------------------------------------------------
-    # Single-text embedding
-    # ------------------------------------------------------------------
+    # ==================================================================
+    # SINGLE EMBEDDING
+    # ==================================================================
 
-    def create_embedding(self, text: str) -> Optional[List[float]]:
-        if not self.base_url or not self.model or not self.api_key:
+    def create_embedding(
+        self,
+        text: str,
+    ) -> Optional[List[float]]:
+
+        if not text or not text.strip():
+
             logger.warning(
-                "Embedding config incomplete: GE_API_KEY, LLM_BASE_URL, "
-                "and EMBEDDING_MODEL must all be set in .env."
+                "Cannot create embedding for empty text."
             )
+
+            return None
+
+        # ==============================================================
+        # LOCAL
+        # ==============================================================
+
+        if self.model.startswith("local:"):
+
+            return self._local_embed_single(
+                text
+            )
+
+        # ==============================================================
+        # GEMINI
+        # ==============================================================
+
+        if self.model.startswith(
+            "gemini-embedding"
+        ):
+
+            return self._google_embed_single(
+                text
+            )
+
+        # ==============================================================
+        # OPENAI-COMPATIBLE
+        # ==============================================================
+
+        if not self.api_key or not self.model:
+
+            logger.warning(
+                "Embedding configuration incomplete."
+            )
+
             return None
 
         if self._client is not None:
+
             try:
+
                 resp = _execute_with_retry(
                     "single embedding",
-                    lambda: self._client.embeddings.create(  # type: ignore[union-attr]
-                        model=self.model,
-                        input=text,
+                    lambda: (
+                        self._client
+                        .embeddings
+                        .create(
+                            model=self.model,
+                            input=text,
+                        )
                     ),
                     max_retries=2,
                     base_delay=0.5,
                 )
+
                 return resp.data[0].embedding
+
             except RateLimitError:
+
                 raise
+
             except Exception as exc:
-                # Do NOT fall through to requests. If the client is configured
-                # and the API returned an error, re-trying with raw requests
-                # will produce the same failure. Surface the error clearly.
+
                 logger.error(
-                    "OpenAI client embedding error (model=%s): %s",
+                    "OpenAI client embedding error "
+                    "(model=%s): %s",
                     self.model,
                     exc,
                 )
+
                 return None
 
-        # -- requests-only path (when OpenAI SDK is not installed) --
-        return self._requests_embed_single(text)
+        return self._requests_embed_single(
+            text
+        )
 
-    # ------------------------------------------------------------------
-    # Batch embedding
-    # ------------------------------------------------------------------
+    # ==================================================================
+    # BATCH EMBEDDING
+    # ==================================================================
 
-    def create_embeddings_batch(self, texts: List[str]) -> List[List[float]]:
-        if not self.base_url or not self.model or not self.api_key:
+    def create_embeddings_batch(
+        self,
+        texts: List[str],
+    ) -> List[List[float]]:
+
+        if not texts:
+            return []
+
+        # ==============================================================
+        # LOCAL
+        # ==============================================================
+
+        if self.model.startswith("local:"):
+
+            return self._local_embed_batch(
+                texts
+            )
+
+        # ==============================================================
+        # GEMINI
+        # ==============================================================
+
+        if self.model.startswith(
+            "gemini-embedding"
+        ):
+
+            return self._google_embed_batch(
+                texts
+            )
+
+        # ==============================================================
+        # OPENAI-COMPATIBLE
+        # ==============================================================
+
+        if not self.api_key or not self.model:
+
             raise ValueError(
-                "Embedding config incomplete: GE_API_KEY, LLM_BASE_URL, "
-                "and EMBEDDING_MODEL must all be set in .env."
+                "Embedding configuration is incomplete."
             )
 
         if self._client is not None:
-            return self._client_embed_batch(texts)
 
-        # -- requests-only fallback --
-        return self._requests_embed_batch(texts)
-
-    # ------------------------------------------------------------------
-    # OpenAI SDK batch helper
-    # ------------------------------------------------------------------
-
-    def _client_embed_batch(self, texts: List[str]) -> List[List[float]]:
-        """Batch embedding via OpenAI SDK with 429 retry/backoff.
-
-        The Gemini OpenAI-compatible endpoint (gemini-embedding-001) only
-        accepts a single string as ``input``, not a list.  We detect this
-        by checking for the HTTP 400 / INVALID_ARGUMENT response that the
-        API returns when a list is submitted, then fall back to per-item
-        requests automatically.  For other OpenAI-compatible endpoints that
-        support list input, the original batch path continues to work.
-        """
-        # --- Try true batch first (works with standard OpenAI endpoints) ---
-        try:
-            resp = _execute_with_retry(
-                f"batch embedding ({len(texts)} items)",
-                lambda: self._client.embeddings.create(  # type: ignore[union-attr]
-                    model=self.model,
-                    input=texts,
-                ),
+            return self._client_embed_batch(
+                texts
             )
-            results = [None] * len(texts)
-            for item in resp.data:
-                if item.index is not None and 0 <= item.index < len(texts):
-                    results[item.index] = item.embedding
-            none_indices = [i for i, value in enumerate(results) if value is None]
-            if none_indices:
-                logger.warning(
-                    "Batch embed: %d items had no index; falling back per-item.",
-                    len(none_indices),
+
+        return self._requests_embed_batch(
+            texts
+        )
+
+    # ==================================================================
+    # LOCAL EMBEDDINGS
+    # ==================================================================
+
+    def _local_embed_single(
+        self,
+        text: str,
+    ) -> List[float]:
+
+        if self._local_model is None:
+
+            raise RuntimeError(
+                "Local embedding model is not loaded."
+            )
+
+        try:
+
+            embedding = (
+                self._local_model.encode(
+                    text,
+                    normalize_embeddings=True,
+                    convert_to_numpy=True,
                 )
-                for i in none_indices:
-                    emb = self._client_embed_single(texts[i])
-                    if emb is None:
-                        raise RuntimeError(
-                            f"Embedding failed for item {i}/{len(texts)}"
-                        )
-                    results[i] = emb
-            return results  # type: ignore[return-value]
-
-        except RateLimitError:
-            raise
-        except Exception as exc:
-            if _is_rate_limit_error(exc):
-                raise RateLimitError(
-                    f"Rate limit exceeded during batch embedding: {exc}"
-                ) from exc
-            # HTTP 400 INVALID_ARGUMENT is returned by the Gemini
-            # OpenAI-compatible endpoint when input is a list.
-            # Fall back to per-item single requests.
-            logger.warning(
-                "Batch embedding failed (%s); retrying per-item.", exc
             )
-            embeddings: List[List[float]] = []
-            for i, text in enumerate(texts):
-                emb = self._client_embed_single(text)
-                if emb is None:
-                    raise RuntimeError(
-                        f"Embedding failed for item {i + 1}/{len(texts)}"
-                    ) from exc
-                embeddings.append(emb)
-                if (i + 1) % 10 == 0:
-                    logger.info(
-                        "Progress: %d / %d embeddings created.", i + 1, len(texts)
-                    )
-            return embeddings
 
-    def _client_embed_single(self, text: str) -> Optional[List[float]]:
-        """Embed a single string using the OpenAI SDK client."""
+            return embedding.tolist()
+
+        except Exception as exc:
+
+            logger.error(
+                "Local embedding failed: %s",
+                exc,
+            )
+
+            raise RuntimeError(
+                "Failed to create local embedding."
+            ) from exc
+
+    def _local_embed_batch(
+        self,
+        texts: List[str],
+    ) -> List[List[float]]:
+
+        if self._local_model is None:
+
+            raise RuntimeError(
+                "Local embedding model is not loaded."
+            )
+
         try:
-            resp = _execute_with_retry(
-                "single embedding (client)",
-                lambda: self._client.embeddings.create(  # type: ignore[union-attr]
-                    model=self.model,
-                    input=text,
+
+            embeddings = (
+                self._local_model.encode(
+                    texts,
+                    batch_size=self.LOCAL_BATCH_SIZE,
+                    normalize_embeddings=True,
+                    convert_to_numpy=True,
+                    show_progress_bar=True,
+                )
+            )
+
+            result = embeddings.tolist()
+
+            if len(result) != len(texts):
+
+                raise RuntimeError(
+                    f"Local model returned "
+                    f"{len(result)} embeddings for "
+                    f"{len(texts)} inputs."
+                )
+
+            return result
+
+        except Exception as exc:
+
+            logger.error(
+                "Local batch embedding failed: %s",
+                exc,
+            )
+
+            raise RuntimeError(
+                "Failed to create local batch embeddings."
+            ) from exc
+
+    # ==================================================================
+    # GEMINI - SINGLE
+    # ==================================================================
+
+    def _google_embed_single(
+        self,
+        text: str,
+    ) -> Optional[List[float]]:
+
+        if self._google_client is None:
+
+            raise RuntimeError(
+                "google-genai is not installed or the "
+                "Google GenAI client could not be initialized."
+            )
+
+        try:
+
+            result = _execute_with_retry(
+                "Gemini single embedding",
+                lambda: (
+                    self._google_client
+                    .models
+                    .embed_content(
+                        model=self.model,
+                        contents=text,
+                        config=(
+                            types.EmbedContentConfig(
+                                output_dimensionality=3072
+                            )
+                        ),
+                    )
                 ),
             )
-            return resp.data[0].embedding
+
+            if not result.embeddings:
+
+                raise RuntimeError(
+                    "Gemini returned no embeddings."
+                )
+
+            values = (
+                result
+                .embeddings[0]
+                .values
+            )
+
+            if values is None:
+
+                raise RuntimeError(
+                    "Gemini returned an embedding "
+                    "without values."
+                )
+
+            return list(values)
+
         except RateLimitError:
+
             raise
+
         except Exception as exc:
+
             logger.error(
-                "OpenAI client embedding error (model=%s): %s",
+                "Gemini embedding error "
+                "(model=%s): %s",
                 self.model,
                 exc,
             )
+
             return None
 
-    # ------------------------------------------------------------------
-    # Raw requests helpers (no OpenAI SDK)
-    # ------------------------------------------------------------------
+    # ==================================================================
+    # GEMINI - BATCH
+    # ==================================================================
 
-    def _embeddings_endpoint(self) -> str:
-        return f"{self.base_url}/embeddings"
+    def _google_embed_batch(
+        self,
+        texts: List[str],
+    ) -> List[List[float]]:
 
-    def _requests_embed_single(self, text: str) -> Optional[List[float]]:
-        headers = {
-            "Authorization": f"Bearer {self.api_key}",
-            "x-api-key": self.api_key,
-            "Content-Type": "application/json",
-        }
-        payload = {"model": self.model, "input": text}
-        try:
-            resp = _execute_with_retry(
-                "single embedding (requests)",
-                lambda: self._post_embedding_request(headers, payload, timeout=30),
+        if self._google_client is None:
+
+            raise RuntimeError(
+                "google-genai is not installed or the "
+                "Google GenAI client could not be initialized."
             )
-            return resp.json()["data"][0]["embedding"]
-        except RateLimitError:
-            raise
-        except Exception as exc:
-            logger.error("Embedding request failed: %s", exc)
-            return None
 
-    def _requests_embed_batch(self, texts: List[str]) -> List[List[float]]:
-        headers = {
-            "Authorization": f"Bearer {self.api_key}",
-            "x-api-key": self.api_key,
-            "Content-Type": "application/json",
-        }
+        all_embeddings: List[List[float]] = []
+
+        total = len(texts)
+
+        for start in range(
+            0,
+            total,
+            self.GEMINI_BATCH_SIZE,
+        ):
+
+            batch = texts[
+                start:
+                start + self.GEMINI_BATCH_SIZE
+            ]
+
+            batch_number = (
+                start // self.GEMINI_BATCH_SIZE
+            ) + 1
+
+            total_batches = (
+                total
+                + self.GEMINI_BATCH_SIZE
+                - 1
+            ) // self.GEMINI_BATCH_SIZE
+
+            logger.info(
+                "Gemini embedding batch %d/%d "
+                "(%d texts).",
+                batch_number,
+                total_batches,
+                len(batch),
+            )
+
+            # Each Content object represents ONE input.
+            contents = [
+                types.Content(
+                    parts=[
+                        types.Part.from_text(
+                            text=text
+                        )
+                    ]
+                )
+                for text in batch
+            ]
+
+            # Small pause between API requests.
+            #
+            # This is only used for Gemini.
+            # Local embeddings do not sleep.
+            if all_embeddings:
+
+                time.sleep(1.0)
+
+            try:
+
+                result = _execute_with_retry(
+                    (
+                        f"Gemini batch embedding "
+                        f"({len(batch)} items)"
+                    ),
+                    lambda: (
+                        self._google_client
+                        .models
+                        .embed_content(
+                            model=self.model,
+                            contents=contents,
+                            config=(
+                                types.EmbedContentConfig(
+                                    output_dimensionality=3072
+                                )
+                            ),
+                        )
+                    ),
+                    max_retries=3,
+                    base_delay=2.0,
+                )
+
+            except RateLimitError:
+
+                raise
+
+            except Exception as exc:
+
+                logger.error(
+                    "Gemini batch embedding failed: %s",
+                    exc,
+                )
+
+                raise RuntimeError(
+                    "Gemini batch embedding failed "
+                    f"for batch "
+                    f"{batch_number}/{total_batches}"
+                ) from exc
+
+            if not result.embeddings:
+
+                raise RuntimeError(
+                    "Gemini returned no embeddings "
+                    f"for batch {batch_number}."
+                )
+
+            batch_embeddings = []
+
+            for embedding in result.embeddings:
+
+                values = embedding.values
+
+                if values is None:
+
+                    raise RuntimeError(
+                        "Gemini returned an embedding "
+                        "without values."
+                    )
+
+                batch_embeddings.append(
+                    list(values)
+                )
+
+            if (
+                len(batch_embeddings)
+                != len(batch)
+            ):
+
+                raise RuntimeError(
+                    "Gemini returned "
+                    f"{len(batch_embeddings)} embeddings "
+                    f"for {len(batch)} inputs."
+                )
+
+            all_embeddings.extend(
+                batch_embeddings
+            )
+
+            logger.info(
+                "Gemini progress: %d/%d embeddings.",
+                len(all_embeddings),
+                total,
+            )
+
+        return all_embeddings
+
+    # ==================================================================
+    # EXISTING OPENAI SDK BATCH
+    # ==================================================================
+
+    def _client_embed_batch(
+        self,
+        texts: List[str],
+    ) -> List[List[float]]:
+
         try:
+
             resp = _execute_with_retry(
-                f"batch embedding (requests, {len(texts)} items)",
-                lambda: self._post_embedding_request(
-                    headers,
-                    {"model": self.model, "input": texts},
-                    timeout=60,
+                f"batch embedding "
+                f"({len(texts)} items)",
+                lambda: (
+                    self._client
+                    .embeddings
+                    .create(
+                        model=self.model,
+                        input=texts,
+                    )
                 ),
             )
-            items = resp.json().get("data", [])
-            if len(items) != len(texts):
-                raise RuntimeError(
-                    f"Batch response length {len(items)} != request size {len(texts)}"
+
+            results = [None] * len(texts)
+
+            for item in resp.data:
+
+                if (
+                    item.index is not None
+                    and 0 <= item.index < len(texts)
+                ):
+
+                    results[
+                        item.index
+                    ] = item.embedding
+
+            none_indices = [
+                i
+                for i, value
+                in enumerate(results)
+                if value is None
+            ]
+
+            if none_indices:
+
+                logger.warning(
+                    "Batch embed: %d items had "
+                    "no index; falling back per-item.",
+                    len(none_indices),
                 )
-            return [item["embedding"] for item in items]
+
+                for i in none_indices:
+
+                    emb = (
+                        self._client_embed_single(
+                            texts[i]
+                        )
+                    )
+
+                    if emb is None:
+
+                        raise RuntimeError(
+                            f"Embedding failed for "
+                            f"item {i}/"
+                            f"{len(texts)}"
+                        )
+
+                    results[i] = emb
+
+            return results  # type: ignore
+
         except RateLimitError:
+
             raise
+
         except Exception as exc:
+
             if _is_rate_limit_error(exc):
+
                 raise RateLimitError(
-                    f"Rate limit exceeded during batch embedding: {exc}"
+                    "Rate limit exceeded during "
+                    f"batch embedding: {exc}"
                 ) from exc
-            logger.warning("Batch embed (requests) failed (%s); retrying per-item.", exc)
-            results: List[List[float]] = []
+
+            logger.warning(
+                "Batch embedding failed (%s); "
+                "retrying per-item.",
+                exc,
+            )
+
+            embeddings: List[List[float]] = []
+
             for i, text in enumerate(texts):
-                emb = self._requests_embed_single(text)
+
+                emb = (
+                    self._client_embed_single(
+                        text
+                    )
+                )
+
                 if emb is None:
+
                     raise RuntimeError(
-                        f"Embedding failed for item {i + 1}/{len(texts)}"
+                        f"Embedding failed for "
+                        f"item {i + 1}/"
+                        f"{len(texts)}"
                     ) from exc
+
+                embeddings.append(emb)
+
+            return embeddings
+
+    # ==================================================================
+    # EXISTING OPENAI SDK SINGLE
+    # ==================================================================
+
+    def _client_embed_single(
+        self,
+        text: str,
+    ) -> Optional[List[float]]:
+
+        try:
+
+            resp = _execute_with_retry(
+                "single embedding (client)",
+                lambda: (
+                    self._client
+                    .embeddings
+                    .create(
+                        model=self.model,
+                        input=text,
+                    )
+                ),
+            )
+
+            return resp.data[0].embedding
+
+        except RateLimitError:
+
+            raise
+
+        except Exception as exc:
+
+            logger.error(
+                "OpenAI client embedding error "
+                "(model=%s): %s",
+                self.model,
+                exc,
+            )
+
+            return None
+
+    # ==================================================================
+    # RAW REQUESTS
+    # ==================================================================
+
+    def _embeddings_endpoint(self) -> str:
+
+        return (
+            f"{self.base_url}/embeddings"
+        )
+
+    def _requests_embed_single(
+        self,
+        text: str,
+    ) -> Optional[List[float]]:
+
+        headers = {
+            "Authorization":
+                f"Bearer {self.api_key}",
+
+            "x-api-key":
+                self.api_key,
+
+            "Content-Type":
+                "application/json",
+        }
+
+        payload = {
+            "model": self.model,
+            "input": text,
+        }
+
+        try:
+
+            resp = _execute_with_retry(
+                "single embedding (requests)",
+                lambda: (
+                    self._post_embedding_request(
+                        headers,
+                        payload,
+                        timeout=30,
+                    )
+                ),
+            )
+
+            return (
+                resp.json()
+                ["data"][0]
+                ["embedding"]
+            )
+
+        except RateLimitError:
+
+            raise
+
+        except Exception as exc:
+
+            logger.error(
+                "Embedding request failed: %s",
+                exc,
+            )
+
+            return None
+
+    def _requests_embed_batch(
+        self,
+        texts: List[str],
+    ) -> List[List[float]]:
+
+        headers = {
+            "Authorization":
+                f"Bearer {self.api_key}",
+
+            "x-api-key":
+                self.api_key,
+
+            "Content-Type":
+                "application/json",
+        }
+
+        try:
+
+            resp = _execute_with_retry(
+                (
+                    f"batch embedding "
+                    f"(requests, {len(texts)} items)"
+                ),
+                lambda: (
+                    self._post_embedding_request(
+                        headers,
+                        {
+                            "model":
+                                self.model,
+                            "input":
+                                texts,
+                        },
+                        timeout=60,
+                    )
+                ),
+            )
+
+            items = (
+                resp
+                .json()
+                .get("data", [])
+            )
+
+            if len(items) != len(texts):
+
+                raise RuntimeError(
+                    "Batch response length "
+                    f"{len(items)} != request size "
+                    f"{len(texts)}"
+                )
+
+            return [
+                item["embedding"]
+                for item in items
+            ]
+
+        except RateLimitError:
+
+            raise
+
+        except Exception as exc:
+
+            if _is_rate_limit_error(exc):
+
+                raise RateLimitError(
+                    "Rate limit exceeded during "
+                    f"batch embedding: {exc}"
+                ) from exc
+
+            logger.warning(
+                "Batch embed (requests) failed "
+                "(%s); retrying per-item.",
+                exc,
+            )
+
+            results: List[List[float]] = []
+
+            for i, text in enumerate(texts):
+
+                emb = (
+                    self._requests_embed_single(
+                        text
+                    )
+                )
+
+                if emb is None:
+
+                    raise RuntimeError(
+                        f"Embedding failed for "
+                        f"item {i + 1}/"
+                        f"{len(texts)}"
+                    ) from exc
+
                 results.append(emb)
+
             return results
+
+    # ==================================================================
+    # HTTP HELPER
+    # ==================================================================
 
     def _post_embedding_request(
         self,
@@ -377,6 +1211,7 @@ class EmbeddingService:
         *,
         timeout: int,
     ) -> requests.Response:
+
         resp = requests.post(
             self._embeddings_endpoint(),
             headers=headers,
@@ -384,34 +1219,118 @@ class EmbeddingService:
             timeout=timeout,
             verify=False,
         )
+
         try:
+
             resp.raise_for_status()
+
         except requests.HTTPError as exc:
+
             if resp.status_code == 429:
                 raise exc
+
             raise
+
         return resp
 
+    # ==================================================================
+    # QUERY COMPATIBILITY
+    # ==================================================================
+
+    def embed_query(
+        self,
+        text: str,
+    ) -> List[float]:
+
+        embedding = self.create_embedding(
+            text
+        )
+
+        if embedding is None:
+
+            raise RuntimeError(
+                "Failed to generate query embedding."
+            )
+
+        return embedding
+
+
+# ======================================================================
+# SYNTHETIC EMBEDDINGS
+# ======================================================================
 
 class SyntheticEmbeddingService:
-    """Deterministic synthetic embeddings for local development/testing without API calls."""
+    """
+    Deterministic synthetic embeddings for local
+    development/testing without API calls.
+
+    This is NOT recommended for actual semantic retrieval.
+    """
 
     DIMS = 768
 
     def __init__(self) -> None:
-        self.model = "synthetic"
-        logger.info("SyntheticEmbeddingService active — no API calls will be made.")
 
-    def create_embedding(self, text: str) -> List[float]:
+        self.model = "synthetic"
+
+        logger.info(
+            "SyntheticEmbeddingService active — "
+            "no API calls will be made."
+        )
+
+    def create_embedding(
+        self,
+        text: str,
+    ) -> List[float]:
+
         import hashlib
         import math
-        seed = int(hashlib.md5(text.encode(), usedforsecurity=False).hexdigest(), 16)
-        vals: List[float] = []
-        for i in range(self.DIMS):
-            angle = (seed + i * 31337) % 360
-            vals.append(math.sin(math.radians(angle)))
-        norm = math.sqrt(sum(v * v for v in vals)) or 1.0
-        return [v / norm for v in vals]
 
-    def create_embeddings_batch(self, texts: List[str]) -> List[List[float]]:
-        return [self.create_embedding(t) for t in texts]
+        seed = int(
+            hashlib.md5(
+                text.encode(),
+                usedforsecurity=False,
+            ).hexdigest(),
+            16,
+        )
+
+        vals: List[float] = []
+
+        for i in range(self.DIMS):
+
+            angle = (
+                seed
+                + i * 31337
+            ) % 360
+
+            vals.append(
+                math.sin(
+                    math.radians(angle)
+                )
+            )
+
+        norm = math.sqrt(
+            sum(v * v for v in vals)
+        ) or 1.0
+
+        return [
+            v / norm
+            for v in vals
+        ]
+
+    def create_embeddings_batch(
+        self,
+        texts: List[str],
+    ) -> List[List[float]]:
+
+        return [
+            self.create_embedding(text)
+            for text in texts
+        ]
+
+    def embed_query(
+        self,
+        text: str,
+    ) -> List[float]:
+
+        return self.create_embedding(text)

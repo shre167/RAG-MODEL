@@ -7,6 +7,20 @@ from typing import Literal
 RetrievalMode = Literal["bm25", "vector", "hybrid"]
 
 _DEFAULT_RAGAS_MODES = ("bm25", "vector", "hybrid")
+_DEEPEVAL_METRICS = (
+    "faithfulness",
+    "answer_relevancy",
+    "contextual_relevancy",
+    "contextual_precision",
+    "contextual_recall",
+    "answer_correctness",
+    "answer_completeness",
+    "citation_correctness",
+    "citation_completeness",
+    "groundedness",
+    "noise_sensitivity",
+    "visual_multimodal_grounding",
+)
 
 
 def _env_flag(name: str, default: bool = False) -> bool:
@@ -65,3 +79,21 @@ def deepeval_eval_modes() -> tuple[RetrievalMode, ...]:
         if mode in _DEFAULT_RAGAS_MODES:
             modes.append(mode)  # type: ignore[arg-type]
     return tuple(modes) if modes else _DEFAULT_RAGAS_MODES
+
+
+def deepeval_metrics() -> tuple[str, ...]:
+    """Return selected DeepEval metric names; defaults to all supported metrics.
+
+    Reads DEEPEVAL_METRICS (comma-separated). If the variable is absent or
+    empty, ALL supported metrics are returned. DEEPEVAL_EVAL_MODES is NOT
+    used as a fallback here — that variable controls retrieval modes, not metrics.
+    """
+    raw = os.getenv("DEEPEVAL_METRICS", "").strip()
+    if not raw:
+        return _DEEPEVAL_METRICS  # run everything by default
+    selected = tuple(
+        part.strip().lower()
+        for part in raw.split(",")
+        if part.strip().lower() in _DEEPEVAL_METRICS
+    )
+    return selected if selected else _DEEPEVAL_METRICS

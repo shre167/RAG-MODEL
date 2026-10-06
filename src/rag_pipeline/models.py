@@ -125,6 +125,20 @@ class Candidate:
             "text": self.text,
             "metadata": dict(self.metadata),
 
+            # Hoist canonical chunk metadata to top level for observatory/UI access
+            "book_name": self.metadata.get("book_name") or self.metadata.get("book_title") or self.filename,
+            "book_title": self.metadata.get("book_title") or self.metadata.get("book_name") or "",
+            "chapter_num": self.metadata.get("chapter_num"),
+            "chapter_title": self.metadata.get("chapter_title") or "",
+            "section_heading": self.metadata.get("section_heading") or self.metadata.get("section_title") or "",
+            "section_title": self.metadata.get("section_title") or self.metadata.get("section_heading") or "",
+            "page_start": self.metadata.get("page_start") or self.metadata.get("page_number"),
+            "page_end": self.metadata.get("page_end"),
+            "token_count": self.metadata.get("token_count"),
+            "chunk_index": self.metadata.get("chunk_index"),
+            "prev_chunk_id": self.metadata.get("prev_chunk_id"),
+            "next_chunk_id": self.metadata.get("next_chunk_id"),
+
             # Dense retrieval
             "dense_rank": self.dense_rank,
             "dense_distance": self.dense_distance,

@@ -1,8 +1,7 @@
-"""DeepEval evaluation for RAG responses (no fabricated ground truth).
+"""LLM-judged RAG metrics with no fabricated ground truth.
 
-NOTE: DeepEval 1.6.2 has broken imports (missing langchain.schema).
-All metrics are implemented as direct LLM prompt calls via DeepEvalLLMAdapter.
-Do NOT import deepeval.metrics or DeepEvalBaseLLM.
+The project uses a small OpenAI-compatible adapter so it can evaluate through
+the configured model endpoint without relying on DeepEval's model wrappers.
 """
 from __future__ import annotations
 
@@ -25,8 +24,8 @@ _LLM_FAILURE_MARKERS = (
 class DeepEvalLLMAdapter:
     """Adapter to make ChatOpenAI compatible with DeepEval's LLM interface.
 
-    DeepEval 1.6.2 has import issues with langchain.schema.
-    This adapter provides a simpler LLM interface for evaluation.
+    This adapter keeps metric evaluation compatible with the configured
+    OpenAI-compatible model endpoint.
     """
 
     def __init__(self, api_key: str, base_url: str, model: str):
@@ -97,14 +96,16 @@ def _parse_score_and_reason(response: str, fallback_reason: str) -> tuple[float,
 
     Returns (score_float, reason_str). Score is clamped to [0, 1].
     """
+    if not response or not response.strip():
+        return 0.0, "Evaluation failed: the model returned an empty response."
     try:
         parts = response.strip().split(None, 1)
-        score = float(parts[0]) if parts else 0.5
+        score = float(parts[0])
         reason = parts[1] if len(parts) > 1 else fallback_reason
         score = max(0.0, min(1.0, score))
     except (ValueError, IndexError):
-        score = 0.5
-        reason = response[:100] if response else fallback_reason
+        score = 0.0
+        reason = "Evaluation failed: the response did not start with a numeric score."
     return score, reason
 
 
@@ -114,6 +115,7 @@ def evaluate_rag_response(
     answer: str,
     retrieved_contexts: list[str],
     retrieval_mode: RetrievalMode,
+    metrics: tuple[str, ...] | None = None,
 ) -> dict[str, Any]:
     """
     Evaluate a RAG response using 10 metrics implemented as direct LLM calls.
@@ -558,7 +560,72 @@ Format: <score> <reason>
                 return {"score": 0.0, "reason": f"Evaluation error: {exc}"}
 
         # ------------------------------------------------------------------
-        # Run all 10 metrics concurrently
+        # 11. NOISE SENSITIVITY
+        # What it measures: Whether irrelevant retrieved context negatively affects the answer.
+        # ------------------------------------------------------------------
+        def _eval_noise_sensitivity() -> dict[str, Any]:
+            try:
+                noise_sensitivity_prompt = f"""
+Evaluate whether the presence of any irrelevant retrieved context negatively affected the answer.
+Noise sensitivity measures if the model was confused by irrelevant chunks and hallucinated or degraded the answer quality.
+
+Query:
+{query}
+
+Retrieved Passages:
+{ctx_snippets}
+
+Answer:
+{answer}
+
+Rate the noise sensitivity on a scale of 0 to 1, where 1 means the answer was perfectly robust and unaffected by any noise, and 0 means irrelevant context severely degraded the answer.
+Respond with just a number between 0 and 1, followed by a brief reason.
+Format: <score> <reason>
+"""
+                ns_score, ns_reason = _parse_score_and_reason(
+                    llm.generate(noise_sensitivity_prompt),
+                    "Noise sensitivity evaluated",
+                )
+                return {"score": ns_score, "reason": ns_reason}
+            except Exception as exc:
+                logger.warning("Noise sensitivity evaluation failed: %s", exc)
+                return {"score": 0.0, "reason": f"Evaluation error: {exc}"}
+
+        # ------------------------------------------------------------------
+        # 12. VISUAL/MULTIMODAL GROUNDING
+        # What it measures: Whether answers correctly use information from image_description metadata.
+        # ------------------------------------------------------------------
+        def _eval_visual_multimodal_grounding() -> dict[str, Any]:
+            try:
+                multimodal_prompt = f"""
+Evaluate whether the answer correctly uses information from image metadata (PDF images, charts, and figures) provided in the retrieved context.
+Visual/Multimodal Grounding measures if the generated answer accurately reflects the visual descriptions.
+
+Query:
+{query}
+
+Retrieved Passages (including image descriptions):
+{context_full}
+
+Answer:
+{answer}
+
+Rate the visual/multimodal grounding on a scale of 0 to 1, where 1 means the answer perfectly utilizes available image descriptions without misinterpretation.
+If the answer makes no reference to visual elements or no image descriptions were retrieved, score 1.0 (neutral/not applicable).
+Respond with just a number between 0 and 1, followed by a brief reason.
+Format: <score> <reason>
+"""
+                vmg_score, vmg_reason = _parse_score_and_reason(
+                    llm.generate(multimodal_prompt),
+                    "Visual/multimodal grounding evaluated",
+                )
+                return {"score": vmg_score, "reason": vmg_reason}
+            except Exception as exc:
+                logger.warning("Visual/multimodal grounding evaluation failed: %s", exc)
+                return {"score": 0.0, "reason": f"Evaluation error: {exc}"}
+
+        # ------------------------------------------------------------------
+        # Run all metrics concurrently
         # ------------------------------------------------------------------
         metric_fns = {
             "faithfulness": _eval_faithfulness,
@@ -571,7 +638,15 @@ Format: <score> <reason>
             "citation_correctness": _eval_citation_correctness,
             "citation_completeness": _eval_citation_completeness,
             "groundedness": _eval_groundedness,
+            "noise_sensitivity": _eval_noise_sensitivity,
+            "visual_multimodal_grounding": _eval_visual_multimodal_grounding,
         }
+        selected_metrics = set(metrics or metric_fns)
+        metric_fns = {
+            name: fn
+            for name, fn in metric_fns.items()
+            if name in selected_metrics
+        } or metric_fns
 
         scores: dict[str, dict[str, Any]] = {}
 
@@ -596,10 +671,20 @@ Format: <score> <reason>
                         "reason": "Evaluation timed out or failed",
                     }
 
+        failed_metrics = [
+            name
+            for name, result in scores.items()
+            if str(result.get("reason", "")).startswith("Evaluation failed:")
+        ]
         return {
-            "status": "ok",
+            "status": (
+                "error"
+                if failed_metrics and len(failed_metrics) == len(scores)
+                else "partial" if failed_metrics else "ok"
+            ),
             "scores": scores,
             "retrieval_mode": retrieval_mode,
+            "failed_metrics": failed_metrics,
         }
 
     except Exception as exc:

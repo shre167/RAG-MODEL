@@ -72,7 +72,10 @@ from src.rag_pipeline.query import (
     safe_float,
 )
 from src.rag_pipeline.evaluation import evaluate_retrieval, evaluate_answer_quality
-from src.rag_pipeline.observability import observe_pipeline_answer
+from src.rag_pipeline.observability import (
+    observe_pipeline_answer,
+    schedule_observation_evaluation,
+)
 from src.rag_pipeline.observation_store import record_observation
 from src.rag_pipeline.citations import generate_claim_citations
 from src.rag_pipeline.confidence import evaluate_confidence
@@ -82,6 +85,16 @@ from src.rag_pipeline.kb_state import (
     get_current_kb_state,
     increment_kb_version,
 )
+
+# Image analysis (optional, runs only when ENABLE_IMAGE_ANALYSIS=true)
+try:
+    from src.config import ENABLE_IMAGE_ANALYSIS, IMAGE_ANALYSIS_MODEL
+    from src.image_analyzer import analyze_pdf_page_images
+    _IMAGE_ANALYSIS_AVAILABLE = True
+except ImportError:
+    _IMAGE_ANALYSIS_AVAILABLE = False
+    ENABLE_IMAGE_ANALYSIS = False
+    IMAGE_ANALYSIS_MODEL = ""
 
 logger = logging.getLogger(__name__)
 
@@ -180,10 +193,11 @@ class RAGPipeline:
                 chunk_overlap=self.chunk_overlap,
             )
 
-            if self.knowledge_base_path.exists():
-                self.bm25.build_index(
-                    str(self.knowledge_base_path)
-                )
+            if not self.bm25.load_index():
+                if self.knowledge_base_path.exists():
+                    self.bm25.build_index(
+                        str(self.knowledge_base_path)
+                    )
 
             logger.info(
                 "BM25 retriever initialized."
@@ -512,6 +526,15 @@ class RAGPipeline:
         started = time.perf_counter()
         response = self._answer_question_impl(question, retrieval_mode)
         total_latency_ms = (time.perf_counter() - started) * 1000
+        response = observe_pipeline_answer(
+            pipeline=self,
+            question=question,
+            retrieval_mode=retrieval_mode,
+            response=response,
+            total_latency_ms=total_latency_ms,
+            labels=evaluation_labels,
+            start_evaluation=False,
+        )
         observation = record_observation(
             self.vectorstore_path,
             question,
@@ -523,7 +546,7 @@ class RAGPipeline:
             key: observation[key]
             for key in ("query_id", "timestamp", "latency_ms", "embedding_model")
         }
-        return observe_pipeline_answer(
+        schedule_observation_evaluation(
             pipeline=self,
             question=question,
             retrieval_mode=retrieval_mode,
@@ -531,6 +554,7 @@ class RAGPipeline:
             total_latency_ms=total_latency_ms,
             labels=evaluation_labels,
         )
+        return response
 
     # ==================================================================
     # INGESTION
@@ -751,6 +775,8 @@ class RAGPipeline:
             "collection_count": count_after,
             "kb_version": new_kb_state.version,
             "indexes_consistent": new_kb_state.indexes_consistent,
+            "chunks_with_images": sum(1 for c in chunks if c.get("has_images", False)),
+            "chunks_with_images_described": sum(1 for c in chunks if c.get("image_description")),
         }
 
     def ingest_file(
@@ -902,6 +928,59 @@ class RAGPipeline:
                 f"No usable content found in "
                 f"{filename} after chunking."
             )
+
+        # ----------------------------------------------------------
+        # IMAGE ANALYSIS (optional, PDF only)
+        # ----------------------------------------------------------
+        if (
+            _IMAGE_ANALYSIS_AVAILABLE
+            and ENABLE_IMAGE_ANALYSIS
+            and str(file_path).lower().endswith(".pdf")
+            and IMAGE_ANALYSIS_MODEL
+        ):
+            _img_api_key = GE_API_KEY or LLM_API_KEY
+            _img_base_url = LLM_BASE_URL
+            if _img_api_key and _img_base_url:
+                logger.info(
+                    "Running image analysis on %s (%d chunks with images)...",
+                    filename,
+                    sum(1 for c in new_chunks if c.get("has_images", False)),
+                )
+                # Group chunks by page to avoid re-analyzing the same page twice
+                analyzed_pages: dict[int, str] = {}
+                for chunk in new_chunks:
+                    if not chunk.get("has_images", False):
+                        continue
+                    p_start = chunk.get("page_start")
+                    if p_start is None:
+                        continue
+                    page_idx = int(p_start) - 1  # fitz is 0-indexed
+                    if page_idx in analyzed_pages:
+                        chunk["image_description"] = analyzed_pages[page_idx]
+                        continue
+                    try:
+                        ch_title = chunk.get("chapter_title") or ""
+                        sec_title = chunk.get("section_title") or ""
+                        hint = f"{ch_title} {sec_title}".strip()
+                        desc = analyze_pdf_page_images(
+                            str(file_path),
+                            page_idx,
+                            api_key=_img_api_key,
+                            base_url=_img_base_url,
+                            model=IMAGE_ANALYSIS_MODEL,
+                            context_hint=hint,
+                        )
+                        analyzed_pages[page_idx] = desc
+                        chunk["image_description"] = desc
+                        if desc:
+                            logger.debug(
+                                "Page %d image: %s...", p_start, desc[:80]
+                            )
+                    except Exception as _img_exc:
+                        logger.warning(
+                            "Image analysis failed for page %d: %s",
+                            p_start, _img_exc,
+                        )
 
         texts = [
             chunk["text"]
@@ -1090,6 +1169,8 @@ class RAGPipeline:
             ),
             "kb_version": new_kb_state.version,
             "indexes_consistent": new_kb_state.indexes_consistent,
+            "chunks_with_images": sum(1 for c in new_chunks if c.get("has_images", False)),
+            "chunks_with_images_described": sum(1 for c in new_chunks if c.get("image_description")),
         }
 
     # ==================================================================
@@ -1168,59 +1249,50 @@ class RAGPipeline:
     def _build_chunk_metadata(
         chunk: dict[str, Any],
     ) -> dict[str, Any]:
+        filename = (
+            chunk.get("book_name")
+            or chunk.get("filename")
+            or ""
+        )
+        book_title = (
+            chunk.get("book_title")
+            or chunk.get("book_name")
+            or (Path(filename).stem if filename else "")
+        )
+        section = (
+            chunk.get("section_title")
+            or chunk.get("section_heading")
+            or ""
+        )
+        page_start = chunk.get("page_start") or chunk.get("page_number") or 0
+        page_end = chunk.get("page_end") or page_start
         meta = {
-            "filename": chunk.get(
-                "filename",
-                "",
-            ),
-            "chunk_id": chunk.get(
-                "chunk_id",
-                0,
-            ),
-            "source_path": chunk.get(
-                "source_path",
-                "",
-            ),
-            "category": chunk.get(
-                "category",
-                "",
-            )
-            or "",
-            "section_heading": chunk.get(
-                "section_heading",
-                "",
-            )
-            or "",
-            "section_path": str(
-                chunk.get(
-                    "section_path",
-                    [],
-                )
-            ),
-            "section_level": chunk.get(
-                "section_level",
-                0,
-            ),
-            "chunk_index": chunk.get(
-                "chunk_index",
-                0,
-            ),
-            "total_section_chunks": chunk.get(
-                "total_section_chunks",
-                0,
-            ),
-            "file_type": chunk.get(
-                "file_type",
-                "",
-            )
-            or Path(chunk.get("filename", "")).suffix.lstrip(".").lower()
-            or "txt",
-            "page_number": int(
-                chunk.get(
-                    "page_number",
-                    0,
-                )
-                or 0
+            "filename": filename,
+            "book_title": book_title,
+            "book_name": filename,
+            "book_id": chunk.get("book_id", ""),
+            "chapter_num": chunk.get("chapter_num") or 0,
+            "chapter_title": chunk.get("chapter_title") or "",
+            "section_heading": section,
+            "section_title": section,
+            "page_start": page_start,
+            "page_end": page_end,
+            "page_number": int(page_start or 0),
+            "token_count": chunk.get("token_count") or 0,
+            "character_count": len(chunk.get("text", "")),
+            "chunk_id": chunk.get("chunk_id", 0),
+            "chunk_index": chunk.get("chunk_index", 0),
+            "prev_chunk_id": chunk.get("prev_chunk_id") or "",
+            "next_chunk_id": chunk.get("next_chunk_id") or "",
+            "source_path": chunk.get("source_path", ""),
+            "category": chunk.get("category", "") or "",
+            "section_path": str(chunk.get("section_path", [])),
+            "section_level": chunk.get("section_level", 0),
+            "total_section_chunks": chunk.get("total_section_chunks", 0),
+            "file_type": (
+                chunk.get("file_type")
+                or Path(filename).suffix.lstrip(".").lower()
+                or "pdf"
             ),
         }
 
@@ -1542,6 +1614,7 @@ class RAGPipeline:
         )
         need_bm25 = retrieval_mode in {"bm25", "hybrid"}
 
+        _retrieval_t0 = __import__("time").perf_counter()
         if retrieval_mode == "hybrid" and need_dense:
             # CONCURRENT PATH: embed + bm25-tokenize in parallel
             _embed_result: list | None = None
@@ -2009,11 +2082,13 @@ class RAGPipeline:
             Any,
         ] = {}
 
+        _llm_t0 = __import__("time").perf_counter()
         raw_answer = self._ask_llm(
             question,
             context,
             trace=generation_trace,
         )
+        _llm_ms = (__import__("time").perf_counter() - _llm_t0) * 1000
 
         # --------------------------------------------------------------
         # CHECK IF LLM FAILED - Skip citation/confidence if so
@@ -2096,6 +2171,7 @@ class RAGPipeline:
             "removed_chunks": opt_result["removed"],
         }
 
+        _retrieval_ms = (__import__("time").perf_counter() - _retrieval_t0) * 1000 - _llm_ms
         return {
             "answer": answer,
             "raw_answer": raw_answer,
@@ -2130,6 +2206,10 @@ class RAGPipeline:
                 "retrieval": {
                     "mode": retrieval_mode,
                     "selected_mode": retrieval_mode,
+                    "retrieval_ms": round(_retrieval_ms, 2),
+                    "llm_ms": round(_llm_ms, 2),
+                    "retrieval_ms": round(_retrieval_ms, 2),
+                    "llm_ms": round(_llm_ms, 2),
                     "candidate_count": len(
                         candidates
                     ),
