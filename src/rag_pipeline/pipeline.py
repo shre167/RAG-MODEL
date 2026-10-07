@@ -560,15 +560,38 @@ class RAGPipeline:
     # INGESTION
     # ==================================================================
 
+    def _reset_retrieval_indexes(self) -> None:
+        """Clear stale vector + BM25 state before a full rebuild."""
+        try:
+            if hasattr(self.vector_store, "clear_collection"):
+                self.vector_store.clear_collection()
+                logger.info("Full rebuild: cleared Chroma collection before re-indexing.")
+        except Exception as exc:
+            logger.warning("Full rebuild: could not clear Chroma collection before re-index: %s", exc)
+
+        if self.bm25 is not None:
+            try:
+                self.bm25._chunks = []
+                self.bm25._tokenized = []
+                self.bm25._bm25 = None
+                self.bm25._document_hashes = {}
+                self.bm25.save_index()
+                logger.info("Full rebuild: cleared BM25 index before re-indexing.")
+            except Exception as exc:
+                logger.warning("Full rebuild: could not clear BM25 index before re-index: %s", exc)
+
     def ingest_documents(
         self,
     ) -> dict[str, Any]:
         """
-        Incrementally ingest all documents.
+        Rebuild the full knowledge-base index from the current chunk strategy.
 
-        Existing chunk IDs are preserved. Only missing chunks are
-        embedded and added to Chroma.
+        This is intentionally a clean rebuild so stale chunks from previous
+        chunking policies are not left behind in Chroma or BM25 and the two
+        indexes cannot drift apart.
         """
+
+        self._reset_retrieval_indexes()
 
         if not self.knowledge_base_path.exists():
             self.knowledge_base_path.mkdir(
@@ -973,6 +996,12 @@ class RAGPipeline:
                         analyzed_pages[page_idx] = desc
                         chunk["image_description"] = desc
                         if desc:
+                            chunk["text"] = (
+                                (chunk.get("text") or "")
+                                + "\n\n[Visual content on this page: "
+                                + desc
+                                + "]"
+                            ).strip()
                             logger.debug(
                                 "Page %d image: %s...", p_start, desc[:80]
                             )

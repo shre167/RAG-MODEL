@@ -387,9 +387,9 @@ def build_context(
             candidate.filename
             or candidate.metadata.get(
                 "filename",
-                "unknown",
+                "",
             )
-            or "unknown"
+            or ""
         )
 
         metadata = candidate.metadata or {}
@@ -407,19 +407,22 @@ def build_context(
         book_title = (
             metadata.get("book_title")
             or metadata.get("book_name")
+            or metadata.get("source_name")
             or filename
+            or "Untitled document"
         )
         if book_title.lower().endswith(".pdf"):
             clean_title = book_title[:-4].replace(" (1)", "").strip()
         else:
             clean_title = book_title.replace(" (1)", "").strip()
+        clean_title = clean_title or "Untitled document"
 
         chapter_num = metadata.get("chapter_num")
         page_start = metadata.get("page_start") or page_number
         page_end = metadata.get("page_end") or page_start
 
         parts = []
-        if clean_title and clean_title != "unknown":
+        if clean_title and clean_title != "Untitled document":
             parts.append(clean_title)
         if chapter_num and int(chapter_num) > 0:
             parts.append(f"Chapter {chapter_num}")
@@ -432,7 +435,7 @@ def build_context(
         if parts:
             source_display = " — ".join(parts)
         else:
-            source_display = filename if filename != "unknown" else "Mind Management, Not Time Management"
+            source_display = filename or "Untitled document"
 
         if source_display not in seen_sources:
             seen_sources.add(source_display)

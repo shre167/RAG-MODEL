@@ -14,6 +14,40 @@ from typing import Any, Iterable
 import fitz  # PyMuPDF
 
 
+def _configure_tesseract_path() -> None:
+    """Point pytesseract at the installed Windows Tesseract binary if present."""
+    try:
+        import pytesseract
+    except Exception:
+        return
+
+    candidates = []
+
+    env_tess = os.getenv("TESSERACT_PATH")
+    if env_tess:
+        candidates.append(Path(env_tess))
+
+    candidates.extend(
+        [
+            Path(r"C:\Users\shrsamal\AppData\Local\Programs\Tesseract-OCR\tesseract.exe"),
+            Path(r"C:\Program Files\Tesseract-OCR\tesseract.exe"),
+            Path(r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe"),
+        ]
+    )
+
+    for exe in candidates:
+        if exe and exe.exists():
+            exe_dir = str(exe.parent)
+            current_path = os.environ.get("PATH", "")
+            if exe_dir not in current_path.split(os.pathsep):
+                os.environ["PATH"] = exe_dir + os.pathsep + current_path
+            pytesseract.pytesseract.tesseract_cmd = str(exe)
+            return
+
+
+_configure_tesseract_path()
+
+
 BASE_DIR = Path(__file__).resolve().parent.parent
 KNOWLEDGE_BASE_DIR = BASE_DIR / "knowledge_base"
 
@@ -55,10 +89,12 @@ OCR_MIN_TEXT_CHARS = int(
 )
 
 # Optional tokenizer.
-TOKENIZER_NAME = os.getenv(
-    "CHUNK_TOKENIZER",
-    "BAAI/bge-small-en-v1.5"
-).strip()
+# Do not default to a remote Hugging Face model because some environments
+# (corporate proxies, self-signed certs, or no internet access) fail while
+# downloading model metadata. If a local tokenizer is needed, set
+# CHUNK_TOKENIZER to a cached local model name; otherwise keep it empty to
+# skip remote downloads and use the conservative fallback token counting path.
+TOKENIZER_NAME = os.getenv("CHUNK_TOKENIZER", "").strip()
 
 
 # ============================================================
@@ -74,9 +110,14 @@ _PAGE_NUMBER_RE = re.compile(
     re.IGNORECASE,
 )
 
+_CHAPTER_NUMBER_TOKEN = (
+    r"(?:\d{1,3}|[ivxlcdm]{1,8}|one|two|three|four|five|six|seven|eight|nine|ten|"
+    r"eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen|twenty)"
+)
+
 _CHAPTER_RE = re.compile(
     r"^(?:chapter|ch\.)\s+"
-    r"(\d{1,3}|[ivxlcdm]{1,8})"
+    rf"({_CHAPTER_NUMBER_TOKEN})"
     r"\s*"
     r"[:.\-\u2013\u2014]?\s*"
     r"(.*)$",
@@ -85,7 +126,7 @@ _CHAPTER_RE = re.compile(
 
 _BARE_CHAPTER_RE = re.compile(
     r"^(?:chapter|ch\.)\s+"
-    r"(\d{1,3}|[ivxlcdm]{1,8})"
+    rf"({_CHAPTER_NUMBER_TOKEN})"
     r"\s*$",
     re.IGNORECASE,
 )
@@ -159,6 +200,10 @@ def _get_tokenizer():
         return _TOKENIZER
 
     if _TOKENIZER_FAILED:
+        return None
+
+    if not TOKENIZER_NAME:
+        _TOKENIZER_FAILED = True
         return None
 
     try:
@@ -980,6 +1025,31 @@ def _parse_chapter_number(value: str) -> int | None:
     if value.isdigit():
         return int(value)
 
+    word_map = {
+        "one": 1,
+        "two": 2,
+        "three": 3,
+        "four": 4,
+        "five": 5,
+        "six": 6,
+        "seven": 7,
+        "eight": 8,
+        "nine": 9,
+        "ten": 10,
+        "eleven": 11,
+        "twelve": 12,
+        "thirteen": 13,
+        "fourteen": 14,
+        "fifteen": 15,
+        "sixteen": 16,
+        "seventeen": 17,
+        "eighteen": 18,
+        "nineteen": 19,
+        "twenty": 20,
+    }
+    if value in word_map:
+        return word_map[value]
+
     roman_map = {
         "i": 1,
         "ii": 2,
@@ -1776,11 +1846,24 @@ def _flush_chunk(
         for paragraph in paragraphs
     )
 
+    book_title = _humanize_book_title(book_name)
+    chunk_label = _make_source_label(
+        book_title,
+        chapter_num,
+        chapter_title,
+        chunk_section_title,
+        page_start,
+        page_end,
+    )
+
     chunks.append(
         {
             "text": text,
             "book_id": book_id,
             "book_name": book_name,
+            "book_title": book_title,
+            "source_name": book_name,
+            "source_label": chunk_label,
             "chapter_num": chapter_num,
             "chapter_title": chapter_title,
             "section_title": chunk_section_title,
@@ -1903,6 +1986,57 @@ def _book_id_from_path(
     return stem or "book"
 
 
+def _humanize_book_title(book_name: str | None) -> str:
+    """Turn a filename into a clean, generic book title without hardcoded titles."""
+    if not book_name:
+        return "Untitled document"
+
+    text = Path(str(book_name)).stem
+    text = text.replace("_", " ").replace("-", " ")
+    text = re.sub(r"^(?:epdf\.pub|pdf|book|document|upload|uploaded|kb)\s*", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"\s+", " ", text).strip()
+    if not text:
+        return "Untitled document"
+    return text
+
+
+def _make_source_label(
+    book_title: str | None,
+    chapter_num: int | None,
+    chapter_title: str | None,
+    section_title: str | None,
+    page_start: int | None,
+    page_end: int | None,
+) -> str:
+    """Create a readable source label without falling back to a specific book name."""
+    title = _humanize_book_title(book_title) if book_title else "Untitled document"
+    parts: list[str] = []
+
+    if title and title.lower() != "untitled document":
+        parts.append(title)
+
+    if chapter_num and chapter_num > 0:
+        chapter_ref = f"Chapter {chapter_num}"
+        if chapter_title and chapter_title.strip():
+            chapter_ref = f"{chapter_ref}: {chapter_title.strip()}"
+        parts.append(chapter_ref)
+    elif chapter_title and chapter_title.strip():
+        parts.append(chapter_title.strip())
+
+    if section_title and section_title.strip():
+        parts.append(section_title.strip())
+
+    if page_start and page_start > 0:
+        if page_end and page_end > page_start:
+            parts.append(f"Pages {page_start}-{page_end}")
+        else:
+            parts.append(f"Page {page_start}")
+
+    if not parts:
+        return "Untitled document"
+    return " — ".join(parts)
+
+
 def _chunk_book(
     pages: list[dict[str, Any]],
     book_path: Path,
@@ -1959,6 +2093,8 @@ def _chunk_book(
         if start_index is not None:
             break
 
+    fallback_to_plain_text = False
+
     if start_index is None:
         print(
             f"[CHUNK] Warning: could not identify "
@@ -1970,12 +2106,14 @@ def _chunk_book(
         for index, page in enumerate(pages):
             if len(page.get("text", "").strip()) >= 300:
                 start_index = index
+                fallback_to_plain_text = True
                 break
 
     if start_index is None:
         return []
 
     pages = pages[start_index:]
+    allow_unstructured_content = fallback_to_plain_text
 
     # --------------------------------------------------------
     # Build vocabulary for conservative dehyphenation.
@@ -2134,11 +2272,19 @@ def _chunk_book(
             continue
 
         # ----------------------------------------------------
-        # Ignore anything before Chapter 1.
+        # Ignore anything before Chapter 1, unless the PDF has no
+        # recognizable chapter structure at all. In that case, start
+        # chunking from the first substantial page rather than dropping
+        # the entire document.
         # ----------------------------------------------------
 
         if current_chapter is None:
-            continue
+            if allow_unstructured_content:
+                current_chapter = 1
+                current_chapter_title = None
+                allow_unstructured_content = False
+            else:
+                continue
 
         # ----------------------------------------------------
         # Section heading.
@@ -2789,8 +2935,39 @@ def chunk_to_chroma_record(
         "source": chunk.get(
             "source",
             chunk.get(
-                "book_id",
+                "source_name",
+                chunk.get(
+                    "book_name",
+                    chunk.get(
+                        "book_id",
+                        "",
+                    ),
+                ),
+            ),
+        ),
+        "source_name": chunk.get(
+            "source_name",
+            chunk.get(
+                "book_name",
                 "",
+            ),
+        ),
+        "book_title": chunk.get(
+            "book_title",
+            chunk.get(
+                "book_name",
+                "",
+            ),
+        ),
+        "source_label": chunk.get(
+            "source_label",
+            _make_source_label(
+                chunk.get("book_title") or chunk.get("book_name"),
+                chunk.get("chapter_num"),
+                chunk.get("chapter_title"),
+                chunk.get("section_title"),
+                chunk.get("page_start"),
+                chunk.get("page_end"),
             ),
         ),
         "chunk_index": int(

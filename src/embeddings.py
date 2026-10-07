@@ -251,6 +251,8 @@ class EmbeddingService:
 
         self.dimension: Optional[int] = None
 
+        self._validate_model_endpoint_pair()
+
         # ==============================================================
         # LOCAL EMBEDDING MODE
         # ==============================================================
@@ -431,6 +433,34 @@ class EmbeddingService:
 
                 self._client = None
 
+    def _validate_model_endpoint_pair(self) -> None:
+        """Apply only the checks that are actually supported by this endpoint.
+
+        The Capgemini OpenAI-compatible endpoint is known to accept the Titan
+        embedding model, so rejecting it here causes a false negative and blocks
+        real semantic embeddings.
+        """
+        model_name = (self.model or "").lower()
+        base = (self.base_url or "").lower()
+
+        if not model_name or not base:
+            return
+
+        has_capgemini_openai_endpoint = (
+            "openai.generative.engine.capgemini.com" in base
+            or "generative.engine.capgemini.com" in base
+        )
+        is_aws_titan_embedding = "amazon.titan-embed" in model_name
+
+        # Verified against the live Capgemini endpoint: Titan embeddings are
+        # allowed there. Do not raise an incompatibility error for this pair.
+        if has_capgemini_openai_endpoint and is_aws_titan_embedding:
+            logger.info(
+                "Capgemini OpenAI-compatible endpoint accepted Titan embedding model '%s'.",
+                self.model,
+            )
+            return
+
     # ==================================================================
     # SINGLE EMBEDDING
     # ==================================================================
@@ -514,12 +544,24 @@ class EmbeddingService:
                     self.model,
                     exc,
                 )
+                raise RuntimeError(
+                    f"Embedding model '{self.model}' failed on the configured endpoint "
+                    f"'{self.base_url}'. Check the API key, model access, and provider permissions."
+                ) from exc
 
-                return None
-
-        return self._requests_embed_single(
-            text
-        )
+        try:
+            return self._requests_embed_single(text)
+        except Exception as exc:
+            logger.error(
+                "Raw embedding request failed for model '%s' on '%s': %s",
+                self.model,
+                self.base_url,
+                exc,
+            )
+            raise RuntimeError(
+                f"Embedding model '{self.model}' failed on the configured endpoint "
+                f"'{self.base_url}'. Check the API key, model access, and provider permissions."
+            ) from exc
 
     # ==================================================================
     # BATCH EMBEDDING
@@ -567,13 +609,33 @@ class EmbeddingService:
 
         if self._client is not None:
 
-            return self._client_embed_batch(
-                texts
-            )
+            try:
+                return self._client_embed_batch(texts)
+            except Exception as exc:
+                logger.error(
+                    "Remote batch embedding failed for model '%s' on '%s': %s",
+                    self.model,
+                    self.base_url,
+                    exc,
+                )
+                raise RuntimeError(
+                    f"Embedding model '{self.model}' failed on the configured endpoint "
+                    f"'{self.base_url}'. Check the API key, model access, and provider permissions."
+                ) from exc
 
-        return self._requests_embed_batch(
-            texts
-        )
+        try:
+            return self._requests_embed_batch(texts)
+        except Exception as exc:
+            logger.error(
+                "Remote batch requests failed for model '%s' on '%s': %s",
+                self.model,
+                self.base_url,
+                exc,
+            )
+            raise RuntimeError(
+                f"Embedding model '{self.model}' failed on the configured endpoint "
+                f"'{self.base_url}'. Check the API key, model access, and provider permissions."
+            ) from exc
 
     # ==================================================================
     # LOCAL EMBEDDINGS

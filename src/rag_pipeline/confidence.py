@@ -36,24 +36,33 @@ def evaluate_confidence(
     # not enter this calculation: a popular-but-wrong passage must not raise
     # confidence. Claim verification is the largest component.
     raw_confidence_score = (
-        (direct_score * 0.35)
-        + (coverage_pct * 0.35)
+        (direct_score * 0.30)
+        + (coverage_pct * 0.40)
         + (sufficiency_score * 0.20)
         + (relevance_score * 0.10)
     )
 
-    # Unsupported claim penalty
-    if has_unsupported and citation_coverage.unsupported_claims > 0:
-        penalty = min(25.0, citation_coverage.unsupported_claims * 8.0)
-        raw_confidence_score = max(15.0, raw_confidence_score - penalty)
+    # Unsupported claim penalty.
+    #
+    # This is proportional to the SHARE of claims that are unsupported,
+    # not the raw count. A flat per-claim penalty unfairly punishes
+    # detailed answers: an answer with 11 extracted claims and 4
+    # unsupported ones is not automatically worse than a 4-claim answer
+    # with 4 unsupported ones, but a flat count-based penalty scored
+    # them identically (both hit the floor). Scaling by ratio preserves
+    # the ability to distinguish "mostly right" from "mostly wrong."
+    if has_unsupported:
+        total_claims = max(1, citation_coverage.total_claims)
+        unsupported_ratio = citation_coverage.unsupported_claims / total_claims
+        penalty = unsupported_ratio * 40.0
+        raw_confidence_score = raw_confidence_score - penalty
 
     final_score = round(max(5.0, min(100.0, raw_confidence_score)), 1)
 
     # Determine confidence tier
-    unsupported_count = getattr(citation_coverage, "unsupported_claims", 0)
-    if (final_score >= 68.0 or (evidence_level == "strong" and final_score >= 60.0)) and unsupported_count == 0 and direct_score >= 48.0:
+    if final_score >= 78.0 and not has_unsupported and direct_score >= 65.0:
         level = "HIGH"
-    elif final_score >= 42.0 or (evidence_level in ("strong", "moderate") and direct_score >= 40.0 and unsupported_count <= 1):
+    elif final_score >= 50.0:
         level = "MEDIUM"
     else:
         level = "LOW"

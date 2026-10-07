@@ -162,6 +162,17 @@ class ChromaVectorStore:
     def delete_collection(self) -> None:
         """Explicit collection deletion — never called automatically by this class."""
         self.client.delete_collection(name=self.collection_name)
+        self.collection = self.client.get_or_create_collection(name=self.collection_name)
+
+    def clear_collection(self) -> None:
+        """Remove every document from the current collection without recreating the DB."""
+        try:
+            ids = self.collection.get(include=[]).get("ids", [])
+            if ids:
+                self.collection.delete(ids=ids)
+        except Exception as exc:
+            logger.warning("Could not clear collection %s by IDs: %s", self.collection_name, exc)
+            self.delete_collection()
 
     def get_collection_count(self) -> int:
         return self.collection.count()

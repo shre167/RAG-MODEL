@@ -41,10 +41,12 @@ def render_comparison_page(pipeline: RAGPipeline) -> None:
 def _normalize_chunk(c: dict[str, Any], index: int = 0) -> dict[str, Any]:
     """Ensure all required canonical metadata fields are present."""
     text = str(c.get("text") or "").strip()
-    filename = str(c.get("filename") or c.get("book_name") or "Mind Management, Not Time Management (1).pdf")
-    book_title = str(c.get("book_title") or c.get("book") or "Mind Management, Not Time Management")
+    filename = str(c.get("filename") or c.get("book_name") or c.get("source_name") or "untitled_document.pdf")
+    book_title = str(c.get("book_title") or c.get("book") or c.get("source_label") or "Untitled document")
     if book_title.lower().endswith(".pdf"):
         book_title = book_title[:-4].replace(" (1)", "").strip()
+    if not book_title.strip():
+        book_title = "Untitled document"
 
     ch_num = c.get("chapter_num")
     try:
@@ -72,7 +74,7 @@ def _normalize_chunk(c: dict[str, Any], index: int = 0) -> dict[str, Any]:
         "book_title": book_title,
         "book_name": filename,
         "filename": filename,
-        "book_id": str(c.get("book_id") or "mind_management_not_time_management_1"),
+        "book_id": str(c.get("book_id") or "untitled_document_1"),
         "chapter_num": ch_int,
         "chapter": ch_int if ch_int > 0 else None,
         "chapter_title": str(c.get("chapter_title") or "").strip(),
