@@ -484,7 +484,7 @@ def _compute_chunks(
             if cached and isinstance(cached, list):
                 for c in cached:
                     if not c.get("filename"):
-                        c["filename"] = c.get("book_name") or "Mind Management, Not Time Management (1).pdf"
+                        c["filename"] = c.get("book_name") or "untitled_document.pdf"
                 return [c for c in cached if (c.get("text") or "").strip()]
         except Exception:
             pass
@@ -499,7 +499,7 @@ def _compute_chunks(
 
     for c in chunks:
         if not c.get("filename"):
-            c["filename"] = c.get("book_name") or "Mind Management, Not Time Management (1).pdf"
+            c["filename"] = c.get("book_name") or "untitled_document.pdf"
 
     return [c for c in chunks if (c.get("text") or "").strip()]
 
@@ -623,7 +623,7 @@ def _build_meta(response: dict, requested_mode: str) -> dict:
 def _render_chunk_list(chunks: list, mode_label: str = "") -> None:
     """Render chunks exposing complete canonical metadata and clean formatting."""
     for index, chunk in enumerate(chunks, start=1):
-        book = chunk.get("book") or chunk.get("book_title") or "Mind Management, Not Time Management"
+        book = chunk.get("book") or chunk.get("book_title") or "Unknown book"
         chunk_id = chunk.get("chunk_id") or f"chunk_{index}"
         ch = chunk.get("chapter") or chunk.get("chapter_num")
         ch_str = f"Chapter {ch}" if ch and int(ch) > 0 else ""

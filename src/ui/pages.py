@@ -127,18 +127,42 @@ def render_chunk_explorer(chunks: list[dict[str, Any]], pipeline: Any = None) ->
 
     # Normalize all chunks
     normalized_chunks = [_normalize_chunk(c, i) for i, c in enumerate(chunks)]
-    normalized_chunks.sort(key=lambda x: x["chunk_index"])
+    normalized_chunks.sort(key=lambda x: (x["book_title"], x["chapter_num"] or 0, x["chunk_index"]))
     chunk_by_id = {c["chunk_id"]: c for c in normalized_chunks}
+
+    all_books = sorted({c["book_title"] for c in normalized_chunks if c["book_title"]})
+    if "book_hierarchy_selected_book" not in st.session_state:
+        st.session_state.book_hierarchy_selected_book = "All books" if all_books else ""
+
+    if all_books:
+        book_options = ["All books"] + all_books
+        selected_book = st.selectbox(
+            "Book",
+            options=book_options,
+            index=book_options.index(st.session_state.book_hierarchy_selected_book) if st.session_state.book_hierarchy_selected_book in book_options else 0,
+            key="book_hierarchy_book_selector",
+        )
+        st.session_state.book_hierarchy_selected_book = selected_book
+    else:
+        selected_book = "All books"
+
+    filtered_chunks = [
+        c for c in normalized_chunks
+        if selected_book == "All books" or c["book_title"] == selected_book
+    ]
+    if not filtered_chunks:
+        st.warning("No chunks available for the selected book.")
+        return
 
     # =========================================================================
     # 1. SUMMARY
     # =========================================================================
     render_html(render_section_title("Canonical Chunks Summary"))
 
-    total_chunks = len(normalized_chunks)
-    chapters = sorted({c["chapter_num"] for c in normalized_chunks if c["chapter_num"] > 0})
-    sections = {c["section"] for c in normalized_chunks if c["section"] and c["section"] != "General"}
-    tokens = [c["token_count"] for c in normalized_chunks]
+    total_chunks = len(filtered_chunks)
+    chapters = sorted({c["chapter_num"] for c in filtered_chunks if c["chapter_num"] > 0})
+    sections = {c["section"] for c in filtered_chunks if c["section"] and c["section"] != "General"}
+    tokens = [c["token_count"] for c in filtered_chunks]
     avg_tokens = round(sum(tokens) / len(tokens)) if tokens else 0
     min_tokens = min(tokens) if tokens else 0
     max_tokens = max(tokens) if tokens else 0
@@ -264,10 +288,12 @@ def render_chunk_explorer(chunks: list[dict[str, Any]], pipeline: Any = None) ->
 
     # Manage selected chunk in session state
     if "selected_chunk_id" not in st.session_state:
-        st.session_state.selected_chunk_id = normalized_chunks[0]["chunk_id"]
+        st.session_state.selected_chunk_id = filtered_chunks[0]["chunk_id"]
+    if st.session_state.selected_chunk_id not in {c["chunk_id"] for c in filtered_chunks}:
+        st.session_state.selected_chunk_id = filtered_chunks[0]["chunk_id"]
 
     for ch in chapters:
-        ch_chunks = [c for c in normalized_chunks if c["chapter_num"] == ch]
+        ch_chunks = [c for c in filtered_chunks if c["chapter_num"] == ch]
         ch_title = next((c["chapter_title"] for c in ch_chunks if c["chapter_title"]), "")
         title_str = f" — {ch_title}" if ch_title else ""
 
@@ -298,8 +324,8 @@ def render_chunk_explorer(chunks: list[dict[str, Any]], pipeline: Any = None) ->
 
     # Direct chunk selector dropdown for convenience
     chunk_options = {
-        f"Chunk {c['chunk_index']:03d} | Ch. {c['chapter_num']} | pp. {c['page_range']} | {c['section'][:30]}": c["chunk_id"]
-        for c in normalized_chunks
+        f"{c['book_title']} | Chunk {c['chunk_index']:03d} | Ch. {c['chapter_num']} | pp. {c['page_range']} | {c['section'][:30]}": c["chunk_id"]
+        for c in filtered_chunks
     }
     opt_labels = list(chunk_options.keys())
     opt_ids = list(chunk_options.values())
@@ -312,7 +338,7 @@ def render_chunk_explorer(chunks: list[dict[str, Any]], pipeline: Any = None) ->
         key="direct_chunk_selector",
     )
     st.session_state.selected_chunk_id = chunk_options[selected_label]
-    selected_chunk = chunk_by_id.get(st.session_state.selected_chunk_id, normalized_chunks[0])
+    selected_chunk = chunk_by_id.get(st.session_state.selected_chunk_id, filtered_chunks[0])
 
     # Display clear Chunk Details Panel
     det_c1, det_c2, det_c3, det_c4 = st.columns(4)
