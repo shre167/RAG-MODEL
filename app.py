@@ -296,6 +296,37 @@ def _dataframe(rows) -> None:
     st.dataframe(rows, hide_index=True, **WIDE)
 
 
+def _extract_metadata(row: dict) -> dict:
+    """Extract book, chapter, section metadata from a retrieval result row."""
+    # Book
+    book = row.get("book_title") or row.get("book") or ""
+    if not book and row.get("filename"):
+        book = Path(row.get("filename")).stem
+    book = book.replace(" (1)", "").replace("_", " ").strip() or "Unknown"
+    
+    # Chapter
+    chapter = row.get("chapter")
+    if not chapter:
+        ch_num = row.get("chapter_num")
+        if ch_num is not None:
+            try:
+                ch_int = int(ch_num)
+                chapter = f"Ch. {ch_num}" if ch_int > 0 else ("Intro" if ch_int == 0 else "-")
+            except (ValueError, TypeError):
+                chapter = "-"
+        else:
+            chapter = "-"
+    
+    # Section
+    section = row.get("section_heading") or ""
+    
+    return {
+        "book": book,
+        "chapter": chapter,
+        "section": section,
+    }
+
+
 def _segmented_control(options: list, default: str, key: str) -> str:
     """
     Render a real segmented control.
@@ -505,7 +536,37 @@ def _compute_chunks(
 
 
 def _load_chunks(pipeline: RAGPipeline) -> list:
-    """Cached chunk preview for the knowledge base."""
+    """Load all chunks for inspection, prioritizing the live ingested database (Chroma)."""
+    # 1. Prioritize live Chroma vector store so all ingested books and chapters appear
+    if pipeline and hasattr(pipeline, "vector_store"):
+        try:
+            cnt = pipeline.vector_store.get_collection_count()
+            if cnt > 0:
+                data = pipeline.vector_store.collection.get(include=["documents", "metadatas"])
+                if data and data.get("ids"):
+                    chroma_chunks = []
+                    ids = data["ids"]
+                    docs = data.get("documents") or []
+                    metas = data.get("metadatas") or []
+                    for i, cid in enumerate(ids):
+                        m = metas[i] if i < len(metas) and isinstance(metas[i], dict) else {}
+                        doc = docs[i] if i < len(docs) and docs[i] else ""
+                        fn = m.get("filename") or m.get("book_name") or ""
+                        bt = m.get("book_title") or m.get("book") or (Path(fn).stem if fn else "")
+                        chroma_chunks.append({
+                            **m,
+                            "chunk_id": cid,
+                            "text": doc,
+                            "filename": fn,
+                            "book_title": bt,
+                            "book": bt,
+                        })
+                    if chroma_chunks:
+                        return chroma_chunks
+        except Exception:
+            pass
+
+    # 2. Fallback to cache or on-demand chunking
     kb_path = Path(KNOWLEDGE_BASE_DIR)
     size, overlap = _chunk_config(pipeline)
 
@@ -1496,6 +1557,7 @@ def _render_retrieval_lab(response) -> None:
         )
 
     _lab_section_evidence(snapshot.get("evidence", {}))
+    _lab_section_retrieval_breakdown(response)
     _lab_section_context(trace, snapshot.get("context", {}))
     _lab_section_generation(snapshot.get("generation", {}))
     _lab_section_grounding_chain(snapshot.get("query", {}), snapshot.get("grounding", {}))
@@ -2023,6 +2085,7 @@ def _lab_section_dense(retrieval: dict) -> None:
     _dataframe([
             {
                 "Rank": row.get("rank"),
+                **_extract_metadata(row),
                 "Source": row.get("filename"),
                 "Chunk": row.get("chunk_id"),
                 "Distance": row.get("distance"),
@@ -2050,6 +2113,7 @@ def _lab_section_bm25(retrieval: dict) -> None:
     _dataframe([
             {
                 "Rank": row.get("rank"),
+                **_extract_metadata(row),
                 "Source": row.get("filename"),
                 "Chunk": row.get("chunk_id"),
                 "BM25 score": row.get("score"),
@@ -2085,6 +2149,7 @@ def _lab_section_rrf(retrieval: dict) -> None:
     _dataframe([
             {
                 "Final rank": row.get("final_rank"),
+                **_extract_metadata(row),
                 "Source": row.get("filename"),
                 "Chunk": row.get("chunk_id"),
                 "Dense rank": row.get("dense_rank"),
@@ -2171,6 +2236,44 @@ def _lab_section_evidence(evidence: dict) -> None:
         "score. An RRF score is a rank-fusion weight and says nothing "
         "about how well the evidence supports an answer."
     )
+
+
+def _lab_section_retrieval_breakdown(response: dict) -> None:
+    """Display retrieved evidence summary by book and chapter."""
+    observation = response.get("observation", {})
+    breakdown = observation.get("retrieval_breakdown", {})
+    
+    if not breakdown or not breakdown.get("breakdown"):
+        return
+    
+    render_html(render_section_title("Retrieved Evidence Summary"))
+    
+    # Display summary stats
+    col1, col2 = st.columns(2)
+    col1.metric("Books Retrieved", breakdown.get("total_books", 0))
+    col2.metric("Chapters Retrieved", breakdown.get("total_chapters", 0))
+    
+    # Display breakdown table
+    breakdown_items = breakdown.get("breakdown", [])
+    if breakdown_items:
+        breakdown_rows = []
+        for item in breakdown_items:
+            ch_num = item.get("chapter")
+            try:
+                ch_int = int(ch_num) if ch_num is not None else None
+                chapter_display = f"Ch. {ch_num}" if ch_int and ch_int > 0 else ("Intro" if ch_int == 0 else "-")
+            except (ValueError, TypeError):
+                chapter_display = "-"
+            
+            breakdown_rows.append({
+                "Book": item.get("book", "Unknown"),
+                "Chapter": chapter_display,
+                "Chapter Title": item.get("chapter_title", ""),
+                "# Chunks": item.get("chunk_count", 0),
+            })
+        st.dataframe(breakdown_rows, use_container_width=True, hide_index=True)
+    else:
+        st.info("No retrieval breakdown available.")
 
 
 def _lab_section_context(trace: dict, context: dict) -> None:
@@ -2330,16 +2433,23 @@ def _render_chunk_monitor(pipeline: RAGPipeline) -> None:
                     p_start = meta.get("page_start") or meta.get("page_number")
                     p_end = meta.get("page_end") or p_start
                     p_str = f"{p_start}–{p_end}" if p_end and p_end != p_start else (str(p_start) if p_start else "-")
-                    ch_num = meta.get("chapter_num")
-                    ch_str = f"Ch. {ch_num}" if ch_num and int(ch_num) > 0 else "-"
+                    ch_num = meta.get("chapter_num") if meta.get("chapter_num") is not None else meta.get("chapter")
+                    ch_str = f"Ch. {ch_num}" if ch_num and int(ch_num) > 0 else ("Intro/Front" if ch_num == 0 else "-")
+                    
+                    fn = meta.get("filename") or meta.get("book_name") or ""
+                    raw_b = meta.get("book_title") or meta.get("book") or (Path(fn).stem if fn else "Unknown")
+                    clean_b = str(raw_b).replace(" (1)", "").replace(".pdf", "").replace(".PDF", "").strip() or "Unknown"
+
                     chroma_rows.append({
                         "Chunk ID": meta.get("chunk_id") or cid,
-                        "Book": meta.get("book_title") or "Mind Management, Not Time Management",
+                        "Book": clean_b,
                         "Chapter": ch_str,
+                        "Chapter Num": int(ch_num) if ch_num is not None else 0,
+                        "Chapter Title": meta.get("chapter_title") or "",
                         "Section": meta.get("section_heading") or meta.get("section_title") or "-",
                         "Pages": p_str,
                         "Tokens": meta.get("token_count", 0),
-                        "Filename": meta.get("filename", ""),
+                        "Filename": fn,
                         "File Type": meta.get("file_type", "pdf"),
                         "Characters": len(doc),
                         "Preview": (doc[:130] + "...") if len(doc) > 130 else doc,
@@ -2347,16 +2457,24 @@ def _render_chunk_monitor(pipeline: RAGPipeline) -> None:
                         "_meta": meta,
                     })
 
-                filter_c1, filter_c2 = st.columns([7, 3])
+                filter_c1, filter_c2, filter_c3 = st.columns([4, 3, 3])
                 with filter_c1:
-                    search_chroma = st.text_input("Filter Chroma entries", placeholder="Filter by filename, chunk ID, or text...", key="chroma_filter")
+                    search_chroma = st.text_input("Filter Chroma entries", placeholder="Filter by text, chunk ID, section...", key="chroma_filter")
                 with filter_c2:
-                    file_types = sorted(list({r["File Type"] for r in chroma_rows if r["File Type"]}))
-                    type_filter = st.selectbox("File type", ["All"] + file_types, key="chroma_type_filter")
+                    chroma_books = sorted(list({r["Book"] for r in chroma_rows if r["Book"]}))
+                    book_filter = st.selectbox("Filter Book", ["All Books"] + chroma_books, key="chroma_book_filter")
+                with filter_c3:
+                    if book_filter != "All Books":
+                        avail_chs = sorted(list({r["Chapter"] for r in chroma_rows if r["Book"] == book_filter and r["Chapter"] != "-"}))
+                    else:
+                        avail_chs = sorted(list({r["Chapter"] for r in chroma_rows if r["Chapter"] != "-"}))
+                    chapter_filter = st.selectbox("Filter Chapter", ["All Chapters"] + avail_chs, key="chroma_chapter_filter")
 
                 filtered_chroma = chroma_rows
-                if type_filter != "All":
-                    filtered_chroma = [r for r in filtered_chroma if r["File Type"] == type_filter]
+                if book_filter != "All Books":
+                    filtered_chroma = [r for r in filtered_chroma if r["Book"] == book_filter]
+                if chapter_filter != "All Chapters":
+                    filtered_chroma = [r for r in filtered_chroma if r["Chapter"] == chapter_filter]
                 if search_chroma:
                     s_low = search_chroma.strip().lower()
                     filtered_chroma = [
@@ -2364,31 +2482,36 @@ def _render_chunk_monitor(pipeline: RAGPipeline) -> None:
                         if s_low in r["Chunk ID"].lower()
                         or s_low in r["Filename"].lower()
                         or s_low in r["_full_text"].lower()
-                        or s_low in str(r["Section Heading"]).lower()
+                        or s_low in str(r["Section"]).lower()
+                        or s_low in str(r["Book"]).lower()
                     ]
 
-                st.caption(f"Displaying {len(filtered_chroma)} of {len(chroma_rows)} vector chunks in Chroma")
+                st.caption(f"Displaying **{len(filtered_chroma)}** of **{len(chroma_rows)}** vector chunks in Chroma across **{len(chroma_books)}** book(s)")
                 _dataframe([
                     {
                         "Chunk ID": r["Chunk ID"],
                         "Book": r["Book"],
                         "Chapter": r["Chapter"],
+                        "Chapter Title": r["Chapter Title"] or "-",
                         "Section": r["Section"],
                         "Pages": r["Pages"],
                         "Tokens": r["Tokens"],
-                        "Chars": r["Characters"],
                         "Preview": r["Preview"],
                     }
                     for r in filtered_chroma
                 ])
 
                 with st.expander("Inspect full chunk text & stored metadata from Chroma"):
-                    inspect_id = st.selectbox("Select Chunk ID to inspect", [r["Chunk ID"] for r in filtered_chroma], key="chroma_inspect_select")
-                    selected_entry = next((r for r in chroma_rows if r["Chunk ID"] == inspect_id), None)
-                    if selected_entry:
-                        st.markdown(f"**Chunk ID:** `{selected_entry['Chunk ID']}` | **Filename:** `{selected_entry['Filename']}`")
-                        st.code(selected_entry["_full_text"], language="text")
-                        st.json(selected_entry["_meta"])
+                    inspect_ids = [r["Chunk ID"] for r in filtered_chroma]
+                    if inspect_ids:
+                        inspect_id = st.selectbox("Select Chunk ID to inspect", inspect_ids, key="chroma_inspect_select")
+                        selected_entry = next((r for r in chroma_rows if r["Chunk ID"] == inspect_id), None)
+                        if selected_entry:
+                            st.markdown(f"**Chunk ID:** `{selected_entry['Chunk ID']}` | **Book:** `{selected_entry['Book']}` | **Filename:** `{selected_entry['Filename']}`")
+                            st.code(selected_entry["_full_text"], language="text")
+                            st.json(selected_entry["_meta"])
+                    else:
+                        st.caption("No matching chunks to inspect.")
             except Exception as exc:  # noqa: BLE001
                 st.error(f"Error fetching Chroma chunks: {exc}")
 
@@ -2416,17 +2539,22 @@ def _render_chunk_monitor(pipeline: RAGPipeline) -> None:
                 p_start = c.get("page_start") or c.get("page_number")
                 p_end = c.get("page_end") or p_start
                 p_str = f"{p_start}–{p_end}" if p_end and p_end != p_start else (str(p_start) if p_start else "-")
-                ch_num = c.get("chapter_num")
-                ch_str = f"Ch. {ch_num}" if ch_num and int(ch_num) > 0 else "-"
+                ch_num = c.get("chapter_num") if c.get("chapter_num") is not None else c.get("chapter")
+                ch_str = f"Ch. {ch_num}" if ch_num and int(ch_num) > 0 else ("Intro/Front" if ch_num == 0 else "-")
                 txt = c.get("text", "")
+                fn = c.get("filename") or c.get("book_name") or ""
+                raw_b = c.get("book_title") or c.get("book") or (Path(fn).stem if fn else "Unknown")
+                clean_b = str(raw_b).replace(" (1)", "").replace(".pdf", "").replace(".PDF", "").strip() or "Unknown"
+
                 bm25_rows.append({
                     "Chunk ID": cid,
-                    "Book": c.get("book_title") or "Mind Management, Not Time Management",
+                    "Book": clean_b,
                     "Chapter": ch_str,
+                    "Chapter Title": c.get("chapter_title") or "",
                     "Section": c.get("section_heading") or c.get("section_title") or "-",
                     "Pages": p_str,
                     "Tokens": c.get("token_count", 0),
-                    "Filename": c.get("filename", ""),
+                    "Filename": fn,
                     "Format": c.get("file_type", "pdf"),
                     "Characters": len(txt),
                     "Preview": (txt[:130] + "...") if len(txt) > 130 else txt,
@@ -2434,22 +2562,24 @@ def _render_chunk_monitor(pipeline: RAGPipeline) -> None:
                     "_raw": c,
                 })
 
-            bf1, bf2 = st.columns([7, 3])
+            bf1, bf2, bf3 = st.columns([4, 3, 3])
             with bf1:
                 search_bm25 = st.text_input("Filter BM25 chunks", placeholder="Filter by term, heading, or filename...", key="bm25_filter")
             with bf2:
-                term_lookup = st.text_input("Lookup word in vocabulary", placeholder="e.g. telescope", key="vocab_term_lookup")
-
-            if term_lookup:
-                t_clean = term_lookup.strip().lower()
-                df = getattr(bm25_instance, "_doc_freqs", {}).get(t_clean)
-                idf = getattr(bm25_instance, "_idf", {}).get(t_clean)
-                if df is not None:
-                    st.success(f"Term '{t_clean}' found in BM25 index: appears in **{df}** chunks (IDF weight: **{idf:.3f}**)")
+                bm25_books = sorted(list({r["Book"] for r in bm25_rows if r["Book"]}))
+                b_book_filter = st.selectbox("Filter Book", ["All Books"] + bm25_books, key="bm25_book_filter")
+            with bf3:
+                if b_book_filter != "All Books":
+                    b_avail_chs = sorted(list({r["Chapter"] for r in bm25_rows if r["Book"] == b_book_filter and r["Chapter"] != "-"}))
                 else:
-                    st.warning(f"Term '{t_clean}' does not appear in the BM25 index vocabulary.")
+                    b_avail_chs = sorted(list({r["Chapter"] for r in bm25_rows if r["Chapter"] != "-"}))
+                b_chapter_filter = st.selectbox("Filter Chapter", ["All Chapters"] + b_avail_chs, key="bm25_chapter_filter")
 
             filtered_bm25 = bm25_rows
+            if b_book_filter != "All Books":
+                filtered_bm25 = [r for r in filtered_bm25 if r["Book"] == b_book_filter]
+            if b_chapter_filter != "All Chapters":
+                filtered_bm25 = [r for r in filtered_bm25 if r["Chapter"] == b_chapter_filter]
             if search_bm25:
                 s_low = search_bm25.strip().lower()
                 filtered_bm25 = [
@@ -2457,31 +2587,36 @@ def _render_chunk_monitor(pipeline: RAGPipeline) -> None:
                     if s_low in r["Chunk ID"].lower()
                     or s_low in r["Filename"].lower()
                     or s_low in r["_full_text"].lower()
-                    or s_low in str(r["Heading"]).lower()
+                    or s_low in str(r["Section"]).lower()
+                    or s_low in str(r["Book"]).lower()
                 ]
 
-            st.caption(f"Displaying {len(filtered_bm25)} of {len(bm25_rows)} chunks in BM25 index")
+            st.caption(f"Displaying **{len(filtered_bm25)}** of **{len(bm25_rows)}** chunks in BM25 index across **{len(bm25_books)}** book(s)")
             _dataframe([
                 {
                     "Chunk ID": r["Chunk ID"],
                     "Book": r["Book"],
                     "Chapter": r["Chapter"],
+                    "Chapter Title": r["Chapter Title"] or "-",
                     "Section": r["Section"],
                     "Pages": r["Pages"],
                     "Tokens": r["Tokens"],
-                    "Chars": r["Characters"],
                     "Preview": r["Preview"],
                 }
                 for r in filtered_bm25
             ])
 
             with st.expander("Inspect full chunk text & BM25 metadata"):
-                inspect_b_id = st.selectbox("Select BM25 Chunk ID", [r["Chunk ID"] for r in filtered_bm25], key="bm25_inspect_select")
-                sel_b = next((r for r in bm25_rows if r["Chunk ID"] == inspect_b_id), None)
-                if sel_b:
-                    st.markdown(f"**Chunk ID:** `{sel_b['Chunk ID']}` | **Filename:** `{sel_b['Filename']}`")
-                    st.code(sel_b["_full_text"], language="text")
-                    st.json({k: v for k, v in sel_b["_raw"].items() if k != "text"})
+                inspect_b_ids = [r["Chunk ID"] for r in filtered_bm25]
+                if inspect_b_ids:
+                    inspect_b_id = st.selectbox("Select BM25 Chunk ID", inspect_b_ids, key="bm25_inspect_select")
+                    sel_b = next((r for r in bm25_rows if r["Chunk ID"] == inspect_b_id), None)
+                    if sel_b:
+                        st.markdown(f"**Chunk ID:** `{sel_b['Chunk ID']}` | **Book:** `{sel_b['Book']}` | **Filename:** `{sel_b['Filename']}`")
+                        st.code(sel_b["_full_text"], language="text")
+                        st.json({k: v for k, v in sel_b["_raw"].items() if k != "text"})
+                else:
+                    st.caption("No matching BM25 chunks to inspect.")
 
     # ================================================================
     # TAB 3: DOCUMENT CHUNKS (SOURCE FILES)
@@ -2933,7 +3068,6 @@ def _render_sidebar(
     pipeline: RAGPipeline,
     status: dict,
     collection_count,
-    dev_embeddings: bool,
 ) -> str:
     """
     Sidebar: brand, grouped navigation, system status and index controls.
@@ -3015,9 +3149,6 @@ def _render_sidebar(
             ]
         )
 
-        if dev_embeddings:
-            meta_html += render_kv_rows([("Mode", "Synthetic (DEV)")])
-
         render_html(render_panel_card("CONFIGURATION", meta_html))
 
         render_html(render_sidebar_divider())
@@ -3078,12 +3209,6 @@ def main() -> None:
 
     render_html(inject_global_css())
 
-    dev_embeddings = os.getenv("DEV_EMBEDDINGS", "false").lower() in (
-        "1",
-        "true",
-        "yes",
-    )
-
     Path(KNOWLEDGE_BASE_DIR).mkdir(parents=True, exist_ok=True)
     Path(VECTORSTORE_DIR).mkdir(parents=True, exist_ok=True)
 
@@ -3099,7 +3224,7 @@ def main() -> None:
     status = _pipeline_status(pipeline)
     collection_count = _collection_count(pipeline)
 
-    page = _render_sidebar(pipeline, status, collection_count, dev_embeddings)
+    page = _render_sidebar(pipeline, status, collection_count)
 
     _show_ingestion_notice()
 
@@ -3107,12 +3232,6 @@ def main() -> None:
         _service_error(
             "SYSTEM STATUS UNAVAILABLE",
             st.session_state["status_error"],
-        )
-
-    if dev_embeddings:
-        st.warning(
-            "DEV MODE: synthetic embeddings are active. Semantic retrieval "
-            "will not reflect real content similarity."
         )
 
     # Page dispatch. Only Mission Control can trigger retrieval or

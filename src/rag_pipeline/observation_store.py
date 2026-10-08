@@ -1,4 +1,4 @@
-"""
+﻿"""
 Persistent JSONL store for reproducible query observations.
 
 Each line is a self-contained, structured observation record with:
@@ -9,7 +9,7 @@ Each line is a self-contained, structured observation record with:
   - RRF rank/score + retriever membership
   - Selected evidence + final rank
   - Context sent to LLM (sources, char/chunk counts)
-  - Answer, citations, claim→evidence mapping
+  - Answer, citations, claimâ†’evidence mapping
   - Model + latency/token data when available
   - Live evaluation (retrieval + answer quality)
 
@@ -43,6 +43,13 @@ def observation_path(vectorstore_path: Path) -> Path:
 # STRUCTURED OBSERVATION BUILDER
 # ---------------------------------------------------------------------------
 
+def _clean_book_name(item: dict) -> str:
+    raw = item.get("book_title") or item.get("book_name") or item.get("book") or item.get("filename") or ""
+    stem = Path(raw).stem if str(raw).lower().endswith(".pdf") else str(raw)
+    clean = stem.replace(" (1)", "").replace("_", " ").strip()
+    return clean or "Unknown"
+
+
 def _extract_dense_results(trace: dict) -> list[dict]:
     """Minimal reproducible dense result rows."""
     rows = []
@@ -54,9 +61,13 @@ def _extract_dense_results(trace: dict) -> list[dict]:
         rows.append({
             "rank": item.get("dense_rank", item.get("rank", i)),
             "source": item.get("filename", ""),
+            "book": _clean_book_name(item),
+            "chapter_num": item.get("chapter_num"),
+            "chapter_title": item.get("chapter_title", ""),
             "chunk_id": item.get("chunk_id", ""),
             "distance": item.get("dense_distance", item.get("distance")),
             "score": item.get("score"),
+            "section": item.get("section_heading") or item.get("section_title") or "",
         })
     return rows
 
@@ -72,8 +83,12 @@ def _extract_bm25_results(trace: dict) -> list[dict]:
         rows.append({
             "rank": item.get("bm25_rank", item.get("rank", i)),
             "source": item.get("filename", ""),
+            "book": _clean_book_name(item),
+            "chapter_num": item.get("chapter_num"),
+            "chapter_title": item.get("chapter_title", ""),
             "chunk_id": item.get("chunk_id", ""),
             "score": item.get("bm25_score", item.get("score")),
+            "section": item.get("section_heading") or item.get("section_title") or "",
         })
     return rows
 
@@ -88,6 +103,9 @@ def _extract_rrf_results(trace: dict) -> list[dict]:
         rows.append({
             "final_rank": item.get("final_rank", item.get("rank", i)),
             "source": item.get("filename", ""),
+            "book": _clean_book_name(item),
+            "chapter_num": item.get("chapter_num"),
+            "chapter_title": item.get("chapter_title", ""),
             "chunk_id": item.get("chunk_id", ""),
             "rrf_score": item.get("rrf_score"),
             "dense_rank": item.get("dense_rank"),
@@ -97,6 +115,7 @@ def _extract_rrf_results(trace: dict) -> list[dict]:
             "in_dense": item.get("in_dense", item.get("dense_rank") is not None),
             "in_bm25": item.get("in_bm25", item.get("bm25_rank") is not None),
             "retrieval_agreement": item.get("retrieval_agreement", False),
+            "section": item.get("section_heading") or item.get("section_title") or "",
         })
     return rows
 
@@ -109,6 +128,9 @@ def _extract_selected_evidence(trace: dict) -> list[dict]:
             continue
         rows.append({
             "source": item.get("filename", ""),
+            "book": _clean_book_name(item),
+            "chapter_num": item.get("chapter_num"),
+            "chapter_title": item.get("chapter_title", ""),
             "chunk_id": item.get("chunk_id", ""),
             "rrf_score": item.get("rrf_score"),
             "dense_rank": item.get("dense_rank"),
@@ -117,12 +139,13 @@ def _extract_selected_evidence(trace: dict) -> list[dict]:
             "in_bm25": item.get("in_bm25", False),
             "retrieval_agreement": item.get("retrieval_agreement", False),
             "text_preview": (item.get("text") or "")[:200],
+            "section": item.get("section_heading") or item.get("section_title") or "",
         })
     return rows
 
 
 def _extract_context_summary(trace: dict) -> dict:
-    """Context sent to LLM — sources, char/chunk counts, no raw text."""
+    """Context sent to LLM â€” sources, char/chunk counts, no raw text."""
     ctx = trace.get("context") or {}
     chunks = ctx.get("final_chunks") or []
     return {
@@ -133,7 +156,7 @@ def _extract_context_summary(trace: dict) -> dict:
 
 
 def _extract_citation_map(trace: dict) -> list[dict]:
-    """Claim → evidence mapping from post-generation grounding."""
+    """Claim â†’ evidence mapping from post-generation grounding."""
     rows = []
     grounding = trace.get("grounding") or {}
     for item in grounding.get("claim_to_citation") or trace.get("citations") or []:
@@ -164,6 +187,45 @@ def _extract_kb_state(trace: dict) -> dict:
         "bm25_chunks": kb.get("bm25_chunks"),
         "indexes_consistent": kb.get("indexes_consistent"),
         "last_updated": kb.get("last_updated", ""),
+    }
+
+def _extract_retrieval_breakdown(trace: dict) -> dict:
+    """Compute aggregate retrieval statistics by book and chapter.
+    
+    Returns a dict with:
+      - total_books: Number of unique books retrieved
+      - total_chapters: Number of unique (book, chapter) pairs
+      - breakdown: List of {book, chapter, chapter_title, chunk_count} sorted by book/chapter
+    """
+    breakdown_dict = {}  # key: (book, chapter) -> {count, title}
+    
+    # Collect from all retrieval stages
+    for item in (trace.get("selected_evidence") or []):
+        if not isinstance(item, dict):
+            continue
+        book = _clean_book_name(item)
+        chapter = item.get("chapter_num")
+        title = item.get("chapter_title", "")
+        
+        key = (book, chapter)
+        if key not in breakdown_dict:
+            breakdown_dict[key] = {"count": 0, "title": title}
+        breakdown_dict[key]["count"] += 1
+    
+    # Build result list
+    breakdown = []
+    for (book, chapter), data in sorted(breakdown_dict.items()):
+        breakdown.append({
+            "book": book,
+            "chapter": chapter,
+            "chapter_title": data["title"],
+            "chunk_count": data["count"],
+        })
+    
+    return {
+        "total_books": len(set(b for b, c in breakdown_dict.keys())),
+        "total_chapters": len(breakdown_dict),
+        "breakdown": breakdown,
     }
 
 
@@ -202,7 +264,7 @@ def record_observation(
     query_trace = trace.get("query") or {}
 
     observation = {
-        # ── Identity ──────────────────────────────────────────────────
+        # â”€â”€ Identity â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         "query_id": str(uuid.uuid4()),
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "raw_query": question,
@@ -211,32 +273,33 @@ def record_observation(
             or query_trace.get("normalized_query")
             or question
         ),
-        # ── KB / index state ──────────────────────────────────────────
+        # â”€â”€ KB / index state â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         "embedding_model": embedding_model or "unknown",
         "kb_state": _extract_kb_state(trace),
-        # ── Retrieval ─────────────────────────────────────────────────
+        # â”€â”€ Retrieval â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         "retrieval_mode": retrieval.get("mode") or retrieval.get("selected_mode") or "hybrid",
         "rrf_k": retrieval.get("rrf_k"),
         "dense_results": _extract_dense_results(trace),
         "bm25_results": _extract_bm25_results(trace),
         "rrf_results": _extract_rrf_results(trace),
         "selected_evidence": _extract_selected_evidence(trace),
-        # ── Context ───────────────────────────────────────────────────
+        "retrieval_breakdown": _extract_retrieval_breakdown(trace),
+        # â”€â”€ Context â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         "context": _extract_context_summary(trace),
-        # ── Answer ────────────────────────────────────────────────────
+        # â”€â”€ Answer â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         "answer_preview": (response.get("raw_answer") or response.get("answer") or "")[:500],
         "citation_map": _extract_citation_map(trace),
         "citation_coverage": trace.get("citation_coverage") or response.get("citation_coverage") or {},
-        # ── Generation metadata ───────────────────────────────────────
+        # â”€â”€ Generation metadata â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         "generation": _extract_generation_meta(trace),
         "latency_ms": round(latency_ms, 1),
-        # ── Evaluation ───────────────────────────────────────────────
+        # â”€â”€ Evaluation â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         "evaluation": response.get("evaluation") or {},
         "answer_evaluation": response.get("answer_evaluation") or {},
         "evidence": (trace.get("evidence_gate") or response.get("evidence") or {}),
         "confidence": trace.get("confidence") or response.get("confidence") or {},
         "response_type": response.get("response_type", "unknown"),
-        # ── Full trace (for drill-down and reproducibility) ───────────
+        # â”€â”€ Full trace (for drill-down and reproducibility) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         "trace": trace,
     }
 
@@ -340,3 +403,5 @@ def delete_observation(vectorstore_path: Path, query_id: str) -> bool:
     if found:
         path.write_text("\n".join(kept) + ("\n" if kept else ""), encoding="utf-8")
     return found
+
+

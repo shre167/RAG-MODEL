@@ -260,6 +260,14 @@ def get_dense_results(
             ),
         )
 
+        meta = row.get("metadata", {}) if isinstance(row.get("metadata"), dict) else {}
+        raw_b = row.get("book") or row.get("book_title") or meta.get("book_title") or row.get("filename") or ""
+        clean_b = Path(raw_b).stem if str(raw_b).lower().endswith(".pdf") else str(raw_b)
+        clean_b = clean_b.replace(" (1)", "").replace("_", " ").strip() or "Unknown"
+
+        ch_num = row.get("chapter_num") if row.get("chapter_num") is not None else meta.get("chapter_num")
+        ch_title = row.get("chapter_title") or meta.get("chapter_title") or ""
+
         results.append(
             {
                 "rank": rank,
@@ -268,6 +276,12 @@ def get_dense_results(
                     "filename",
                     "",
                 ),
+
+                "book": clean_b,
+                "book_title": clean_b,
+                "chapter_num": ch_num,
+                "chapter": f"Ch. {ch_num}" if ch_num and int(ch_num) > 0 else ("Intro" if ch_num == 0 else "-"),
+                "chapter_title": ch_title,
 
                 "chunk_id": row.get(
                     "chunk_id",
