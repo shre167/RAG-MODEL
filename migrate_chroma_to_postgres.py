@@ -1,121 +1,303 @@
-﻿#!/usr/bin/env python3
+﻿"""
+Migrate data from Chroma to plain PostgreSQL WITHOUT pgvector.
+
+Requirements:
+    - PostgreSQL server running
+    - Database exists
+    - Valid DATABASE_URL in .env
+    - USE_POSTGRES=true in .env
+    - postgres_vector_store_simple.py available in src/
 """
-Migration script to move data from Chroma to PostgreSQL.
-"""
+
 import os
 import sys
+import traceback
 from pathlib import Path
 
-# Add src to path
-sys.path.insert(0, str(Path(__file__).parent))
+from dotenv import load_dotenv
+
+# ---------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------
+
+BASE_DIR = Path(__file__).resolve().parent
+
+# Load the project's .env file.
+load_dotenv(BASE_DIR / ".env", override=False)
+
+# Ensure project root is importable.
+if str(BASE_DIR) not in sys.path:
+    sys.path.insert(0, str(BASE_DIR))
+
 
 def migrate_chroma_to_postgres():
-    """Migrate all chunks from Chroma to PostgreSQL."""
+    """Migrate all Chroma chunks to PostgreSQL without pgvector."""
+
     print("=" * 60)
-    print("CHROMA TO POSTGRESQL MIGRATION SCRIPT")
+    print("CHROMA TO POSTGRESQL MIGRATION")
+    print("Backend: Plain PostgreSQL - NO pgvector")
     print("=" * 60)
-    
-    # Check if PostgreSQL is enabled
-    if os.getenv("USE_POSTGRES", "false").lower() != "true":
-        print("❌ PostgreSQL is not enabled in .env")
-        print("   Set USE_POSTGRES=true and configure DATABASE_URL")
+
+    # Validate configuration.
+    use_postgres = os.getenv(
+        "USE_POSTGRES", "false"
+    ).strip().lower()
+
+    if use_postgres not in ("true", "1", "yes"):
+        print("ERROR: PostgreSQL is not enabled.")
+        print("Set USE_POSTGRES=true in your .env file.")
         return False
-    
+
+    database_url = os.getenv("DATABASE_URL", "").strip()
+
+    if not database_url:
+        print("ERROR: DATABASE_URL is missing from .env.")
+        return False
+
     try:
-        # Connect to Chroma
+        # -------------------------------------------------
+        # 1. Connect to Chroma
+        # -------------------------------------------------
         from src.vector_store import ChromaVectorStore
         from src.config import VECTORSTORE_DIR
-        
-        print("Connecting to Chroma...")
-        chroma = ChromaVectorStore(persist_directory=VECTORSTORE_DIR)
+
+        print("\n[1/4] Connecting to Chroma...")
+
+        chroma = ChromaVectorStore(
+            persist_directory=VECTORSTORE_DIR
+        )
+
         chroma_count = chroma.get_collection_count()
-        
+
         if chroma_count == 0:
-            print("❌ No data in Chroma to migrate")
+            print("ERROR: No chunks found in Chroma.")
             return False
-        
-        print(f"Found {chroma_count} chunks in Chroma")
-        
-        # Connect to PostgreSQL
-        from src.postgres_vector_store import PostgresVectorStore
-        
-        print("Connecting to PostgreSQL...")
+
+        print(f"Found {chroma_count} chunks in Chroma.")
+
+        # -------------------------------------------------
+        # 2. Fetch Chroma data
+        # -------------------------------------------------
+        print("\n[2/4] Fetching documents and embeddings...")
+
+        data = chroma.collection.get(
+            include=[
+                "documents",
+                "metadatas",
+                "embeddings",
+            ]
+        )
+
+        ids = data.get("ids") or []
+        documents = data.get("documents")
+        metadatas = data.get("metadatas")
+        embeddings = data.get("embeddings")
+
+        if not ids:
+            print("ERROR: Chroma returned no IDs.")
+            return False
+
+        if (
+            documents is None
+            or metadatas is None
+            or embeddings is None
+        ):
+            print("ERROR: Chroma returned incomplete data.")
+            return False
+
+        total = len(ids)
+
+        if not (
+            len(documents) == total
+            and len(metadatas) == total
+            and len(embeddings) == total
+        ):
+            raise ValueError(
+                "The number of IDs, documents, metadata entries "
+                "and embeddings does not match."
+            )
+
+        # Validate embedding dimensions without changing them.
+        dimensions = {
+            len(embedding)
+            for embedding in embeddings
+            if embedding is not None
+        }
+
+        if len(dimensions) != 1:
+            raise ValueError(
+                f"Inconsistent embedding dimensions: {dimensions}"
+            )
+
+        embedding_dimension = next(iter(dimensions))
+
+        print(f"Records retrieved: {total}")
+        print(f"Embedding dimension: {embedding_dimension}")
+
+        # -------------------------------------------------
+        # 3. Connect to plain PostgreSQL
+        # -------------------------------------------------
+        print("\n[3/4] Connecting to plain PostgreSQL...")
+
+        # IMPORTANT:
+        # This imports the implementation that stores embeddings
+        # as JSON and does not import pgvector.
+        from src.postgres_vector_store_simple import (
+            PostgresVectorStore,
+        )
+
         postgres = PostgresVectorStore()
-        
-        # Fetch all data from Chroma
-        print("Fetching data from Chroma...")
-        data = chroma.collection.get(include=["documents", "metadatas", "embeddings"])
-        
-        if not data.get("ids"):
-            print("❌ No data retrieved from Chroma")
-            return False
-        
-        # Process in batches to avoid memory issues
+
+        print("PostgreSQL connection initialized.")
+        print("Using JSON embeddings; pgvector is not required.")
+
+        # Check for incompatible pre-existing schema/data.
+        # The simple store expects an embedding_json column.
+        from sqlalchemy import inspect
+
+        inspector = inspect(postgres.engine) if hasattr(
+            postgres, "engine"
+        ) else None
+
+        # The simple implementation may keep its engine at module
+        # level rather than on the instance.
+        if inspector is None:
+            from src import postgres_vector_store_simple as simple_store
+
+            inspector = inspect(simple_store.engine)
+
+        if inspector.has_table("chunks"):
+            columns = {
+                column["name"]
+                for column in inspector.get_columns("chunks")
+            }
+
+            if "embedding_json" not in columns:
+                raise RuntimeError(
+                    "The existing 'chunks' table does not contain "
+                    "'embedding_json'. Its schema may belong to the "
+                    "old pgvector implementation. Migration stopped "
+                    "to protect existing data. Do not drop the table "
+                    "without first backing it up and reviewing its schema."
+                )
+
+        # -------------------------------------------------
+        # 4. Migrate in batches
+        # -------------------------------------------------
+        print("\n[4/4] Migrating records...")
+
         batch_size = 100
-        total_chunks = len(data["ids"])
-        
-        print(f"Migrating {total_chunks} chunks in batches of {batch_size}...")
-        
-        for i in range(0, total_chunks, batch_size):
-            end_idx = min(i + batch_size, total_chunks)
-            batch_texts = data["documents"][i:end_idx]
-            batch_embeddings = data["embeddings"][i:end_idx]
-            batch_metadatas = data["metadatas"][i:end_idx]
-            batch_ids = data["ids"][i:end_idx]
-            
-            # Migrate batch to PostgreSQL
+        migrated = 0
+
+        for start in range(0, total, batch_size):
+            end = min(start + batch_size, total)
+
+            batch_ids = ids[start:end]
+            batch_documents = documents[start:end]
+            batch_metadatas = metadatas[start:end]
+            batch_embeddings = embeddings[start:end]
+
+            # Check each batch before writing.
+            batch_lengths = {
+                len(batch_ids),
+                len(batch_documents),
+                len(batch_metadatas),
+                len(batch_embeddings),
+            }
+
+            if len(batch_lengths) != 1:
+                raise ValueError(
+                    f"Batch {start}:{end} contains mismatched data."
+                )
+
+            # Preserve original Chroma IDs, text, metadata and
+            # embedding values. Do not regenerate embeddings.
             postgres.add_documents(
-                texts=batch_texts,
-                embeddings=batch_embeddings,
-                metadatas=batch_metadatas,
+                texts=batch_documents,
+                embeddings=[
+                    embedding.tolist()
+                    if hasattr(embedding, "tolist")
+                    else list(embedding)
+                    for embedding in batch_embeddings
+                ],
+                metadatas=[
+                    metadata or {}
+                    for metadata in batch_metadatas
+                ],
                 ids=batch_ids,
             )
-            
-            print(f"  Migrated {end_idx}/{total_chunks} chunks")
-        
-        # Verify migration
+
+            migrated += len(batch_ids)
+            print(f"  Processed {migrated}/{total} chunks.")
+
+        # -------------------------------------------------
+        # Verify destination
+        # -------------------------------------------------
         postgres_count = postgres.get_collection_count()
-        print(f"\n✅ Migration complete!")
-        print(f"   Chroma: {chroma_count} chunks")
-        print(f"   PostgreSQL: {postgres_count} chunks")
-        
-        if postgres_count == chroma_count:
-            print("   ✅ All chunks migrated successfully")
-        else:
-            print(f"   ⚠️  Count mismatch - please verify")
-        
+
+        print("\n" + "=" * 60)
+        print("MIGRATION VERIFICATION")
+        print("=" * 60)
+        print(f"Chroma source count:      {chroma_count}")
+        print(f"Records processed:        {migrated}")
+        print(f"PostgreSQL destination:   {postgres_count}")
+        print(f"Embedding dimension:      {embedding_dimension}")
+
+        if postgres_count != chroma_count:
+            print("\nWARNING: Source and destination counts differ.")
+            print(
+                "Check for pre-existing records or duplicate IDs "
+                "before attempting another migration."
+            )
+            return False
+
+        print("\nSUCCESS: Source and destination counts match.")
+        print("Original Chroma data has not been deleted.")
+        print(
+            "Test PostgreSQL retrieval before switching your "
+            "application to the new backend."
+        )
+
         return True
-        
-    except Exception as e:
-        print(f"❌ Migration failed: {e}")
-        import traceback
+
+    except Exception as exc:
+        print(f"\nMIGRATION FAILED: {exc}")
         traceback.print_exc()
         return False
 
+
 def main():
-    print("This script migrates data from Chroma to PostgreSQL.")
-    print("")
-    print("PREREQUISITES:")
-    print("  1. PostgreSQL server must be running")
-    print("  2. Database 'rag_helpdesk' must exist")
-    print("  3. pgvector extension must be enabled")
-    print("  4. USE_POSTGRES=true in .env")
-    print("  5. DATABASE_URL configured correctly")
-    print("")
-    
-    response = input("Are you ready to migrate? (yes/no): ").strip().lower()
+    print("Chroma -> PostgreSQL migration")
+    print("Storage: JSON embeddings; no pgvector extension.")
+    print()
+    print("Prerequisites:")
+    print("  1. PostgreSQL is running.")
+    print("  2. Database 'rag_helpdesk' exists.")
+    print("  3. DATABASE_URL contains valid credentials.")
+    print("  4. USE_POSTGRES=true is set in .env.")
+    print("  5. The destination table uses the simple-store schema.")
+    print()
+    print("WARNING:")
+    print("  - Existing destination records may be overwritten by ID.")
+    print("  - Chroma data will not be deleted by this script.")
+    print("  - An incompatible existing schema will stop migration.")
+    print()
+
+    response = input(
+        "Are you ready to migrate? (yes/no): "
+    ).strip().lower()
+
     if response != "yes":
         print("Migration cancelled.")
         return
-    
-    if migrate_chroma_to_postgres():
-        print("\n✅ Migration completed successfully!")
-        print("\nNEXT STEPS:")
-        print("  1. Verify data in PostgreSQL")
-        print("  2. Test queries work correctly")
-        print("  3. Consider archiving Chroma data")
+
+    success = migrate_chroma_to_postgres()
+
+    if success:
+        print("\nMigration completed successfully.")
     else:
-        print("\n❌ Migration failed. Please check the error above.")
+        print("\nMigration did not complete successfully.")
+
 
 if __name__ == "__main__":
     main()

@@ -148,16 +148,21 @@ class PostgresVectorStore:
             logger.warning(f"Could not validate collection: {exc}")
     
     def get_collection_embedding_dimension(self) -> Optional[int]:
-        """Return the embedding dimension from stored vectors."""
-        try:
-            with get_db_session() as session:
-                record = session.query(ChunkRecord).first()
-                if record:
-                    emb = record.embedding
-                    return len(emb) if emb else 1536
-        except Exception as exc:
-            logger.warning(f"Could not read embedding dimension: {exc}")
-        return 1536  # Default dimension
+        """Return the dimension of a stored embedding, or None if no usable
+        embedding exists yet. Never assume 1536: this store supports any
+        consistent embedding dimension, including local 384-dimensional models.
+        """
+        with get_db_session() as session:
+            record = session.query(ChunkRecord).filter(
+                ChunkRecord.embedding_json.isnot(None),
+                ChunkRecord.embedding_json != "",
+            ).first()
+
+            if record is None:
+                return None
+
+            embedding = record.embedding
+            return len(embedding) if embedding else None
     
     def _validate_new_embeddings(self, embeddings: List[List[float]]) -> None:
         """Ensure new embeddings are compatible."""
