@@ -13,11 +13,6 @@ def main() -> int:
     parser = argparse.ArgumentParser(
         description="Ingest knowledge base into vector store"
     )
-    parser.add_argument(
-        "--dev",
-        action="store_true",
-        help="Use synthetic embeddings for local testing",
-    )
     args = parser.parse_args()
 
     base_dir = Path(KNOWLEDGE_BASE_DIR)
@@ -32,9 +27,6 @@ def main() -> int:
             "Add files there and run this command again."
         )
         return 0
-
-    if args.dev:
-        os.environ["DEV_EMBEDDINGS"] = "true"
 
     pipeline = RAGPipeline(
         knowledge_base_path=base_dir,

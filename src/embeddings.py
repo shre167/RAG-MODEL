@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import logging
 import random
@@ -297,7 +297,8 @@ class EmbeddingService:
 
                 self._local_model = (
                     SentenceTransformer(
-                        local_model_name
+                        local_model_name,
+                        local_files_only=True,
                     )
                 )
 
@@ -1336,7 +1337,7 @@ class SyntheticEmbeddingService:
         self.model = "synthetic"
 
         logger.info(
-            "SyntheticEmbeddingService active — "
+            "SyntheticEmbeddingService active â€” "
             "no API calls will be made."
         )
 

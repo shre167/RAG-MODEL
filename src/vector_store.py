@@ -94,10 +94,8 @@ class ChromaVectorStore:
                 "Embedding dimension mismatch: the existing Chroma collection "
                 f"uses dimension {existing_dim}, but the new embeddings have "
                 f"dimension {new_dim}. The collection was NOT modified. "
-                "Your embedding configuration (EMBEDDING_MODEL, LLM_BASE_URL, "
-                "and DEV_EMBEDDINGS) must match the configuration used to build "
-                "the existing index. Do not mix synthetic/dev embeddings with "
-                "production API embeddings in the same collection."
+                "Your embedding configuration (EMBEDDING_MODEL and LLM_BASE_URL) "
+                "must match the configuration used to build the existing index."
             )
 
     def add_documents(
@@ -138,7 +136,7 @@ class ChromaVectorStore:
                     f"Existing collection dimension: {existing_dim}. "
                     f"New embedding dimension: {new_dim}. "
                     "The collection was NOT deleted and was NOT modified. "
-                    "Align EMBEDDING_MODEL, LLM_BASE_URL, and DEV_EMBEDDINGS "
+                    "Align EMBEDDING_MODEL and LLM_BASE_URL "
                     "with the configuration used for the existing vectors."
                 ) from exc
             raise
@@ -207,7 +205,6 @@ class ChromaVectorStore:
         *,
         configured_model: Optional[str] = None,
         configured_base_url: Optional[str] = None,
-        dev_embeddings: bool = False,
         current_embedding_dim: Optional[int] = None,
     ) -> Dict[str, Any]:
         """Return safe, non-secret vector-store diagnostics."""
@@ -230,7 +227,6 @@ class ChromaVectorStore:
             "dimensions_compatible": dimensions_compatible,
             "configured_embedding_provider": provider_host,
             "configured_embedding_model": configured_model,
-            "dev_embeddings": dev_embeddings,
             "persist_directory": self.persist_directory,
         }
 

@@ -34,7 +34,7 @@ from src.document_loader import (
 from src.embeddings import EmbeddingService
 from src.bm25_retriever import BM25Retriever
 from src.utils import ensure_directory
-from src.vector_store import ChromaVectorStore
+from src.unified_vector_store import UnifiedVectorStore
 
 from src.rag_pipeline.config import (
     ABSTAIN_MESSAGE,
@@ -105,28 +105,28 @@ class RAGPipeline:
 
     Architecture:
         User Query
-             â†“
+             Ã¢â€ â€œ
         Greeting Check
-             â†“
+             Ã¢â€ â€œ
         Query Preparation
-             â†“
-        â”Œâ”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”
-        â”‚ Dense Retrieval      â”‚
-        â”‚ BM25 Retrieval       â”‚
-        â””â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”¬â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”˜
-                   â†“
+             Ã¢â€ â€œ
+        Ã¢â€Å’Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€Â
+        Ã¢â€â€š Dense Retrieval      Ã¢â€â€š
+        Ã¢â€â€š BM25 Retrieval       Ã¢â€â€š
+        Ã¢â€â€Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€Â¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€Ëœ
+                   Ã¢â€ â€œ
               RRF Fusion
-                   â†“
+                   Ã¢â€ â€œ
             Candidate Pool
-                   â†“
+                   Ã¢â€ â€œ
           Evidence Evaluation
-                   â†“
+                   Ã¢â€ â€œ
         Deduplication + Diversity
-                   â†“
+                   Ã¢â€ â€œ
           Context Selection
-                   â†“
+                   Ã¢â€ â€œ
                   LLM
-                   â†“
+                   Ã¢â€ â€œ
               Final Answer
 
     CrossEncoder reranking is intentionally disabled.
@@ -152,24 +152,16 @@ class RAGPipeline:
         # --------------------------------------------------------------
         # Embedding Service
         # --------------------------------------------------------------
-        if os.getenv(
-            "DEV_EMBEDDINGS",
-            "false",
-        ).lower() in ("1", "true", "yes"):
-            from src.embeddings import SyntheticEmbeddingService
-
-            self.embedding_service = SyntheticEmbeddingService()
-        else:
-            self.embedding_service = EmbeddingService(
-                api_key=GE_API_KEY or LLM_API_KEY,
-                model=model_name,
-                base_url=LLM_BASE_URL,
-            )
+        self.embedding_service = EmbeddingService(
+            api_key=GE_API_KEY or LLM_API_KEY,
+            model=model_name,
+            base_url=LLM_BASE_URL,
+        )
 
         # --------------------------------------------------------------
         # Vector Store
         # --------------------------------------------------------------
-        self.vector_store = ChromaVectorStore(
+        self.vector_store = UnifiedVectorStore(
             collection_name="knowledge_base",
             persist_directory=self.vectorstore_path,
         )
@@ -893,7 +885,7 @@ class RAGPipeline:
         )
 
         # --------------------------------------------------------------
-        # Unchanged file â†’ skip
+        # Unchanged file Ã¢â€ â€™ skip
         # --------------------------------------------------------------
 
         if (
@@ -1365,7 +1357,7 @@ class RAGPipeline:
         """
         import re
 
-        # Rule-based splitting â€” no LLM call
+        # Rule-based splitting Ã¢â‚¬â€ no LLM call
         # Split on common multi-intent delimiters
         raw = re.split(r" and | also |\? |\n|; ", question)
 
@@ -1389,7 +1381,7 @@ class RAGPipeline:
                 resp = self._answer_question_impl(sub_q, retrieval_mode)
                 sub_responses.append((sub_q, resp))
             except Exception as exc:
-                logger.warning("Multi-intent sub-question failed: %s â€” %s", sub_q, exc)
+                logger.warning("Multi-intent sub-question failed: %s Ã¢â‚¬â€ %s", sub_q, exc)
 
         if len(sub_responses) < 2:
             return None
@@ -1452,25 +1444,25 @@ class RAGPipeline:
 
         Flow:
             Validate
-              â†“
+              Ã¢â€ â€œ
             Greeting
-              â†“
+              Ã¢â€ â€œ
             Query preparation
-              â†“
+              Ã¢â€ â€œ
             Query embedding
-              â†“
+              Ã¢â€ â€œ
             Dense + BM25
-              â†“
+              Ã¢â€ â€œ
             RRF
-              â†“
+              Ã¢â€ â€œ
             Evidence gate
-              â†“
+              Ã¢â€ â€œ
             Token Optimizer
-              â†“
+              Ã¢â€ â€œ
             Context
-              â†“
+              Ã¢â€ â€œ
             LLM
-              â†“
+              Ã¢â€ â€œ
             Answer
         """
 
@@ -2297,3 +2289,4 @@ class RAGPipeline:
                 ),
             },
         }
+

@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import os
 from pathlib import Path
@@ -33,6 +33,11 @@ class Config:
     _raw_image_model = os.getenv("IMAGE_ANALYSIS_MODEL")
     IMAGE_ANALYSIS_MODEL: str = _raw_image_model.strip() if _raw_image_model else ""
     ENABLE_IMAGE_ANALYSIS: bool = os.getenv("ENABLE_IMAGE_ANALYSIS", "false").lower() in ("1", "true", "yes")
+
+    # ==================== POSTGRESQL ====================
+    USE_POSTGRES: bool = os.getenv("USE_POSTGRES", "false").lower() in ("1", "true", "yes")
+    DATABASE_URL: str = os.getenv("DATABASE_URL", "postgresql://postgres:password@localhost:5432/rag_helpdesk")
+    DATABASE_ECHO: bool = os.getenv("DATABASE_ECHO", "false").lower() in ("1", "true", "yes")
 
     # ==================== PATHS ====================
     BASE_DIR: Path = BASE_DIR
@@ -114,7 +119,7 @@ class Config:
     ]
 
     # ==================== CATEGORY BOOSTING ====================
-    ENABLE_CATEGORY_BOOST: bool = False  # Disabled — rag_pipeline.py uses RRF
+    ENABLE_CATEGORY_BOOST: bool = False  # Disabled â€” rag_pipeline.py uses RRF
     CATEGORY_BOOST_FACTORS: dict = {
         "Planetary Science": 1.0,
         "Stars & Astrophysics": 1.0,
@@ -205,10 +210,13 @@ MIN_RERANK_SCORE = Config.MIN_RERANK_SCORE
 RERANKER_MODEL = Config.RERANKER_MODEL
 IMAGE_ANALYSIS_MODEL = Config.IMAGE_ANALYSIS_MODEL
 ENABLE_IMAGE_ANALYSIS = Config.ENABLE_IMAGE_ANALYSIS
+USE_POSTGRES = Config.USE_POSTGRES
+DATABASE_URL = Config.DATABASE_URL
+DATABASE_ECHO = Config.DATABASE_ECHO
 
 # Validate on import (print warning but don't crash)
 try:
     Config.validate()
 except ValueError as e:
     import sys
-    print(f"⚠️  Configuration validation warning:\n{e}", file=sys.stderr)
+    print(f"âš ï¸  Configuration validation warning:\n{e}", file=sys.stderr)

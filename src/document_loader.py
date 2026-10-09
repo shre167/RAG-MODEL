@@ -2201,35 +2201,24 @@ def _chunk_book(
                 chapter_parsed
             )
 
-            if current_chapter == 7:
+            if chapter_number > 0 and chapter_number != current_chapter:
+                _flush_chunk(
+                    chunks,
+                    current_chunk_paragraphs,
+                    book_id,
+                    current_chapter,
+                    current_chapter_title,
+                    current_section,
+                    book_name,
+                )
+
+                current_chunk_paragraphs = []
+
+                current_chapter = chapter_number
+                current_chapter_title = chapter_title
+                current_section = None
+
                 continue
-
-            expected_chapter = (
-                1
-                if current_chapter is None
-                else current_chapter + 1
-            )
-
-            if chapter_number != expected_chapter or chapter_number > 7:
-                continue
-
-            _flush_chunk(
-                chunks,
-                current_chunk_paragraphs,
-                book_id,
-                current_chapter,
-                current_chapter_title,
-                current_section,
-                book_name,
-            )
-
-            current_chunk_paragraphs = []
-
-            current_chapter = chapter_number
-            current_chapter_title = chapter_title
-            current_section = None
-
-            continue
 
         # ----------------------------------------------------
         # Bare chapter heading.
@@ -2239,37 +2228,26 @@ def _chunk_book(
             text
         )
 
-        if bare_chapter is not None:
+        if bare_chapter is not None and bare_chapter > 0:
 
-            if current_chapter == 7:
+            if bare_chapter != current_chapter:
+                _flush_chunk(
+                    chunks,
+                    current_chunk_paragraphs,
+                    book_id,
+                    current_chapter,
+                    current_chapter_title,
+                    current_section,
+                    book_name,
+                )
+
+                current_chunk_paragraphs = []
+
+                current_chapter = bare_chapter
+                current_chapter_title = None
+                current_section = None
+
                 continue
-
-            expected_chapter = (
-                1
-                if current_chapter is None
-                else current_chapter + 1
-            )
-
-            if bare_chapter != expected_chapter or bare_chapter > 7:
-                continue
-
-            _flush_chunk(
-                chunks,
-                current_chunk_paragraphs,
-                book_id,
-                current_chapter,
-                current_chapter_title,
-                current_section,
-                book_name,
-            )
-
-            current_chunk_paragraphs = []
-
-            current_chapter = bare_chapter
-            current_chapter_title = None
-            current_section = None
-
-            continue
 
         # ----------------------------------------------------
         # Ignore anything before Chapter 1, unless the PDF has no
