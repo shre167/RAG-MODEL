@@ -9,8 +9,14 @@ from pathlib import Path
 
 import streamlit as st
 
-from src.config import KNOWLEDGE_BASE_DIR, VECTORSTORE_DIR, ENABLE_IMAGE_ANALYSIS
-from src.document_loader import chunk_documents, list_txt_files, list_knowledge_files, load_documents
+from src.config import KNOWLEDGE_BASE_DIR, VECTORSTORE_DIR
+from src.document_loader import (
+    chunk_documents,
+    get_chunking_config,
+    list_txt_files,
+    list_knowledge_files,
+    load_documents,
+)
 from src.rag_pipeline import RAGPipeline
 from src.rag_pipeline.kb_state import get_current_kb_state
 from src.rag_pipeline.observation_store import load_observations
@@ -151,8 +157,8 @@ SIMULATION_STEPS = [
      "Raw text is read and normalized. Whitespace is collapsed and "
      "section headings are detected so they can be kept as metadata."),
     ("03", "", "CONTENT CHUNKED",
-     "The document is split into overlapping segments. Overlap keeps a "
-     "sentence that crosses a boundary readable in both chunks."),
+     "Paragraphs are merged into token-sized chunks (target ~350, max ~450). "
+     "Oversized paragraphs are split with a small token carry-over."),
     ("04", "", "EMBEDDING GENERATED",
      "Each chunk is converted into a numerical vector by the configured "
      "embedding model, capturing meaning rather than exact wording."),
@@ -174,8 +180,8 @@ ARCH_DESCRIPTIONS = [
      "Normalizes raw text and records section headings as metadata before "
      "the document is split."),
     ("Chunking",
-     "Converts source documents into retrievable chunks used by both "
-     "semantic and lexical retrieval."),
+     "Packs paragraphs into token-sized chunks (~350 target, ~450 max) for "
+     "both semantic and lexical retrieval."),
     ("Embedding Model",
      "Turns each chunk into a vector using the model named in the "
      "environment configuration."),
@@ -410,6 +416,12 @@ def _pipeline() -> RAGPipeline:
 def _pipeline_status(pipeline: RAGPipeline) -> dict:
     """Read pipeline.status() without letting a backend error kill the UI."""
     try:
+        # Check and purge any files deleted from disk so UI status is always accurate
+        pipeline.sync_deleted_files()
+    except Exception:
+        pass
+
+    try:
         status = pipeline.status()
     except Exception as exc:  # noqa: BLE001 - surfaced to the user below
         st.session_state.status_error = str(exc)
@@ -471,12 +483,11 @@ def _llm_model(status: dict):
     return None
 
 
-def _chunk_config(pipeline: RAGPipeline) -> tuple:
-    """Configured chunk size and overlap, read from the live pipeline."""
-    return (
-        getattr(pipeline, "chunk_size", None),
-        getattr(pipeline, "chunk_overlap", None),
-    )
+def _chunk_config(pipeline: RAGPipeline) -> tuple[int | None, int | None]:
+    """Target and max token limits used by the canonical chunker."""
+    _ = pipeline
+    cfg = get_chunking_config()
+    return cfg.get("target_tokens"), cfg.get("max_tokens")
 
 
 def _kb_signature(kb_path: Path) -> tuple:
@@ -1033,19 +1044,6 @@ def _render_ingestion_result(result: dict) -> None:
             "Fields shown as N/A are not reported by the current ingestion "
             "backend. They are not estimated here."
         )
-
-    # Image-aware metadata
-    chunks_with_images = result.get("chunks_with_images", 0)
-    if chunks_with_images:
-        st.caption(f"🖼 {chunks_with_images} chunks contain pages with embedded images/figures (metadata preserved for retrieval)")
-
-    chunks_described = result.get("chunks_with_images_described", 0)
-    if chunks_described:
-        st.caption(f"🤖 {chunks_described} image pages analyzed by Gemini Vision and descriptions stored in chunk metadata")
-    elif chunks_with_images > 0:
-        enable_hint = not ENABLE_IMAGE_ANALYSIS
-        if enable_hint:
-            st.caption("💡 Set `ENABLE_IMAGE_ANALYSIS=true` in .env to enable Gemini Vision analysis of these images")
 
 
 # ============================================================================
@@ -1646,7 +1644,7 @@ def _render_ingestion_architecture() -> None:
         render_html(render_arch_arrow())
         render_html(
             render_arch_node(
-                "", "Chunking", "size + overlap", "processing"
+                "", "Chunking", "token pack", "processing"
             )
         )
         render_html(render_arch_arrow("  "))
@@ -1727,8 +1725,8 @@ def _render_ingestion_simulation(pipeline: RAGPipeline) -> None:
                 render_html(
                     render_kv_rows(
                         [
-                            ("Configured chunk size", _na(size)),
-                            ("Configured overlap", _na(overlap)),
+                            ("Target tokens (pack goal)", _na(size)),
+                            ("Max tokens per chunk", _na(overlap)),
                         ]
                     )
                 )
@@ -1810,8 +1808,8 @@ def _render_ingestion_page(
     render_html(
         render_kv_rows(
             [
-                ("Chunk size", _na(size)),
-                ("Chunk overlap", _na(overlap)),
+                ("Target tokens", _na(size)),
+                ("Max tokens", _na(overlap)),
                 ("BM25 indexed chunks", _bm25_indexed_count(status)),
                 ("Embedding model", _na(status.get("embedding_model"))),
                 ("Vectorstore path", _na(status.get("vectorstore_path"))),
@@ -2501,17 +2499,48 @@ def _render_chunk_monitor(pipeline: RAGPipeline) -> None:
                     for r in filtered_chroma
                 ])
 
-                with st.expander("Inspect full chunk text & stored metadata from Chroma"):
-                    inspect_ids = [r["Chunk ID"] for r in filtered_chroma]
-                    if inspect_ids:
-                        inspect_id = st.selectbox("Select Chunk ID to inspect", inspect_ids, key="chroma_inspect_select")
-                        selected_entry = next((r for r in chroma_rows if r["Chunk ID"] == inspect_id), None)
-                        if selected_entry:
-                            st.markdown(f"**Chunk ID:** `{selected_entry['Chunk ID']}` | **Book:** `{selected_entry['Book']}` | **Filename:** `{selected_entry['Filename']}`")
-                            st.code(selected_entry["_full_text"], language="text")
+                render_html(render_section_title("Chunk inspector"))
+                inspect_ids = [r["Chunk ID"] for r in filtered_chroma]
+                if inspect_ids:
+                    inspect_id = st.selectbox(
+                        "Select chunk",
+                        inspect_ids,
+                        format_func=lambda cid: next(
+                            (
+                                f"{cid} — {r['Book'][:28]} | {r['Section'][:24]} | pp. {r['Pages']}"
+                                for r in filtered_chroma
+                                if r["Chunk ID"] == cid
+                            ),
+                            cid,
+                        ),
+                        key="chroma_inspect_select",
+                    )
+                    selected_entry = next(
+                        (r for r in filtered_chroma if r["Chunk ID"] == inspect_id),
+                        None,
+                    )
+                    if selected_entry:
+                        st.caption(
+                            f"`{selected_entry['Chunk ID']}` · "
+                            f"{selected_entry['Book']} · pp. {selected_entry['Pages']} · "
+                            f"{selected_entry['Tokens']} tokens"
+                        )
+                        body = selected_entry["_full_text"] or ""
+                        st.markdown("**Paragraph text**")
+                        if body.strip():
+                            st.text_area(
+                                "Chroma chunk text",
+                                value=body,
+                                height=min(400, max(140, len(body) // 3)),
+                                disabled=True,
+                                label_visibility="collapsed",
+                            )
+                        else:
+                            st.warning("This Chroma record has no stored document text.")
+                        with st.expander("Stored metadata", expanded=False):
                             st.json(selected_entry["_meta"])
-                    else:
-                        st.caption("No matching chunks to inspect.")
+                else:
+                    st.caption("No matching chunks to inspect.")
             except Exception as exc:  # noqa: BLE001
                 st.error(f"Error fetching Chroma chunks: {exc}")
 
@@ -2606,17 +2635,45 @@ def _render_chunk_monitor(pipeline: RAGPipeline) -> None:
                 for r in filtered_bm25
             ])
 
-            with st.expander("Inspect full chunk text & BM25 metadata"):
-                inspect_b_ids = [r["Chunk ID"] for r in filtered_bm25]
-                if inspect_b_ids:
-                    inspect_b_id = st.selectbox("Select BM25 Chunk ID", inspect_b_ids, key="bm25_inspect_select")
-                    sel_b = next((r for r in bm25_rows if r["Chunk ID"] == inspect_b_id), None)
-                    if sel_b:
-                        st.markdown(f"**Chunk ID:** `{sel_b['Chunk ID']}` | **Book:** `{sel_b['Book']}` | **Filename:** `{sel_b['Filename']}`")
-                        st.code(sel_b["_full_text"], language="text")
+            render_html(render_section_title("Chunk inspector"))
+            inspect_b_ids = [r["Chunk ID"] for r in filtered_bm25]
+            if inspect_b_ids:
+                inspect_b_id = st.selectbox(
+                    "Select chunk",
+                    inspect_b_ids,
+                    format_func=lambda cid: next(
+                        (
+                            f"{cid} — {r['Book'][:28]} | {r['Section'][:24]} | pp. {r['Pages']}"
+                            for r in filtered_bm25
+                            if r["Chunk ID"] == cid
+                        ),
+                        cid,
+                    ),
+                    key="bm25_inspect_select",
+                )
+                sel_b = next((r for r in filtered_bm25 if r["Chunk ID"] == inspect_b_id), None)
+                if sel_b:
+                    st.caption(
+                        f"`{sel_b['Chunk ID']}` · "
+                        f"{sel_b['Book']} · pp. {sel_b['Pages']} · "
+                        f"{sel_b['Tokens']} tokens"
+                    )
+                    body = sel_b["_full_text"] or ""
+                    st.markdown("**Paragraph text**")
+                    if body.strip():
+                        st.text_area(
+                            "BM25 chunk text",
+                            value=body,
+                            height=min(400, max(140, len(body) // 3)),
+                            disabled=True,
+                            label_visibility="collapsed",
+                        )
+                    else:
+                        st.warning("This BM25 record has no chunk text.")
+                    with st.expander("Stored metadata", expanded=False):
                         st.json({k: v for k, v in sel_b["_raw"].items() if k != "text"})
-                else:
-                    st.caption("No matching BM25 chunks to inspect.")
+            else:
+                st.caption("No matching BM25 chunks to inspect.")
 
     # ================================================================
     # TAB 3: DOCUMENT CHUNKS (SOURCE FILES)
@@ -2703,7 +2760,7 @@ def _render_chunk_monitor(pipeline: RAGPipeline) -> None:
         )
         col3.metric("Chunks", len(selected_chunks))
         col4.metric(
-            "Chunk size / overlap",
+            "Target / max tokens",
             f"{size} / {overlap}" if size is not None else "N/A",
         )
 
@@ -2765,22 +2822,16 @@ def _render_chunk_monitor(pipeline: RAGPipeline) -> None:
         # ----------------------------------------------------------------
         # OVERLAP EXPLANATION
         # ----------------------------------------------------------------
-        render_html(render_section_title("Why chunks overlap"))
+        render_html(render_section_title("How chunks are sized"))
 
-        if overlap:
-            st.write(
-                f"This knowledge base is configured with a {overlap}-character "
-                f"overlap between neighbouring chunks of {size} characters. "
-                "Overlap allows neighbouring chunks to retain contextual "
-                "continuity, so a sentence that crosses a boundary is still "
-                "readable in both chunks."
-            )
-        else:
-            st.write(
-                "Chunk overlap allows neighbouring chunks to retain contextual "
-                "continuity. The configured overlap is not available from the "
-                "pipeline, so no value is shown here."
-            )
+        para_overlap = get_chunking_config().get("paragraph_overlap_tokens")
+        st.write(
+            f"Chunks are packed by **token count**, not fixed character width. "
+            f"The chunker aims for about **{size}** tokens per chunk and hard-limits "
+            f"each chunk to **{overlap}** tokens. Paragraphs are merged until the target "
+            f"is reached; oversized paragraphs are split with up to "
+            f"**{para_overlap}** tokens of carry-over between split pieces."
+        )
 
         with st.expander(f"All chunks in {selected_name}"):
             for position, item in enumerate(selected_chunks):
@@ -2842,9 +2893,9 @@ def _render_architecture_page(
     size, overlap = _chunk_config(pipeline)
 
     chunk_tech = (
-        f"size {size} / overlap {overlap}"
+        f"target {size} / max {overlap} tokens"
         if size is not None and overlap is not None
-        else "size + overlap"
+        else "token chunking"
     )
 
     # ----------------------------------------------------------------
@@ -3372,7 +3423,6 @@ def _render_observation_page(pipeline: RAGPipeline) -> None:
             "citation_completeness": 0.7,
             "groundedness": 0.7,
             "noise_sensitivity": 0.7,
-            "visual_multimodal_grounding": 0.7,
         }
         _DE_HOW: dict[str, str] = {
             "faithfulness": "LLM checks each claim in the answer against retrieved context (top 3). Score: 0=contradicts context, 1=fully grounded.",
@@ -3386,7 +3436,6 @@ def _render_observation_page(pipeline: RAGPipeline) -> None:
             "citation_completeness": "LLM counts major factual claims and checks what proportion carry a bracketed citation. Score: 0=no claims cited, 1=every claim cited.",
             "groundedness": "LLM reads the answer and flags statements not found or inferable from context (hallucination check). Score: 0=full of hallucinations, 1=fully grounded.",
             "noise_sensitivity": "LLM evaluates whether irrelevant retrieved context negatively affected the answer. Score: 0=degraded answer, 1=unaffected by noise.",
-            "visual_multimodal_grounding": "LLM checks if the answer correctly uses information from image metadata (PDF images, charts) generated by vision pipeline. Score: 0=incorrect usage, 1=perfect usage.",
         }
 
         # Categories for grouping in the UI
@@ -3394,7 +3443,6 @@ def _render_observation_page(pipeline: RAGPipeline) -> None:
             "Retrieval": ["contextual_relevancy", "contextual_precision", "contextual_recall", "noise_sensitivity"],
             "Answer Quality": ["faithfulness", "answer_relevancy", "answer_correctness", "answer_completeness", "groundedness"],
             "Citation": ["citation_correctness", "citation_completeness"],
-            "Multimodal": ["visual_multimodal_grounding"],
         }
 
 

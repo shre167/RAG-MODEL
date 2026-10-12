@@ -227,31 +227,31 @@ def select_context_candidates(
     if diversify_sources:
         selected: list[Candidate] = []
         source_counts: dict[str, int] = {}
-
-        # First pass:
-        # Try to give different sources representation.
+        by_source: dict[str, list[Candidate]] = {}
         for candidate in ranked:
-            source = (
+            src = (
                 candidate.filename
-                or candidate.metadata.get(
-                    "filename",
-                    "unknown",
-                )
+                or candidate.metadata.get("filename")
+                or candidate.metadata.get("book_title")
                 or "unknown"
             )
+            by_source.setdefault(src, []).append(candidate)
 
-            count = source_counts.get(
-                source,
-                0,
-            )
-
-            if count >= MAX_CHUNKS_PER_SOURCE:
-                continue
-
-            selected.append(candidate)
-            source_counts[source] = count + 1
-
-            if len(selected) >= MAX_CONTEXT_CHUNKS:
+        # Round-robin selection across sources so all books get representation
+        max_limit = MAX_CONTEXT_CHUNKS
+        while len(selected) < max_limit and any(by_source.values()):
+            added_any = False
+            for src in list(by_source.keys()):
+                if by_source[src] and source_counts.get(src, 0) < MAX_CHUNKS_PER_SOURCE:
+                    cand = by_source[src].pop(0)
+                    selected.append(cand)
+                    source_counts[src] = source_counts.get(src, 0) + 1
+                    added_any = True
+                    if len(selected) >= max_limit:
+                        break
+                elif not by_source[src] or source_counts.get(src, 0) >= MAX_CHUNKS_PER_SOURCE:
+                    by_source.pop(src, None)
+            if not added_any:
                 break
 
         ranked = selected
@@ -393,9 +393,6 @@ def build_context(
         )
 
         metadata = candidate.metadata or {}
-        image_desc = metadata.get("image_description") or ""
-        if image_desc:
-            text = text + f"\n\n[Visual content on this page: {image_desc}]"
 
         file_type = metadata.get("file_type") or (Path(filename).suffix.lstrip(".").lower() if filename else "")
         page_num = metadata.get("page_number") or metadata.get("page_start")
@@ -418,6 +415,7 @@ def build_context(
         clean_title = clean_title or "Untitled document"
 
         chapter_num = metadata.get("chapter_num")
+        chapter_title = (metadata.get("chapter_title") or "").strip()
         page_start = metadata.get("page_start") or page_number
         page_end = metadata.get("page_end") or page_start
 
@@ -425,7 +423,10 @@ def build_context(
         if clean_title and clean_title != "Untitled document":
             parts.append(clean_title)
         if chapter_num and int(chapter_num) > 0:
-            parts.append(f"Chapter {chapter_num}")
+            ch_part = f"Chapter {chapter_num}"
+            if chapter_title:
+                ch_part += f": {chapter_title}"
+            parts.append(ch_part)
         if page_start and int(page_start) > 0:
             if page_end and int(page_end) > int(page_start):
                 parts.append(f"Pages {page_start}–{page_end}")

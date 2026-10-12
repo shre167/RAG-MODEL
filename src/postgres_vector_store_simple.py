@@ -1,4 +1,4 @@
-﻿"""
+"""
 PostgreSQL Vector Store WITHOUT pgvector extension.
 Works with plain PostgreSQL - no extension needed!
 
@@ -285,7 +285,103 @@ class PostgresVectorStore:
         except Exception as exc:
             logger.error(f"Query error: {exc}")
             return {"documents": [], "metadatas": [], "distances": [], "ids": []}
-    
+
+    def get_chunks_by_page(
+        self,
+        page_start: int,
+        page_end: int | None = None,
+        book_title: str | None = None,
+    ) -> List[Dict[str, Any]]:
+        """Retrieve all chunks covering the specified page or page range."""
+        target_end = page_end if page_end is not None else page_start
+        try:
+            with get_db_session() as session:
+                query = session.query(ChunkRecord).filter(
+                    ChunkRecord.page_start <= target_end,
+                    ChunkRecord.page_end >= page_start,
+                )
+                if book_title:
+                    from sqlalchemy import func
+                    query = query.filter(
+                        func.lower(ChunkRecord.book_title).contains(book_title.lower())
+                    )
+                records = query.order_by(
+                    ChunkRecord.book_title,
+                    ChunkRecord.page_start,
+                    ChunkRecord.id,
+                ).all()
+                results = []
+                for r in records:
+                    results.append({
+                        "id": r.id,
+                        "text": r.document_text,
+                        "metadata": {
+                            "id": r.id,
+                            "chunk_id": r.id,
+                            "book_title": r.book_title,
+                            "book_id": r.book_id,
+                            "chapter_num": r.chapter_num,
+                            "chapter_title": r.chapter_title,
+                            "section_heading": r.section_heading,
+                            "section_title": r.section_title,
+                            "source": r.source,
+                            "filename": r.filename,
+                            "page_start": r.page_start,
+                            "page_end": r.page_end,
+                            "token_count": r.token_count,
+                        }
+                    })
+                return results
+        except Exception as exc:
+            logger.warning(f"Error querying postgres by page: {exc}")
+            return []
+
+    def delete_by_ids(self, ids: List[str]) -> int:
+        """Delete chunks by ID from PostgreSQL."""
+        if not ids:
+            return 0
+        try:
+            with get_db_session() as session:
+                deleted = session.query(ChunkRecord).filter(
+                    ChunkRecord.id.in_(ids)
+                ).delete(synchronize_session=False)
+                session.commit()
+                logger.info(f"PostgreSQL: deleted {deleted} chunks by ID")
+                return deleted
+        except Exception as exc:
+            logger.error(f"Error deleting chunks by ID from PostgreSQL: {exc}")
+            return 0
+
+    def delete_file(self, filename: str) -> int:
+        """Delete all chunks belonging to a filename or source from PostgreSQL."""
+        if not filename:
+            return 0
+        fname = Path(filename).name
+        try:
+            with get_db_session() as session:
+                deleted = session.query(ChunkRecord).filter(
+                    (ChunkRecord.filename == fname) |
+                    (ChunkRecord.source == fname) |
+                    (ChunkRecord.book_id == fname) |
+                    (func.lower(ChunkRecord.book_title) == fname.lower())
+                ).delete(synchronize_session=False)
+                session.commit()
+                logger.info(f"PostgreSQL: deleted {deleted} chunks for file {fname}")
+                return deleted
+        except Exception as exc:
+            logger.error(f"Error deleting file {fname} from PostgreSQL: {exc}")
+            return 0
+
+    def delete(self, ids: List[str] | None = None, where: Dict[str, Any] | None = None) -> int:
+        """Chroma-compatible delete API on PostgreSQL store."""
+        if ids:
+            return self.delete_by_ids(ids)
+        if where:
+            filename = where.get("filename") or where.get("source")
+            if filename:
+                return self.delete_file(filename)
+        return 0
+
     def delete_collection(self) -> None:
         """Delete all chunks from collection."""
         try:
@@ -302,7 +398,7 @@ class PostgresVectorStore:
         self.delete_collection()
     
     def get_collection_count(self) -> int:
-        """Return total number of chunks in collection."""
+        """Return total number of chunyks in collection."""
         try:
             with get_db_session() as session:
                 return session.query(ChunkRecord).count()

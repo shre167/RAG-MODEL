@@ -165,6 +165,20 @@ def ask_llm(
             "the retrieved information."
         )
 
+    try:
+        from src.rag_pipeline.query import extract_page_query_info
+        page_info = extract_page_query_info(question)
+        if page_info and page_info.get("is_page_query"):
+            user_instruction += (
+                "\n\nPAGE RETRIEVAL INSTRUCTION:\n"
+                "The user is asking for content from a specific page or page range. "
+                "Present the key content and summary found on that page accurately based on the retrieved sources. "
+                "If the retrieved sources cover multiple books on that page number, "
+                "organize the response clearly with separate sections or markdown headings for each book."
+            )
+    except Exception:
+        pass
+
     messages = [
         {
             "role": "system",

@@ -139,6 +139,190 @@ def dense_retrieve(
 
 
 # ======================================================================
+# PAGE / METADATA RETRIEVAL
+# ======================================================================
+
+
+def page_retrieve(
+    vector_store: Any,
+    page_start: int,
+    page_end: int | None = None,
+    book_title: str | None = None,
+    candidates: dict[str, Candidate] | None = None,
+) -> dict[str, Candidate]:
+    """
+    Retrieve chunks matching a specific page or page range.
+    Populates Candidate objects with top ranks and direct page match flag.
+    """
+    if candidates is None:
+        candidates = {}
+
+    if not hasattr(vector_store, "get_chunks_by_page"):
+        return candidates
+
+    try:
+        raw_chunks = vector_store.get_chunks_by_page(
+            page_start=page_start,
+            page_end=page_end,
+            book_title=book_title,
+        )
+    except Exception:
+        logger.exception("Page retrieval failed.")
+        return candidates
+
+    for index, item in enumerate(raw_chunks):
+        text = str(item.get("text", "")).strip()
+        if not text:
+            continue
+        metadata = item.get("metadata") or {}
+        filename = str(
+            metadata.get("filename")
+            or metadata.get("book_name")
+            or metadata.get("book_title")
+            or f"document-{index}"
+        )
+        chunk_id = metadata.get("chunk_id", item.get("id", index))
+        key = candidate_key(filename, chunk_id)
+
+        meta_copy = dict(metadata)
+        meta_copy["is_page_match"] = True
+        meta_copy["target_page"] = page_start
+
+        rank = index + 1
+        if key not in candidates:
+            candidates[key] = Candidate(
+                key=key,
+                filename=filename,
+                chunk_id=chunk_id,
+                text=text,
+                metadata=meta_copy,
+                dense_rank=rank,
+                bm25_rank=rank,
+                dense_distance=0.01 * rank,
+                bm25_score=10.0 / rank,
+            )
+        else:
+            candidates[key].metadata.update(meta_copy)
+            candidates[key].dense_rank = min(candidates[key].dense_rank or 999, rank)
+            candidates[key].bm25_rank = min(candidates[key].bm25_rank or 999, rank)
+
+        candidates[key].in_dense = True
+        candidates[key].in_bm25 = True
+
+    logger.debug(
+        "Page retrieval returned %d candidates for page %s.",
+        len(raw_chunks),
+        page_start,
+    )
+
+    return candidates
+
+
+# ======================================================================
+# CHAPTER / METADATA RETRIEVAL
+# ======================================================================
+
+
+def chapter_retrieve(
+    vector_store: Any,
+    chapter_num: int,
+    book_title: str | None = None,
+    candidates: dict[str, Candidate] | None = None,
+) -> dict[str, Candidate]:
+    """
+    Retrieve all chunks belonging to a specific chapter number.
+
+    Uses Chroma's native ``where`` filter on the ``chapter_num`` metadata
+    field so the result is exact rather than embedding-based.  Candidates
+    are returned with both ``dense_rank`` and ``bm25_rank`` set (same
+    positional rank) and flagged ``in_dense`` / ``in_bm25`` so they
+    participate in RRF fusion alongside semantic results.
+    """
+    if candidates is None:
+        candidates = {}
+
+    if not hasattr(vector_store, "collection"):
+        return candidates
+
+    try:
+        where: dict
+        if book_title:
+            where = {
+                "$and": [
+                    {"chapter_num": {"$eq": chapter_num}},
+                    {"book_title": {"$eq": book_title}},
+                ]
+            }
+        else:
+            where = {"chapter_num": {"$eq": chapter_num}}
+
+        data = vector_store.collection.get(
+            where=where,
+            include=["documents", "metadatas"],
+        )
+    except Exception as exc:
+        logger.warning("Chapter retrieval failed: %s", exc)
+        return candidates
+
+    docs = data.get("documents") or []
+    metas = data.get("metadatas") or []
+    ids = data.get("ids") or []
+
+    for index, (cid, doc, meta) in enumerate(zip(ids, docs, metas)):
+        if not doc or not meta:
+            continue
+        text = str(doc).strip()
+        if not text:
+            continue
+
+        filename = str(
+            meta.get("filename")
+            or meta.get("book_name")
+            or meta.get("book_title")
+            or f"document-{index}"
+        )
+        chunk_id = meta.get("chunk_id", cid)
+        key = candidate_key(filename, chunk_id)
+
+        meta_copy = dict(meta)
+        meta_copy["is_chapter_match"] = True
+        meta_copy["target_chapter"] = chapter_num
+
+        rank = index + 1
+        if key not in candidates:
+            candidates[key] = Candidate(
+                key=key,
+                filename=filename,
+                chunk_id=chunk_id,
+                text=text,
+                metadata=meta_copy,
+                dense_rank=rank,
+                bm25_rank=rank,
+                dense_distance=0.01 * rank,
+                bm25_score=10.0 / rank,
+            )
+        else:
+            candidates[key].metadata.update(meta_copy)
+            candidates[key].dense_rank = min(
+                candidates[key].dense_rank or 999, rank
+            )
+            candidates[key].bm25_rank = min(
+                candidates[key].bm25_rank or 999, rank
+            )
+
+        candidates[key].in_dense = True
+        candidates[key].in_bm25 = True
+
+    logger.debug(
+        "Chapter retrieval returned %d candidates for chapter %s (book: %s).",
+        len(ids),
+        chapter_num,
+        book_title,
+    )
+    return candidates
+
+
+# ======================================================================
 # BM25 RETRIEVAL
 # ======================================================================
 
@@ -354,6 +538,9 @@ def calculate_rrf_score(
         score += 1.0 / (
             rrf_k + candidate.bm25_rank
         )
+
+    if candidate.metadata.get("is_page_match"):
+        score += 0.05
 
     return score
 

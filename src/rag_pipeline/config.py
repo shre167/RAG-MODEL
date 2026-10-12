@@ -46,8 +46,8 @@ RERANK_CANDIDATE_LIMIT = min(
 # Number of chunks that can ultimately reach the LLM.
 # Keeping this bounded prevents context bloat as the KB grows.
 MAX_CONTEXT_CHUNKS = min(
-    max(RERANK_TOP_K, 5),
-    8,
+    max(RERANK_TOP_K, 8),
+    10,
 )
 
 # Prevent one source file from dominating the final context.

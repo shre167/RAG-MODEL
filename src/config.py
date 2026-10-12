@@ -47,8 +47,20 @@ class Config:
     COLLECTION_NAME: str = "knowledge_base"
 
     # ==================== CHUNKING ====================
-    CHUNK_SIZE: int = int(os.getenv("CHUNK_SIZE", "800"))
-    CHUNK_OVERLAP: int = int(os.getenv("CHUNK_OVERLAP", "200"))
+    # Canonical chunking is token-based (see document_loader TARGET_TOKENS).
+    # CHUNK_SIZE / CHUNK_OVERLAP are legacy pipeline field names: target and max tokens.
+    CHUNK_SIZE: int = int(
+        os.getenv("CHUNK_TARGET_TOKENS", os.getenv("CHUNK_SIZE", "350"))
+    )
+    CHUNK_MAX_TOKENS: int = int(
+        os.getenv("CHUNK_MAX_TOKENS", "450")
+    )
+    CHUNK_OVERLAP: int = int(
+        os.getenv(
+            "OVERSIZED_PARAGRAPH_OVERLAP",
+            os.getenv("CHUNK_OVERLAP", "40"),
+        )
+    )
     MIN_CHUNK_LENGTH: int = 50
 
     # ==================== EMBEDDING INGESTION ====================
@@ -196,6 +208,7 @@ OPENAI_BASE_URL = Config.OPENAI_BASE_URL
 TOP_K = Config.TOP_K
 SCORE_THRESHOLD = Config.SCORE_THRESHOLD
 CHUNK_SIZE = Config.CHUNK_SIZE
+CHUNK_MAX_TOKENS = Config.CHUNK_MAX_TOKENS
 CHUNK_OVERLAP = Config.CHUNK_OVERLAP
 EMBEDDING_BATCH_SIZE = Config.EMBEDDING_BATCH_SIZE
 EMBEDDING_MAX_RETRIES = Config.EMBEDDING_MAX_RETRIES

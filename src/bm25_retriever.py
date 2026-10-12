@@ -258,14 +258,36 @@ class BM25Retriever:
 
     @staticmethod
     def _extract_chunk_meta(c: Dict[str, Any]) -> Dict[str, Any]:
-        fname = c.get("filename", "")
+        fname = (
+            c.get("filename")
+            or c.get("book_name")
+            or c.get("source_name")
+            or ""
+        )
         suffix = Path(fname).suffix.lstrip(".").lower() if fname else ""
+        p_start = c.get("page_start") or c.get("page_number") or 0
+        p_end = c.get("page_end") or p_start
+        try:
+            p_start = int(p_start)
+        except (ValueError, TypeError):
+            p_start = 0
+        try:
+            p_end = int(p_end)
+        except (ValueError, TypeError):
+            p_end = p_start
+
         return {
             "filename": fname,
             "chunk_id": c.get("chunk_id", ""),
             "text": c.get("text", ""),
+            "book_title": c.get("book_title") or c.get("book_name") or "",
+            "book_name": c.get("book_name") or fname,
+            "book_id": c.get("book_id", ""),
             "source_path": c.get("source_path", ""),
             "section_heading": c.get("section_heading", ""),
+            "section_title": c.get("section_title", ""),
+            "chapter_num": c.get("chapter_num"),
+            "chapter_title": c.get("chapter_title", ""),
             "section_path": c.get("section_path", ""),
             "section_level": c.get("section_level", 0),
             "chunk_index": c.get("chunk_index", 0),
@@ -273,5 +295,38 @@ class BM25Retriever:
             "category": c.get("category", ""),
             "has_heading": c.get("has_heading", False),
             "file_type": c.get("file_type") or suffix or "txt",
-            "page_number": int(c.get("page_number", 0) or 0),
+            "page_number": p_start,
+            "page_start": p_start,
+            "page_end": p_end,
         }
+
+    def get_chunks_by_page(
+        self,
+        page_start: int,
+        page_end: int | None = None,
+        book_title: str | None = None,
+    ) -> List[Dict[str, Any]]:
+        target_end = page_end if page_end is not None else page_start
+        results: List[Dict[str, Any]] = []
+        for chunk in self._chunks:
+            p_s = chunk.get("page_start") or chunk.get("page_number") or 0
+            p_e = chunk.get("page_end") or p_s
+            try:
+                p_s = int(p_s)
+                p_e = int(p_e)
+            except (ValueError, TypeError):
+                continue
+            if p_s <= target_end and p_e >= page_start:
+                if book_title:
+                    b_cand = str(
+                        chunk.get("book_title")
+                        or chunk.get("book_name")
+                        or chunk.get("filename")
+                        or ""
+                    ).lower()
+                    b_target = book_title.lower()
+                    if b_target not in b_cand and b_cand not in b_target:
+                        continue
+                results.append(dict(chunk))
+        return results
+

@@ -127,13 +127,129 @@ def check_index_consistency(pipeline: Any) -> dict[str, Any]:
     }
 
 
+def sync_deleted_files(pipeline: Any) -> dict[str, Any]:
+    """
+    Detect files that have been removed from the knowledge-base directory
+    but whose chunks are still present in Chroma / Postgres / BM25 / the manifest,
+    and clean them up immediately.
+
+    This is called automatically on pipeline initialization, before queries,
+    and after ingestion so stale chunks never linger.
+
+    Returns a summary dict with the filenames removed and counts.
+    """
+    vs_path = Path(pipeline.vectorstore_path)
+    kb_path = Path(pipeline.knowledge_base_path)
+    manifest_path = vs_path / "ingestion_manifest.json"
+
+    # 1. Existing files on disk (active or any supported document)
+    existing_on_disk: set[str] = set()
+    if kb_path.exists():
+        try:
+            existing_on_disk = {
+                p.name
+                for p in kb_path.iterdir()
+                if p.is_file() and p.suffix.lower() in {".pdf", ".txt", ".md"}
+            }
+        except Exception as exc:
+            logger.warning("sync_deleted_files: error listing KB files: %s", exc)
+
+    # 2. Gather all tracked files from manifest, BM25, and vector stores
+    stale_filenames: set[str] = set()
+
+    # From manifest
+    manifest: dict[str, Any] = {}
+    if manifest_path.exists():
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            for fname in manifest.keys():
+                if fname not in existing_on_disk:
+                    stale_filenames.add(fname)
+        except Exception as exc:
+            logger.warning("sync_deleted_files: could not read manifest: %s", exc)
+
+    # From BM25 chunks
+    if pipeline.bm25 is not None:
+        try:
+            for chunk in getattr(pipeline.bm25, "_chunks", []):
+                fn = chunk.get("filename") or chunk.get("source") or ""
+                if fn and fn not in existing_on_disk:
+                    stale_filenames.add(fn)
+        except Exception:
+            pass
+
+    # From Chroma / Vector store metadata if available
+    try:
+        vs = getattr(pipeline, "vector_store", None)
+        if vs is not None:
+            backend = getattr(vs, "_backend", vs)
+            if hasattr(backend, "collection") and hasattr(backend.collection, "get"):
+                c_data = backend.collection.get(include=["metadatas"])
+                metas = c_data.get("metadatas") or []
+                for m in metas:
+                    if m:
+                        fn = m.get("filename") or m.get("source") or ""
+                        if fn and fn not in existing_on_disk:
+                            stale_filenames.add(fn)
+    except Exception:
+        pass
+
+    # From Postgres if enabled
+    try:
+        from src.config import USE_POSTGRES
+        if USE_POSTGRES:
+            from src.postgres_vector_store_simple import get_db_session, ChunkRecord
+            with get_db_session() as session:
+                rows = session.query(ChunkRecord.filename).distinct().all()
+                for (fn,) in rows:
+                    if fn and fn not in existing_on_disk:
+                        stale_filenames.add(fn)
+    except Exception:
+        pass
+
+    if not stale_filenames:
+        return {"removed": [], "total_chunks_deleted": 0}
+
+    total_deleted = 0
+    removed = []
+
+    for fname in sorted(stale_filenames):
+        logger.info(
+            "sync_deleted_files: %s no longer in KB folder — immediately purging chunks.", fname
+        )
+        try:
+            result = delete_document(
+                pipeline,
+                fname,
+                delete_file_from_disk=False,  # already deleted by user
+            )
+            chunks_del = result.get("deleted_from_vector_store", 0) + result.get("deleted_from_chroma", 0)
+            total_deleted += chunks_del
+            removed.append(
+                {
+                    "filename": fname,
+                    "vector_chunks_removed": chunks_del,
+                    "bm25_chunks_removed": result.get("deleted_from_bm25", 0),
+                }
+            )
+        except Exception as exc:
+            logger.warning(
+                "sync_deleted_files: failed to purge %s: %s", fname, exc
+            )
+
+    return {
+        "removed": removed,
+        "total_chunks_deleted": total_deleted,
+    }
+
+
 def delete_document(
     pipeline: Any,
     filename: str,
     delete_file_from_disk: bool = True,
 ) -> dict[str, Any]:
     """
-    Safely delete all chunks belonging to a document from both Chroma and BM25.
+    Safely delete all chunks belonging to a document from Chroma, PostgreSQL, and BM25.
     Prevents stale chunks from lingering in retrieval indexes.
     """
     filename = Path(filename).name
@@ -151,21 +267,47 @@ def delete_document(
     file_info = manifest.get(filename, {})
     chunk_ids = list(file_info.get("chunk_ids", []))
 
-    chroma_removed = 0
-    # 2. Delete from Chroma
-    if chunk_ids:
-        try:
-            pipeline.vector_store.collection.delete(ids=chunk_ids)
-            chroma_removed = len(chunk_ids)
-            logger.info("Chroma: deleted %d chunks by ID for %s", len(chunk_ids), filename)
-        except Exception as exc:
-            logger.warning("Chroma chunk deletion by ID failed for %s: %s", filename, exc)
+    vector_removed = 0
+    # 2. Delete from Vector Store (Unified / Chroma / Postgres)
+    vs = getattr(pipeline, "vector_store", None)
+    if vs is not None:
+        # Delete by chunk IDs if known
+        if chunk_ids:
+            try:
+                if hasattr(vs, "delete_by_ids"):
+                    vector_removed = vs.delete_by_ids(chunk_ids)
+                elif hasattr(vs, "collection") and hasattr(vs.collection, "delete"):
+                    vs.collection.delete(ids=chunk_ids)
+                    vector_removed = len(chunk_ids)
+                logger.info("Vector store: deleted %d chunks by ID for %s", len(chunk_ids), filename)
+            except Exception as exc:
+                logger.warning("Vector chunk deletion by ID failed for %s: %s", filename, exc)
 
-    # Fallback delete by metadata where supported
-    try:
-        pipeline.vector_store.collection.delete(where={"filename": filename})
-    except Exception:
-        pass
+        # Delete by filename/source filter
+        try:
+            if hasattr(vs, "delete_file"):
+                vs.delete_file(filename)
+            elif hasattr(vs, "collection") and hasattr(vs.collection, "delete"):
+                vs.collection.delete(where={"filename": filename})
+        except Exception as exc:
+            logger.warning("Vector chunk deletion by filename failed for %s: %s", filename, exc)
+
+        # Also purge from Postgres directly if Postgres is active or configured
+        try:
+            from src.postgres_vector_store_simple import get_db_session, ChunkRecord, func
+            with get_db_session() as session:
+                deleted_pg = session.query(ChunkRecord).filter(
+                    (ChunkRecord.filename == filename) |
+                    (ChunkRecord.source == filename) |
+                    (ChunkRecord.book_id == filename) |
+                    (func.lower(ChunkRecord.book_title) == filename.lower())
+                ).delete(synchronize_session=False)
+                session.commit()
+                if deleted_pg:
+                    logger.info("PostgreSQL: deleted %d chunks for %s", deleted_pg, filename)
+                    vector_removed = max(vector_removed, deleted_pg)
+        except Exception:
+            pass
 
     # 3. Delete from BM25
     bm25_removed = 0
@@ -202,7 +344,8 @@ def delete_document(
 
     return {
         "filename": filename,
-        "deleted_from_chroma": chroma_removed,
+        "deleted_from_vector_store": vector_removed,
+        "deleted_from_chroma": vector_removed,
         "deleted_from_bm25": bm25_removed,
         "deleted_from_disk": file_deleted,
         "collection_count": new_state.chroma_chunks,

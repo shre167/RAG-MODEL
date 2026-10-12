@@ -236,6 +236,175 @@ def is_multi_intent_query(query: str) -> bool:
     return False
 
 
+KNOWN_BOOK_ALIASES = {
+    "Deep Work": [
+        "deep work",
+        "deepwork",
+        "cal newport",
+        "newport",
+    ],
+    "cant hurt me": [
+        "cant hurt me",
+        "can't hurt me",
+        "david goggins",
+        "goggins",
+    ],
+    "Mind Management, Not Time Management (1)": [
+        "mind management",
+        "not time management",
+        "mind management not time management",
+        "david kadavy",
+        "kadavy",
+    ],
+}
+
+
+def extract_page_query_info(query: str) -> Optional[Dict[str, Any]]:
+    """
+    Detect if the user is asking for content from a specific page or page range.
+    Extracts the page number, optional page end, target book if mentioned, and
+    determines if the query is a pure page lookup or contains additional semantic keywords.
+    """
+    if not query:
+        return None
+
+    text = str(query).strip()
+    text_lower = text.lower()
+
+    # 1. Page range: e.g. "page 60-65", "pages 60 to 65", "p. 60-65"
+    range_match = re.search(
+        r"\b(?:pages?|p\.?|pg\.?)\s*(\d{1,4})\s*(?:-|–|—|to)\s*(\d{1,4})\b",
+        text_lower,
+    )
+    if range_match:
+        page_start = int(range_match.group(1))
+        page_end = int(range_match.group(2))
+        matched_span = range_match.span()
+    else:
+        # 2. Single page: e.g. "page 60", "p. 60", "on page 60", "in page 60", "page no 60", "page number 60"
+        single_match = re.search(
+            r"\b(?:(?:on|in|at)\s+(?:the\s+)?)?(?:pages?|p\.?|pg\.?|page\s+no\.?|page\s+number)\s*[:#]?\s*(\d{1,4})\b",
+            text_lower,
+        )
+        if single_match:
+            page_start = int(single_match.group(1))
+            page_end = page_start
+            matched_span = single_match.span()
+        else:
+            return None
+
+    # Check for book mentions
+    book_match = None
+    for canonical_name, aliases in KNOWN_BOOK_ALIASES.items():
+        for alias in aliases:
+            if re.search(rf"\b{re.escape(alias)}\b", text_lower):
+                book_match = canonical_name
+                break
+        if book_match:
+            break
+
+    # Determine whether there is additional semantic intent beyond the page request
+    residual = text_lower[:matched_span[0]] + " " + text_lower[matched_span[1]:]
+    if book_match:
+        for alias in KNOWN_BOOK_ALIASES[book_match]:
+            residual = re.sub(rf"\b{re.escape(alias)}\b", " ", residual)
+
+    filler_words = {
+        "give", "me", "the", "content", "in", "on", "at", "of", "from", "for",
+        "what", "is", "written", "there", "show", "tell", "about", "summarize",
+        "summary", "read", "details", "explain", "text", "information", "info",
+        "please", "can", "you", "does", "say", "saying", "having", "with",
+        "book", "ebook", "pdf", "chapter", "bro", "hey", "a", "an",
+    }
+    residual_tokens = [
+        w for w in re.findall(r"[a-z0-9]+", residual)
+        if w not in filler_words and len(w) > 2
+    ]
+
+    is_pure_page_query = len(residual_tokens) == 0
+    semantic_query = " ".join(residual_tokens) if not is_pure_page_query else ""
+
+    return {
+        "is_page_query": True,
+        "page_start": page_start,
+        "page_end": page_end,
+        "book_match": book_match,
+        "is_pure_page_query": is_pure_page_query,
+        "semantic_query": semantic_query,
+    }
+
+
+_CHAPTER_ORDINALS: dict[str, int] = {
+    "one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
+    "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10,
+    "eleven": 11, "twelve": 12, "thirteen": 13, "fourteen": 14,
+    "fifteen": 15, "sixteen": 16, "seventeen": 17, "eighteen": 18,
+    "nineteen": 19, "twenty": 20,
+}
+
+
+def extract_chapter_query_info(query: str) -> Optional[Dict[str, Any]]:
+    """
+    Detect if the user is asking about a specific chapter number.
+
+    Handles patterns like:
+      - "chapter 3", "chapter three", "ch 3", "ch. 3"
+      - "in chapter 5", "show me chapter 2", "what is in chapter 4"
+      - "summarize chapter 1"
+
+    Returns a dict with ``is_chapter_query``, ``chapter_num``, and
+    ``book_match``, or *None* if no chapter reference is found.
+    """
+    if not query:
+        return None
+
+    text_lower = str(query).strip().lower()
+
+    # Numeric chapter: "chapter 3", "ch. 3", "ch 3"
+    num_match = re.search(
+        r"\b(?:chapter|ch\.?)\s*(\d{1,3})\b",
+        text_lower,
+    )
+    if num_match:
+        chapter_num = int(num_match.group(1))
+        matched_span = num_match.span()
+    else:
+        # Ordinal word: "chapter three", "chapter one"
+        ordinal_pattern = "|".join(re.escape(w) for w in _CHAPTER_ORDINALS)
+        word_match = re.search(
+            rf"\b(?:chapter|ch\.?)\s+({ordinal_pattern})\b",
+            text_lower,
+        )
+        if word_match:
+            chapter_num = _CHAPTER_ORDINALS[word_match.group(1)]
+            matched_span = word_match.span()
+        else:
+            return None
+
+    if chapter_num < 1:
+        return None
+
+    # Check for known book mentions (reuse same KNOWN_BOOK_ALIASES if available)
+    book_match = None
+    try:
+        from src.rag_pipeline.query import KNOWN_BOOK_ALIASES as _aliases
+    except Exception:
+        _aliases = {}
+    for canonical_name, aliases in _aliases.items():
+        for alias in aliases:
+            if re.search(rf"\b{re.escape(alias)}\b", text_lower):
+                book_match = canonical_name
+                break
+        if book_match:
+            break
+
+    return {
+        "is_chapter_query": True,
+        "chapter_num": chapter_num,
+        "book_match": book_match,
+    }
+
+
 def prepare_search_query(
     query: str,
 ) -> Dict[str, Any]:
@@ -251,7 +420,8 @@ def prepare_search_query(
             "search_query": ...,
             "normalized_query": ...,
             "is_greeting": ...,
-            "is_multi_intent": ...
+            "is_multi_intent": ...,
+            "page_info": ...
         }
     """
 
@@ -260,6 +430,7 @@ def prepare_search_query(
 
     greeting = is_greeting(original_query)
     multi_intent = is_multi_intent_query(original_query)
+    page_info = extract_page_query_info(original_query)
 
     # IMPORTANT:
     # Do not aggressively rewrite the user's query.
@@ -272,6 +443,7 @@ def prepare_search_query(
         "normalized_query": normalized_query,
         "is_greeting": greeting,
         "is_multi_intent": multi_intent,
+        "page_info": page_info,
     }
 
 
@@ -322,4 +494,6 @@ def get_query_diagnostics(
         "tokens": tokens,
         "is_greeting": prepared["is_greeting"],
         "is_multi_intent": prepared["is_multi_intent"],
+        "page_info": prepared.get("page_info"),
     }
+

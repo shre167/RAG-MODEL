@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import hashlib
 import json
@@ -9,7 +9,7 @@ from typing import Any
 
 from src.config import (
     BM25_TOP_K,
-    CHUNK_OVERLAP,
+    CHUNK_MAX_TOKENS,
     CHUNK_SIZE,
     EMBEDDING_BATCH_SIZE,
     EMBEDDING_MODEL,
@@ -84,17 +84,8 @@ from src.rag_pipeline.kb_state import (
     delete_document as _delete_kb_document,
     get_current_kb_state,
     increment_kb_version,
+    sync_deleted_files as _sync_deleted_files,
 )
-
-# Image analysis (optional, runs only when ENABLE_IMAGE_ANALYSIS=true)
-try:
-    from src.config import ENABLE_IMAGE_ANALYSIS, IMAGE_ANALYSIS_MODEL
-    from src.image_analyzer import analyze_pdf_page_images
-    _IMAGE_ANALYSIS_AVAILABLE = True
-except ImportError:
-    _IMAGE_ANALYSIS_AVAILABLE = False
-    ENABLE_IMAGE_ANALYSIS = False
-    IMAGE_ANALYSIS_MODEL = ""
 
 logger = logging.getLogger(__name__)
 
@@ -140,7 +131,7 @@ class RAGPipeline:
         top_k: int = TOP_K,
         score_threshold: float = SCORE_THRESHOLD,
         chunk_size: int = CHUNK_SIZE,
-        chunk_overlap: int = CHUNK_OVERLAP,
+        chunk_overlap: int = CHUNK_MAX_TOKENS,
     ):
         self.knowledge_base_path = Path(knowledge_base_path)
         self.vectorstore_path = ensure_directory(vectorstore_path)
@@ -210,6 +201,20 @@ class RAGPipeline:
             "CrossEncoder reranker disabled; "
             "using Dense + BM25 + RRF only."
         )
+
+        # --------------------------------------------------------------
+        # Automatic Sync: purge any stale chunks for files deleted from disk
+        # --------------------------------------------------------------
+        try:
+            sync_res = self.sync_deleted_files()
+            if sync_res.get("removed"):
+                logger.info(
+                    "Pipeline startup: purged %d deleted files (%d chunks total)",
+                    len(sync_res["removed"]),
+                    sync_res.get("total_chunks_deleted", 0),
+                )
+        except Exception as exc:
+            logger.warning("Pipeline startup file sync failed: %s", exc)
 
     # ==================================================================
     # DELEGATING HELPERS
@@ -585,6 +590,8 @@ class RAGPipeline:
 
         self._reset_retrieval_indexes()
 
+        _ingest_t0 = __import__("time").perf_counter()
+
         if not self.knowledge_base_path.exists():
             self.knowledge_base_path.mkdir(
                 parents=True,
@@ -779,6 +786,31 @@ class RAGPipeline:
                 "Vector store is empty after ingestion."
             )
 
+        # Build and save manifest mapping each file to its chunk IDs and hash
+        manifest: dict[str, Any] = {}
+        file_chunks_map: dict[str, list[str]] = {}
+        for m, cid in zip(metadatas, ids):
+            fn = m.get("filename") or m.get("source") or "unknown"
+            file_chunks_map.setdefault(fn, []).append(cid)
+
+        for fn, chunk_ids_list in file_chunks_map.items():
+            f_path = self.knowledge_base_path / fn
+            f_hash = ""
+            if f_path.exists():
+                try:
+                    f_hash = hashlib.sha256(f_path.read_bytes()).hexdigest()
+                except Exception:
+                    pass
+            manifest[fn] = {
+                "hash": f_hash,
+                "chunk_ids": chunk_ids_list,
+            }
+        try:
+            self._save_manifest(manifest)
+            logger.info("Saved ingestion manifest for %d files.", len(manifest))
+        except Exception as exc:
+            logger.warning("Could not save manifest after ingest_documents: %s", exc)
+
         new_kb_state = increment_kb_version(self)
 
         return {
@@ -790,8 +822,7 @@ class RAGPipeline:
             "collection_count": count_after,
             "kb_version": new_kb_state.version,
             "indexes_consistent": new_kb_state.indexes_consistent,
-            "chunks_with_images": sum(1 for c in chunks if c.get("has_images", False)),
-            "chunks_with_images_described": sum(1 for c in chunks if c.get("image_description")),
+            "ingestion_time_ms": round((__import__("time").perf_counter() - _ingest_t0) * 1000, 1),
         }
 
     def ingest_file(
@@ -913,6 +944,8 @@ class RAGPipeline:
         # Clean + chunk
         # --------------------------------------------------------------
 
+        _ingest_file_t0 = __import__("time").perf_counter()
+
         docs = load_document(
             file_path,
             content=raw_bytes,
@@ -943,65 +976,6 @@ class RAGPipeline:
                 f"No usable content found in "
                 f"{filename} after chunking."
             )
-
-        # ----------------------------------------------------------
-        # IMAGE ANALYSIS (optional, PDF only)
-        # ----------------------------------------------------------
-        if (
-            _IMAGE_ANALYSIS_AVAILABLE
-            and ENABLE_IMAGE_ANALYSIS
-            and str(file_path).lower().endswith(".pdf")
-            and IMAGE_ANALYSIS_MODEL
-        ):
-            _img_api_key = GE_API_KEY or LLM_API_KEY
-            _img_base_url = LLM_BASE_URL
-            if _img_api_key and _img_base_url:
-                logger.info(
-                    "Running image analysis on %s (%d chunks with images)...",
-                    filename,
-                    sum(1 for c in new_chunks if c.get("has_images", False)),
-                )
-                # Group chunks by page to avoid re-analyzing the same page twice
-                analyzed_pages: dict[int, str] = {}
-                for chunk in new_chunks:
-                    if not chunk.get("has_images", False):
-                        continue
-                    p_start = chunk.get("page_start")
-                    if p_start is None:
-                        continue
-                    page_idx = int(p_start) - 1  # fitz is 0-indexed
-                    if page_idx in analyzed_pages:
-                        chunk["image_description"] = analyzed_pages[page_idx]
-                        continue
-                    try:
-                        ch_title = chunk.get("chapter_title") or ""
-                        sec_title = chunk.get("section_title") or ""
-                        hint = f"{ch_title} {sec_title}".strip()
-                        desc = analyze_pdf_page_images(
-                            str(file_path),
-                            page_idx,
-                            api_key=_img_api_key,
-                            base_url=_img_base_url,
-                            model=IMAGE_ANALYSIS_MODEL,
-                            context_hint=hint,
-                        )
-                        analyzed_pages[page_idx] = desc
-                        chunk["image_description"] = desc
-                        if desc:
-                            chunk["text"] = (
-                                (chunk.get("text") or "")
-                                + "\n\n[Visual content on this page: "
-                                + desc
-                                + "]"
-                            ).strip()
-                            logger.debug(
-                                "Page %d image: %s...", p_start, desc[:80]
-                            )
-                    except Exception as _img_exc:
-                        logger.warning(
-                            "Image analysis failed for page %d: %s",
-                            p_start, _img_exc,
-                        )
 
         texts = [
             chunk["text"]
@@ -1190,8 +1164,7 @@ class RAGPipeline:
             ),
             "kb_version": new_kb_state.version,
             "indexes_consistent": new_kb_state.indexes_consistent,
-            "chunks_with_images": sum(1 for c in new_chunks if c.get("has_images", False)),
-            "chunks_with_images_described": sum(1 for c in new_chunks if c.get("image_description")),
+            "ingestion_time_ms": round((__import__("time").perf_counter() - _ingest_file_t0) * 1000, 1),
         }
 
     # ==================================================================
@@ -1219,6 +1192,15 @@ class RAGPipeline:
             filename,
             delete_file_from_disk=delete_file_from_disk,
         )
+
+    def sync_deleted_files(self) -> dict[str, Any]:
+        """
+        Scan the manifest for files no longer present on disk and purge their
+        chunks from Chroma, BM25, and the manifest immediately.
+
+        Call this on startup and after any ingestion to keep indexes clean.
+        """
+        return _sync_deleted_files(self)
 
     def _manifest_path(
         self,
@@ -1315,6 +1297,8 @@ class RAGPipeline:
                 or Path(filename).suffix.lstrip(".").lower()
                 or "pdf"
             ),
+            "is_front_matter": bool(chunk.get("is_front_matter", False)),
+            "source_label": chunk.get("source_label") or "",
         }
 
         safe_meta = {}
@@ -1546,7 +1530,7 @@ class RAGPipeline:
                 return sub_answers
 
         # --------------------------------------------------------------
-        # 3. VALIDATE KNOWLEDGE BASE
+        # 3. VALIDATE KNOWLEDGE BASE & SYNC DELETED FILES
         # --------------------------------------------------------------
 
         if not self.knowledge_base_path.exists():
@@ -1555,6 +1539,12 @@ class RAGPipeline:
                 "Add documents and run ingestion.",
                 response_type="error",
             )
+
+        # Ensure any file deleted from disk is immediately purged from all stores
+        try:
+            self.sync_deleted_files()
+        except Exception as _sync_exc:
+            logger.debug("Automatic pre-query deleted files sync: %s", _sync_exc)
 
         # --------------------------------------------------------------
         # 4. VALIDATE VECTOR STORE
@@ -1619,93 +1609,173 @@ class RAGPipeline:
         )
 
         # --------------------------------------------------------------
-        # 6-8. QUERY EMBEDDING + DENSE + BM25
-        # For hybrid: embedding API call and BM25 tokenization run
-        # concurrently to eliminate the sequential network wait.
+        # 6-8. QUERY EMBEDDING + DENSE + BM25 + PAGE RETRIEVAL
         # --------------------------------------------------------------
         import concurrent.futures as _cf
+
+        from src.rag_pipeline.query import extract_page_query_info
+        page_info = extract_page_query_info(question)
+
+        # ----------------------------------------------------------
+        # Chapter-specific retrieval
+        # ----------------------------------------------------------
+        from src.rag_pipeline.query import extract_chapter_query_info
+        chapter_info = extract_chapter_query_info(question)
+
+        chapter_candidates: dict[str, Candidate] = {}
+        if chapter_info and chapter_info.get("is_chapter_query"):
+            from src.rag_pipeline.retrieval import chapter_retrieve
+            chapter_retrieve(
+                vector_store=self.vector_store,
+                chapter_num=chapter_info["chapter_num"],
+                book_title=chapter_info.get("book_match"),
+                candidates=chapter_candidates,
+            )
+            logger.info(
+                "Chapter retrieval found %d candidates for chapter %s (book: %s)",
+                len(chapter_candidates),
+                chapter_info["chapter_num"],
+                chapter_info.get("book_match"),
+            )
+
+        # Check for page-specific retrieval
+        page_candidates: dict[str, Candidate] = {}
+        if page_info and page_info.get("is_page_query"):
+            from src.rag_pipeline.retrieval import page_retrieve
+            page_retrieve(
+                vector_store=self.vector_store,
+                page_start=page_info["page_start"],
+                page_end=page_info.get("page_end"),
+                book_title=page_info.get("book_match"),
+                candidates=page_candidates,
+            )
+            logger.info(
+                "Page retrieval found %d candidates for page %s (book: %s)",
+                len(page_candidates),
+                page_info["page_start"],
+                page_info.get("book_match"),
+            )
+            if not page_candidates:
+                target_p = page_info["page_start"]
+                target_b = page_info.get("book_match")
+                logger.warning(
+                    "Page %s not found in index (book: %s); falling back to semantic search.",
+                    target_p,
+                    target_b,
+                )
+                # Do NOT early-exit. Fall through to semantic + BM25 retrieval below.
+                # The LLM context will note that no exact page match was found.
 
         query_embedding = None
         candidates: dict[str, Candidate] = {}
         bm25_query_tokens: list[str] = []
-
-        need_dense = (
-            collection_count > 0
-            and retrieval_mode in {"vector", "hybrid"}
-        )
-        need_bm25 = retrieval_mode in {"bm25", "hybrid"}
-
         _retrieval_t0 = __import__("time").perf_counter()
-        if retrieval_mode == "hybrid" and need_dense:
-            # CONCURRENT PATH: embed + bm25-tokenize in parallel
-            _embed_result: list | None = None
-            _dense_candidates: dict = {}
 
-            def _run_dense() -> None:
-                nonlocal _embed_result, _dense_candidates
-                try:
-                    _embed_result = self.embedding_service.create_embedding(search_text)
-                    if _embed_result:
-                        _dense_candidates = self._dense_retrieve(_embed_result)
-                        for c in _dense_candidates.values():
-                            c.in_dense = True
-                except Exception as exc:
-                    logger.warning("Concurrent dense retrieval failed: %s", exc)
+        is_pure_page_query = bool(page_info and page_info.get("is_pure_page_query") and page_candidates)
+        is_pure_chapter_query = bool(chapter_info and chapter_info.get("is_chapter_query") and chapter_candidates and not page_candidates)
 
-            def _run_bm25_tokenize() -> None:
-                nonlocal bm25_query_tokens
-                try:
-                    if self.bm25 is not None:
-                        bm25_query_tokens = self.bm25._tokenize(search_text)
-                except Exception:
-                    bm25_query_tokens = []
-
-            with _cf.ThreadPoolExecutor(max_workers=2) as _pool:
-                _f_dense = _pool.submit(_run_dense)
-                _f_bm25t = _pool.submit(_run_bm25_tokenize)
-                _f_dense.result()
-                _f_bm25t.result()
-
-            query_embedding = _embed_result
-            candidates.update(_dense_candidates)
-
-            # BM25 retrieve runs main-thread (mutates shared candidates dict)
-            if need_bm25:
-                self._bm25_retrieve(search_text, candidates)
-                for c in candidates.values():
-                    if c.bm25_rank is not None:
-                        c.in_bm25 = True
-
-        else:
-            # SEQUENTIAL PATH (vector-only or bm25-only)
-            if need_dense:
-                try:
-                    query_embedding = self.embedding_service.create_embedding(search_text)
-                except Exception as exc:
-                    logger.warning("Query embedding failed: %s", exc)
-
-            if need_dense and query_embedding:
-                candidates = self._dense_retrieve(query_embedding)
-                for c in candidates.values():
-                    c.in_dense = True
-
+        if is_pure_page_query:
+            # Pure page lookup: use page candidates directly
+            candidates.update(page_candidates)
             if self.bm25 is not None:
                 try:
                     bm25_query_tokens = self.bm25._tokenize(search_text)
                 except Exception:
                     bm25_query_tokens = []
+        elif is_pure_chapter_query:
+            # Pure chapter lookup: use chapter candidates directly
+            candidates.update(chapter_candidates)
+            if self.bm25 is not None:
+                try:
+                    bm25_query_tokens = self.bm25._tokenize(search_text)
+                except Exception:
+                    bm25_query_tokens = []
+        else:
+            need_dense = (
+                collection_count > 0
+                and retrieval_mode in {"vector", "hybrid"}
+            )
+            need_bm25 = retrieval_mode in {"bm25", "hybrid"}
 
-            if need_bm25:
-                self._bm25_retrieve(search_text, candidates)
-                for c in candidates.values():
-                    if c.bm25_rank is not None:
-                        c.in_bm25 = True
-            elif retrieval_mode == "vector" and not candidates and self.bm25 is not None:
-                logger.info("Dense retrieval yielded no results; falling back to BM25.")
-                self._bm25_retrieve(search_text, candidates)
-                for c in candidates.values():
-                    if c.bm25_rank is not None:
-                        c.in_bm25 = True
+            _retrieval_t0 = __import__("time").perf_counter()
+            if retrieval_mode == "hybrid" and need_dense:
+                # CONCURRENT PATH: embed + bm25-tokenize in parallel
+                _embed_result: list | None = None
+                _dense_candidates: dict = {}
+
+                def _run_dense() -> None:
+                    nonlocal _embed_result, _dense_candidates
+                    try:
+                        _embed_result = self.embedding_service.create_embedding(search_text)
+                        if _embed_result:
+                            _dense_candidates = self._dense_retrieve(_embed_result)
+                            for c in _dense_candidates.values():
+                                c.in_dense = True
+                    except Exception as exc:
+                        logger.warning("Concurrent dense retrieval failed: %s", exc)
+
+                def _run_bm25_tokenize() -> None:
+                    nonlocal bm25_query_tokens
+                    try:
+                        if self.bm25 is not None:
+                            bm25_query_tokens = self.bm25._tokenize(search_text)
+                    except Exception:
+                        bm25_query_tokens = []
+
+                with _cf.ThreadPoolExecutor(max_workers=2) as _pool:
+                    _f_dense = _pool.submit(_run_dense)
+                    _f_bm25t = _pool.submit(_run_bm25_tokenize)
+                    _f_dense.result()
+                    _f_bm25t.result()
+
+                query_embedding = _embed_result
+                candidates.update(_dense_candidates)
+
+                # BM25 retrieve runs main-thread (mutates shared candidates dict)
+                if need_bm25:
+                    self._bm25_retrieve(search_text, candidates)
+                    for c in candidates.values():
+                        if c.bm25_rank is not None:
+                            c.in_bm25 = True
+
+            else:
+                # SEQUENTIAL PATH (vector-only or bm25-only)
+                if need_dense:
+                    try:
+                        query_embedding = self.embedding_service.create_embedding(search_text)
+                    except Exception as exc:
+                        logger.warning("Query embedding failed: %s", exc)
+
+                if need_dense and query_embedding:
+                    candidates = self._dense_retrieve(query_embedding)
+                    for c in candidates.values():
+                        c.in_dense = True
+
+                if self.bm25 is not None:
+                    try:
+                        bm25_query_tokens = self.bm25._tokenize(search_text)
+                    except Exception:
+                        bm25_query_tokens = []
+
+                if need_bm25:
+                    self._bm25_retrieve(search_text, candidates)
+                    for c in candidates.values():
+                        if c.bm25_rank is not None:
+                            c.in_bm25 = True
+                elif retrieval_mode == "vector" and not candidates and self.bm25 is not None:
+                    logger.info("Dense retrieval yielded no results; falling back to BM25.")
+                    self._bm25_retrieve(search_text, candidates)
+                    for c in candidates.values():
+                        if c.bm25_rank is not None:
+                            c.in_bm25 = True
+
+            # Merge any page-specific candidates
+            if page_candidates:
+                candidates.update(page_candidates)
+
+            # Merge any chapter-specific candidates
+            if chapter_candidates:
+                candidates.update(chapter_candidates)
 
         # OBSERVATORY: snapshot raw Dense results BEFORE BM25 merges in
         raw_dense_results = [

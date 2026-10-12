@@ -1,4 +1,4 @@
-﻿"""
+"""
 Unified Vector Store - Automatically uses PostgreSQL if available, falls back to Chroma.
 """
 from __future__ import annotations
@@ -56,7 +56,48 @@ class UnifiedVectorStore:
     
     def query(self, query_embedding: List[float], n_results: int = 5) -> Dict[str, Any]:
         return self._backend.query(query_embedding, n_results)
-    
+
+    def get_chunks_by_page(
+        self,
+        page_start: int,
+        page_end: int | None = None,
+        book_title: str | None = None,
+    ) -> List[Dict[str, Any]]:
+        if hasattr(self._backend, "get_chunks_by_page"):
+            return self._backend.get_chunks_by_page(page_start, page_end, book_title)
+        return []
+
+    def delete_by_ids(self, ids: List[str]) -> int:
+        if hasattr(self._backend, "delete_by_ids"):
+            return self._backend.delete_by_ids(ids)
+        if hasattr(self._backend, "collection") and hasattr(self._backend.collection, "delete"):
+            self._backend.collection.delete(ids=ids)
+            return len(ids)
+        return 0
+
+    def delete_file(self, filename: str) -> int:
+        if hasattr(self._backend, "delete_file"):
+            return self._backend.delete_file(filename)
+        if hasattr(self._backend, "collection") and hasattr(self._backend.collection, "delete"):
+            try:
+                self._backend.collection.delete(where={"filename": filename})
+            except Exception:
+                pass
+        return 0
+
+    def delete(self, ids: List[str] | None = None, where: Dict[str, Any] | None = None) -> int:
+        if hasattr(self._backend, "delete"):
+            return self._backend.delete(ids=ids, where=where)
+        if hasattr(self._backend, "collection") and hasattr(self._backend.collection, "delete"):
+            kwargs = {}
+            if ids:
+                kwargs["ids"] = ids
+            if where:
+                kwargs["where"] = where
+            if kwargs:
+                self._backend.collection.delete(**kwargs)
+        return 0
+
     def delete_collection(self) -> None:
         self._backend.delete_collection()
     

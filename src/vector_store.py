@@ -157,6 +157,105 @@ class ChromaVectorStore:
         results = self.collection.query(query_embeddings=[query_embedding], n_results=effective_n)
         return results
 
+    def get_chunks_by_page(
+        self,
+        page_start: int,
+        page_end: int | None = None,
+        book_title: str | None = None,
+    ) -> List[Dict[str, Any]]:
+        """Retrieve all chunks that cover the specified page or page range."""
+        target_end = page_end if page_end is not None else page_start
+        cnt = self.get_collection_count()
+        if cnt == 0:
+            return []
+
+        try:
+            # Build Chroma native where filter for efficient range lookup.
+            # Chroma supports $lte and $gte operators in the where clause.
+            where_conditions: list[dict] = [
+                {"page_start": {"$lte": target_end}},
+                {"page_end": {"$gte": page_start}},
+            ]
+
+            try:
+                if book_title:
+                    # Exact book_title match as an additional filter.
+                    # Fall back to Python-side filtering if Chroma rejects $and with 3 conditions.
+                    where_clause: dict = {
+                        "$and": [
+                            {"page_start": {"$lte": target_end}},
+                            {"page_end": {"$gte": page_start}},
+                            {"book_title": {"$eq": book_title}},
+                        ]
+                    }
+                else:
+                    where_clause = {
+                        "$and": [
+                            {"page_start": {"$lte": target_end}},
+                            {"page_end": {"$gte": page_start}},
+                        ]
+                    }
+                data = self.collection.get(
+                    where=where_clause,
+                    include=["documents", "metadatas"],
+                )
+            except Exception as where_exc:
+                # Chroma version may not support $and/$lte/$gte — fall back to full scan.
+                logger.warning(
+                    "Chroma where-filter failed (%s); falling back to full scan.",
+                    where_exc,
+                )
+                data = self.collection.get(include=["documents", "metadatas"])
+
+            docs = data.get("documents") or []
+            metas = data.get("metadatas") or []
+            ids = data.get("ids") or []
+
+            results: List[Dict[str, Any]] = []
+            for cid, doc, meta in zip(ids, docs, metas):
+                if not meta or not doc:
+                    continue
+                p_s = meta.get("page_start") or meta.get("page_number")
+                p_e = meta.get("page_end") or p_s
+                if p_s is None:
+                    continue
+                try:
+                    p_s = int(p_s)
+                    p_e = int(p_e)
+                except (ValueError, TypeError):
+                    continue
+
+                # Re-apply range check in case the fallback path ran.
+                if p_s <= target_end and p_e >= page_start:
+                    if book_title:
+                        b_cand = str(
+                            meta.get("book_title")
+                            or meta.get("book_name")
+                            or meta.get("filename")
+                            or ""
+                        ).lower()
+                        b_target = book_title.lower()
+                        if b_target not in b_cand and b_cand not in b_target:
+                            continue
+
+                    results.append({
+                        "id": cid,
+                        "text": str(doc),
+                        "metadata": dict(meta),
+                    })
+
+            results.sort(
+                key=lambda x: (
+                    str(x["metadata"].get("book_title") or ""),
+                    int(x["metadata"].get("page_start") or 0),
+                    str(x["id"]),
+                )
+            )
+            return results
+        except Exception as exc:
+            logger.warning("Could not get chunks by page from Chroma: %s", exc)
+            return []
+
     def delete_collection(self) -> None:
         """Explicit collection deletion — never called automatically by this class."""
         self.client.delete_collection(name=self.collection_name)

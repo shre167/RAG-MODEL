@@ -40,7 +40,12 @@ def render_comparison_page(pipeline: RAGPipeline) -> None:
 
 def _normalize_chunk(c: dict[str, Any], index: int = 0) -> dict[str, Any]:
     """Ensure all required canonical metadata fields are present."""
-    text = str(c.get("text") or "").strip()
+    text = str(
+        c.get("text")
+        or c.get("document")
+        or c.get("page_content")
+        or ""
+    ).strip()
     filename = str(c.get("filename") or c.get("book_name") or c.get("source_name") or "untitled_document.pdf")
     
     # Resolve clean human-readable book title
@@ -106,7 +111,7 @@ def render_chunk_explorer(chunks: list[dict[str, Any]], pipeline: Any = None) ->
     Chunk Explorer organized around book and chapter hierarchy.
     Exposes canonical summary, chapter distribution, per-book breakdown,
     hierarchical Chapter -> Section -> Chunks accordion, and
-    individual chunk inspection with boundary context.
+    individual chunk inspection with full paragraph text.
     """
     # 1. Fallback to Chroma if chunks empty
     if not chunks and pipeline and hasattr(pipeline, "vector_store"):
@@ -416,59 +421,24 @@ def render_chunk_explorer(chunks: list[dict[str, Any]], pipeline: Any = None) ->
     det_c7.metric("Character Count", f"{selected_chunk['character_count']} chars")
     det_c8.metric("PDF Filename", selected_chunk["filename"][:20] + ("..." if len(selected_chunk["filename"]) > 20 else ""))
 
-    st.markdown(f"**Chunk ID:** `{selected_chunk['chunk_id']}`")
+    st.caption(f"Chunk ID: `{selected_chunk['chunk_id']}`")
     if selected_chunk["chapter_title"]:
         st.markdown(f"**Chapter Title:** {selected_chunk['chapter_title']}")
     if selected_chunk["section_heading"]:
         st.markdown(f"**Section Heading:** {selected_chunk['section_heading']}")
 
-    # Full Chunk Text
-    st.markdown("**Full Chunk Text:**")
-    st.code(selected_chunk["text"], language="text")
-
-    # =========================================================================
-    # 6. BOUNDARY VIEW (Previous chunk → Current chunk → Next chunk)
-    # =========================================================================
-    render_html(render_section_title("Boundary Context View (Previous → Current → Next)"))
-
-    b_prev, b_curr, b_next = st.columns(3)
-
-    prev_id = selected_chunk.get("prev_chunk_id")
-    prev_chunk = chunk_by_id.get(prev_id) if prev_id else None
-
-    next_id = selected_chunk.get("next_chunk_id")
-    next_chunk = chunk_by_id.get(next_id) if next_id else None
-
-    with b_prev:
-        st.markdown("### ⬅️ Previous Chunk")
-        if prev_chunk:
-            st.markdown(f"**Chunk #{prev_chunk['chunk_index']:03d}** (pp. {prev_chunk['page_range']})")
-            st.caption(f"{prev_chunk['token_count']} tokens | Ch. {prev_chunk['chapter_num']}")
-            st.code((prev_chunk["text"][:280] + "...") if len(prev_chunk["text"]) > 280 else prev_chunk["text"], language="text")
-            if st.button("⬅️ Navigate to Previous", key="nav_to_prev", use_container_width=True):
-                st.session_state.selected_chunk_id = prev_chunk["chunk_id"]
-                st.rerun()
-        else:
-            st.info("None (Beginning of Document)")
-
-    with b_curr:
-        st.markdown("### 🎯 Current Chunk")
-        st.markdown(f"**Chunk #{selected_chunk['chunk_index']:03d}** (pp. {selected_chunk['page_range']})")
-        st.caption(f"{selected_chunk['token_count']} tokens | Ch. {selected_chunk['chapter_num']}")
-        st.code((selected_chunk["text"][:280] + "...") if len(selected_chunk["text"]) > 280 else selected_chunk["text"], language="text")
-        st.success("Currently Inspected")
-
-    with b_next:
-        st.markdown("### ➡️ Next Chunk")
-        if next_chunk:
-            st.markdown(f"**Chunk #{next_chunk['chunk_index']:03d}** (pp. {next_chunk['page_range']})")
-            st.caption(f"{next_chunk['token_count']} tokens | Ch. {next_chunk['chapter_num']}")
-            st.code((next_chunk["text"][:280] + "...") if len(next_chunk["text"]) > 280 else next_chunk["text"], language="text")
-            if st.button("➡️ Navigate to Next", key="nav_to_next", use_container_width=True):
-                st.session_state.selected_chunk_id = next_chunk["chunk_id"]
-                st.rerun()
-        else:
-            st.info("None (End of Document)")
+    chunk_body = selected_chunk["text"]
+    st.markdown("**Chunk text**")
+    if chunk_body.strip():
+        st.text_area(
+            "Paragraph content",
+            value=chunk_body,
+            height=min(400, max(120, len(chunk_body) // 3)),
+            disabled=True,
+            label_visibility="collapsed",
+        )
+    else:
+        st.warning("No paragraph text is stored for this chunk.")
 
     # Expandable Raw JSON View
     with st.expander("Raw Metadata / JSON View", expanded=False):

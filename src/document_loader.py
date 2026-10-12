@@ -62,6 +62,17 @@ OVERSIZED_PARAGRAPH_OVERLAP = int(
 
 MERGE_SLACK = int(os.getenv("CHUNK_MERGE_SLACK", "30"))
 
+
+def get_chunking_config() -> dict[str, int]:
+    """Token-based chunking settings used by the canonical chunker."""
+    return {
+        "target_tokens": TARGET_TOKENS,
+        "max_tokens": MAX_TOKENS,
+        "min_tokens": MIN_TOKENS,
+        "paragraph_overlap_tokens": OVERSIZED_PARAGRAPH_OVERLAP,
+    }
+
+
 # OCR_MODE is intentionally NOT cached at module level â€”
 # read it dynamically so callers can set the env var after import.
 def _get_ocr_mode() -> str:
@@ -1803,6 +1814,7 @@ def _flush_chunk(
     chapter_title: str | None,
     section_title: str | None,
     book_name: str = "",
+    is_front_matter: bool = False,
 ) -> None:
 
     if not paragraphs:
@@ -1871,6 +1883,7 @@ def _flush_chunk(
             "page_end": page_end,
             "token_count": count_tokens(text),
             "has_images": has_images,
+            "is_front_matter": is_front_matter,
         }
     )
 
@@ -2104,13 +2117,68 @@ def _chunk_book(
         # Safer fallback: don't throw away the entire document.
         # Start from the first page containing substantial text.
         for index, page in enumerate(pages):
-            if len(page.get("text", "").strip()) >= 300:
+            if len(page.get("text", "").strip()) >= 100:
                 start_index = index
                 fallback_to_plain_text = True
                 break
 
     if start_index is None:
         return []
+
+    # --------------------------------------------------------
+    # Ingest front-matter pages (everything before Chapter 1)
+    # as separate chunks tagged is_front_matter=True so that
+    # page-number queries for TOC/preface/dedication pages still
+    # return content instead of a hard "page not found" error.
+    # --------------------------------------------------------
+
+    front_matter_chunks: list[dict[str, Any]] = []
+
+    if start_index > 0:
+        fm_pages = pages[:start_index]
+        fm_vocabulary = build_vocabulary(fm_pages)
+        fm_paragraphs: list[dict[str, Any]] = []
+        for page in fm_pages:
+            if len(page.get("text", "").strip()) < 30:
+                continue  # skip truly empty pages (blank, cover image-only)
+            fm_paragraphs.extend(
+                reconstruct_paragraphs(page, fm_vocabulary)
+            )
+        fm_paragraphs = merge_cross_page_paragraphs(fm_paragraphs, fm_vocabulary)
+
+        fm_current_paras: list[dict[str, Any]] = []
+        for para in fm_paragraphs:
+            text = clean_text(para.get("text", ""))
+            if not text:
+                continue
+            fm_current_paras.append(dict(para))
+            # Flush when we hit the token target
+            candidate_tokens = count_tokens(
+                clean_text("\n\n".join(p["text"] for p in fm_current_paras))
+            )
+            if candidate_tokens >= TARGET_TOKENS:
+                _flush_chunk(
+                    front_matter_chunks,
+                    fm_current_paras,
+                    book_id,
+                    chapter_num=None,
+                    chapter_title=None,
+                    section_title=None,
+                    book_name=book_name,
+                    is_front_matter=True,
+                )
+                fm_current_paras = []
+        # Flush remainder
+        _flush_chunk(
+            front_matter_chunks,
+            fm_current_paras,
+            book_id,
+            chapter_num=None,
+            chapter_title=None,
+            section_title=None,
+            book_name=book_name,
+            is_front_matter=True,
+        )
 
     pages = pages[start_index:]
     allow_unstructured_content = fallback_to_plain_text
@@ -2162,7 +2230,15 @@ def _chunk_book(
     # Iterate paragraphs.
     # --------------------------------------------------------
 
-    for paragraph in paragraphs:
+    _skip_para_index: int | None = None  # index of a para consumed by chapter-title look-ahead
+
+    for para_index, paragraph in enumerate(paragraphs):
+
+        # Skip paragraphs already consumed by look-ahead (e.g. the chapter
+        # title line that immediately follows a bare "CHAPTER N" line).
+        if _skip_para_index is not None and para_index == _skip_para_index:
+            _skip_para_index = None
+            continue
 
         text = clean_text(
             paragraph.get(
@@ -2215,6 +2291,21 @@ def _chunk_book(
                 current_chunk_paragraphs = []
 
                 current_chapter = chapter_number
+                # If parse_chapter_line found no inline title, look ahead
+                # to the next paragraph for the chapter title.
+                if chapter_title is None and para_index + 1 < len(paragraphs):
+                    _next_raw = clean_text(
+                        paragraphs[para_index + 1].get("text", "")
+                    )
+                    if (
+                        _next_raw
+                        and len(_next_raw) <= 120
+                        and not parse_chapter_line(_next_raw)
+                        and not parse_bare_chapter_line(_next_raw)
+                        and not _is_toc_line(_next_raw)
+                    ):
+                        chapter_title = _next_raw
+                        _skip_para_index = para_index + 1  # consumed
                 current_chapter_title = chapter_title
                 current_section = None
 
@@ -2244,7 +2335,24 @@ def _chunk_book(
                 current_chunk_paragraphs = []
 
                 current_chapter = bare_chapter
-                current_chapter_title = None
+                # Look ahead one paragraph for the chapter title
+                # (books that put "CHAPTER N" on one line and the
+                # title on the next).
+                _next_title: str | None = None
+                if para_index + 1 < len(paragraphs):
+                    _next_raw = clean_text(
+                        paragraphs[para_index + 1].get("text", "")
+                    )
+                    if (
+                        _next_raw
+                        and len(_next_raw) <= 120
+                        and not parse_chapter_line(_next_raw)
+                        and not parse_bare_chapter_line(_next_raw)
+                        and not _is_toc_line(_next_raw)
+                    ):
+                        _next_title = _next_raw
+                        _skip_para_index = para_index + 1  # consumed
+                current_chapter_title = _next_title
                 current_section = None
 
                 continue
@@ -2360,6 +2468,11 @@ def _chunk_book(
     chunks = _merge_small_chunks(
         chunks
     )
+
+    # Prepend front-matter chunks (TOC, preface, dedication, etc.)
+    # so page-number queries on those pages return content.
+    if front_matter_chunks:
+        chunks = front_matter_chunks + chunks
 
     # --------------------------------------------------------
     # Add stable IDs and neighbor links.
@@ -2972,16 +3085,7 @@ def chunk_to_chroma_record(
                 0,
             )
         ),
-        "has_images": bool(
-            chunk.get(
-                "has_images",
-                False,
-            )
-        ),
     }
-
-    if chunk.get("image_description"):
-        metadata["image_description"] = str(chunk["image_description"])[:1000]
 
     if chunk.get("chapter_num") is not None:
         metadata["chapter_num"] = int(

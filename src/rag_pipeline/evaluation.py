@@ -222,7 +222,9 @@ def evaluate_direct_answer_support(
 
         # Score this candidate's direct answer capability
         cand_support = 0.0
-        if definitional_sents:
+        if cand.metadata.get("is_page_match"):
+            cand_support += 75.0
+        elif definitional_sents:
             cand_support += 50.0 + min(30.0, len(definitional_sents) * 15.0)
         elif density > 0.1:
             cand_support += 30.0 + min(20.0, density * 50.0)

@@ -107,10 +107,17 @@ def _lexical_overlap_ratio(
     )
 
 
+def _has_page_support(candidate: Candidate) -> bool:
+    return bool(candidate.metadata.get("is_page_match"))
+
+
 def _has_direct_text_support(
     candidate: Candidate,
     query_tokens: set[str],
 ) -> bool:
+    if _has_page_support(candidate):
+        return True
+
     if not query_tokens:
         return False
 
@@ -129,6 +136,7 @@ def _has_direct_text_support(
             return True
 
     return False
+
 
 
 def _has_lexical_support(
@@ -507,18 +515,22 @@ def evaluate_evidence(
         # Strong
         #
         # Requires:
-        # - both retrievers agree
-        # - RRF above strong threshold
-        # - direct/lexical support
+        # - verified page support OR
+        # - both retrievers agree + RRF above strong threshold + direct/lexical support
         # ----------------------------------------------------------
 
+        page_supported = _has_page_support(top)
+
         strong = bool(
-            agreement
-            and top_score
-            >= STRONG_RRF_THRESHOLD
-            and (
-                lexical
-                or direct
+            page_supported
+            or (
+                agreement
+                and top_score
+                >= STRONG_RRF_THRESHOLD
+                and (
+                    lexical
+                    or direct
+                )
             )
         )
 
@@ -529,12 +541,15 @@ def evaluate_evidence(
         # ----------------------------------------------------------
 
         moderate = bool(
-            top_score
-            >= RRF_ABSTAIN_FLOOR
-            and (
-                lexical
-                or direct
-                or agreement
+            page_supported
+            or (
+                top_score
+                >= RRF_ABSTAIN_FLOOR
+                and (
+                    lexical
+                    or direct
+                    or agreement
+                )
             )
         )
 
@@ -598,6 +613,9 @@ def evaluate_evidence(
             top_percentile=top_percentile,
             retrieval_mode=mode,
             reason=(
+                f"Answer supported by verified content from page {top.metadata.get('target_page', 'requested')}."
+                if page_supported
+                else
                 "Answer supported by agreement "
                 "between Dense and BM25 with "
                 "direct/lexical support."
