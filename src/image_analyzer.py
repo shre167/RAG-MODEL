@@ -26,7 +26,7 @@ def extract_page_images(pdf_path: str, page_index: int) -> list[bytes]:
     Returns a list of image bytes. Empty list if no images or extraction fails.
     """
     try:
-        import fitz
+        import pymupdf as fitz
         doc = fitz.open(pdf_path)
         try:
             page = doc[page_index]

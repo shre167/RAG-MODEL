@@ -236,7 +236,14 @@ def is_multi_intent_query(query: str) -> bool:
     return False
 
 
-KNOWN_BOOK_ALIASES = {
+# ---------------------------------------------------------------------------
+# Book alias registry — static seed kept for backwards compatibility.
+# get_book_aliases() merges these with every doc currently in the vector
+# store, so newly ingested books are recognised in page/chapter queries
+# automatically without any code changes.
+# ---------------------------------------------------------------------------
+
+_STATIC_BOOK_ALIASES: dict[str, list[str]] = {
     "Deep Work": [
         "deep work",
         "deepwork",
@@ -258,12 +265,118 @@ KNOWN_BOOK_ALIASES = {
     ],
 }
 
+# Keep the old name so any direct imports still work.
+KNOWN_BOOK_ALIASES = _STATIC_BOOK_ALIASES
 
-def extract_page_query_info(query: str) -> Optional[Dict[str, Any]]:
+
+def _aliases_for_filename(filename: str) -> list[str]:
+    """Auto-generate query aliases from a document filename.
+
+    Examples
+    --------
+    "Atomic Habits (James Clear).pdf"
+        -> ["atomic habits (james clear)", "atomic habits", "james clear",
+            "clear", "atomic", "habits"]
+    "Deep_Work_Newport_2016.pdf"
+        -> ["deep_work_newport_2016", "deep work newport 2016",
+            "deep", "work", "newport", ...]
+    """
+    from pathlib import Path as _Path
+
+    stem = _Path(filename).stem
+    base = stem.lower()
+    aliases: list[str] = [base]
+
+    # version without underscores/hyphens
+    spaced = re.sub(r"[_\-]+", " ", base).strip()
+    if spaced != base:
+        aliases.append(spaced)
+
+    # strip parenthesised author/edition segments and keep them separately
+    inner_parts = re.findall(r"\(([^)]+)\)", base)
+    clean = re.sub(r"\s*\([^)]*\)", "", spaced).strip()
+    if clean and clean not in aliases:
+        aliases.append(clean)
+    for part in inner_parts:
+        part = part.strip()
+        if part and part not in aliases:
+            aliases.append(part)
+
+    # drop common edition/volume noise
+    clean2 = re.sub(
+        r"\b(vol|volume|edition|ed|book|part|no|num|number)\b\.?\s*\d*",
+        "",
+        clean,
+    ).strip()
+    clean2 = re.sub(r"\s+", " ", clean2).strip()
+    if clean2 and clean2 not in aliases:
+        aliases.append(clean2)
+
+    # individual significant words (>=4 chars, skip stop words)
+    _stop = {
+        "with", "from", "that", "this", "they", "your", "have", "been",
+        "what", "when", "will", "more", "time", "into", "over", "also",
+    }
+    for word in re.findall(r"[a-z]{4,}", spaced):
+        if word not in _stop and word not in aliases:
+            aliases.append(word)
+
+    return [a for a in aliases if a]
+
+
+def get_book_aliases(vector_store: Any | None = None) -> dict[str, list[str]]:
+    """Return the full alias map: static entries + every ingested document.
+
+    Parameters
+    ----------
+    vector_store:
+        Optional UnifiedVectorStore / ChromaVectorStore instance.  When
+        supplied the collection is scanned for distinct filenames and
+        auto-aliases are generated for each, so page/chapter queries work
+        for any book without hardcoding it here.
+    """
+    aliases: dict[str, list[str]] = dict(_STATIC_BOOK_ALIASES)
+
+    if vector_store is None:
+        return aliases
+
+    try:
+        backend = getattr(vector_store, "_backend", vector_store)
+        col = getattr(backend, "collection", None)
+        if col is None:
+            return aliases
+
+        data = col.get(include=["metadatas"])
+        seen: set[str] = set()
+        for meta in (data.get("metadatas") or []):
+            fn = (
+                meta.get("filename")
+                or meta.get("book_title")
+                or meta.get("book_name")
+                or ""
+            )
+            if fn and fn not in seen:
+                seen.add(fn)
+                if fn not in aliases:
+                    aliases[fn] = _aliases_for_filename(fn)
+    except Exception:
+        pass
+
+    return aliases
+
+
+def extract_page_query_info(query: str, vector_store: Any | None = None) -> Optional[Dict[str, Any]]:
     """
     Detect if the user is asking for content from a specific page or page range.
     Extracts the page number, optional page end, target book if mentioned, and
     determines if the query is a pure page lookup or contains additional semantic keywords.
+
+    Parameters
+    ----------
+    query:        Raw user query string.
+    vector_store: Optional vector store used to resolve book titles dynamically.
+                  When supplied, any ingested document is recognised by name —
+                  not just the hardcoded static entries.
     """
     if not query:
         return None
@@ -293,9 +406,10 @@ def extract_page_query_info(query: str) -> Optional[Dict[str, Any]]:
         else:
             return None
 
-    # Check for book mentions
+    # Check for book mentions — use dynamic aliases so any ingested doc is recognised
+    _book_aliases = get_book_aliases(vector_store)
     book_match = None
-    for canonical_name, aliases in KNOWN_BOOK_ALIASES.items():
+    for canonical_name, aliases in _book_aliases.items():
         for alias in aliases:
             if re.search(rf"\b{re.escape(alias)}\b", text_lower):
                 book_match = canonical_name
@@ -306,7 +420,7 @@ def extract_page_query_info(query: str) -> Optional[Dict[str, Any]]:
     # Determine whether there is additional semantic intent beyond the page request
     residual = text_lower[:matched_span[0]] + " " + text_lower[matched_span[1]:]
     if book_match:
-        for alias in KNOWN_BOOK_ALIASES[book_match]:
+        for alias in _book_aliases[book_match]:
             residual = re.sub(rf"\b{re.escape(alias)}\b", " ", residual)
 
     filler_words = {
@@ -343,7 +457,7 @@ _CHAPTER_ORDINALS: dict[str, int] = {
 }
 
 
-def extract_chapter_query_info(query: str) -> Optional[Dict[str, Any]]:
+def extract_chapter_query_info(query: str, vector_store: Any | None = None) -> Optional[Dict[str, Any]]:
     """
     Detect if the user is asking about a specific chapter number.
 
@@ -351,6 +465,11 @@ def extract_chapter_query_info(query: str) -> Optional[Dict[str, Any]]:
       - "chapter 3", "chapter three", "ch 3", "ch. 3"
       - "in chapter 5", "show me chapter 2", "what is in chapter 4"
       - "summarize chapter 1"
+
+    Parameters
+    ----------
+    query:        Raw user query string.
+    vector_store: Optional vector store for dynamic book title resolution.
 
     Returns a dict with ``is_chapter_query``, ``chapter_num``, and
     ``book_match``, or *None* if no chapter reference is found.
@@ -384,13 +503,10 @@ def extract_chapter_query_info(query: str) -> Optional[Dict[str, Any]]:
     if chapter_num < 1:
         return None
 
-    # Check for known book mentions (reuse same KNOWN_BOOK_ALIASES if available)
+    # Check for known book mentions using dynamic aliases
     book_match = None
-    try:
-        from src.rag_pipeline.query import KNOWN_BOOK_ALIASES as _aliases
-    except Exception:
-        _aliases = {}
-    for canonical_name, aliases in _aliases.items():
+    _book_aliases = get_book_aliases(vector_store)
+    for canonical_name, aliases in _book_aliases.items():
         for alias in aliases:
             if re.search(rf"\b{re.escape(alias)}\b", text_lower):
                 book_match = canonical_name

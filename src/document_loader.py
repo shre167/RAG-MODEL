@@ -11,7 +11,7 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Iterable
 
-import fitz  # PyMuPDF
+import pymupdf as fitz  # PyMuPDF (replaces legacy `import fitz`)
 
 
 def _configure_tesseract_path() -> None:
@@ -581,7 +581,7 @@ def _ocr_single_page(
     pdf_path, page_index, language = args
 
     try:
-        import fitz
+        import pymupdf as fitz
         import pytesseract
         from PIL import Image
         import io
@@ -3087,19 +3087,11 @@ def chunk_to_chroma_record(
             chunk["section_title"]
         )
 
-    if chunk.get("prev_chunk_id"):
-        metadata[
-            "prev_chunk_id"
-        ] = str(
-            chunk["prev_chunk_id"]
-        )
-
-    if chunk.get("next_chunk_id"):
-        metadata[
-            "next_chunk_id"
-        ] = str(
-            chunk["next_chunk_id"]
-        )
+    # Prev/next chunk IDs removed — not useful in UI and clutter metadata
+    # if chunk.get("prev_chunk_id"):
+    #     metadata["prev_chunk_id"] = str(chunk["prev_chunk_id"])
+    # if chunk.get("next_chunk_id"):
+    #     metadata["next_chunk_id"] = str(chunk["next_chunk_id"])
 
     return {
         "id": chunk.get(

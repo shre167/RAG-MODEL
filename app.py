@@ -409,31 +409,80 @@ def _pipeline() -> RAGPipeline:
             vectorstore_path=Path(VECTORSTORE_DIR),
         )
         st.session_state.force_reload = False
+        # Reset KB snapshot so stale-chunk check runs on next status call
+        st.session_state.pop("_kb_snapshot", None)
 
     return st.session_state.pipeline
 
 
-def _pipeline_status(pipeline: RAGPipeline) -> dict:
-    """Read pipeline.status() without letting a backend error kill the UI."""
+def _kb_file_snapshot(kb_path: Path) -> frozenset:
+    """Return a frozenset of (name, mtime) pairs for all KB documents."""
     try:
-        # Check and purge any files deleted from disk so UI status is always accurate
-        pipeline.sync_deleted_files()
+        return frozenset(
+            (p.name, p.stat().st_mtime)
+            for p in kb_path.iterdir()
+            if p.is_file() and p.suffix.lower() in {".pdf", ".txt", ".md", ".docx"}
+        )
     except Exception:
-        pass
+        return frozenset()
+
+
+def _pipeline_status(pipeline: RAGPipeline) -> dict:
+    """Return cached pipeline status, refreshing at most every 5 seconds.
+
+    Also detects file deletions from the knowledge_base/ directory and
+    purges stale chunks automatically — without blocking navigation.
+    """
+    import time as _time
+
+    now = _time.monotonic()
+    cache_age = now - st.session_state.get("_status_ts", 0.0)
+
+    # ── Stale-chunk detection (fast: only stat calls, no Chroma I/O) ──
+    kb_path = Path(pipeline.knowledge_base_path)
+    current_snapshot = _kb_file_snapshot(kb_path)
+    last_snapshot = st.session_state.get("_kb_snapshot")
+
+    if last_snapshot is not None and current_snapshot != last_snapshot:
+        # Files were added or removed — purge stale chunks immediately
+        try:
+            sync_result = pipeline.sync_deleted_files()
+            removed = sync_result.get("removed", [])
+            if removed:
+                names = ", ".join(r["filename"] for r in removed)
+                st.session_state.ingestion_notice = {
+                    "type": "info",
+                    "message": f"Auto-removed stale chunks for: {names}",
+                }
+                # Force status refresh so sidebar counts update
+                cache_age = 999.0
+        except Exception:
+            pass
+
+    st.session_state["_kb_snapshot"] = current_snapshot
+
+    # ── Return cached status when it is fresh enough ──────────────────
+    if cache_age < 5.0 and "pipeline_status" in st.session_state:
+        return st.session_state["pipeline_status"]
 
     try:
         status = pipeline.status()
-    except Exception as exc:  # noqa: BLE001 - surfaced to the user below
+    except Exception as exc:  # noqa: BLE001
         st.session_state.status_error = str(exc)
-        return {}
+        return st.session_state.get("pipeline_status", {})
 
     st.session_state.pop("status_error", None)
-
-    return status or {}
+    st.session_state["pipeline_status"] = status or {}
+    st.session_state["_status_ts"] = now
+    return st.session_state["pipeline_status"]
 
 
 def _collection_count(pipeline: RAGPipeline):
-    """Actual Chroma collection count, or None when it cannot be read."""
+    """Return cached Chroma collection count (refreshed alongside status)."""
+    # Prefer the count embedded in the cached status dict
+    cached = st.session_state.get("pipeline_status", {})
+    if "collection_count" in cached:
+        return cached["collection_count"]
     try:
         return int(pipeline.vector_store.get_collection_count())
     except Exception:  # noqa: BLE001
@@ -832,7 +881,7 @@ def _render_answer_extras(meta: dict) -> None:
     col1, col2 = st.columns(2)
     col1.metric("Retrieval Latency", f"{ret_ms:.0f} ms" if isinstance(ret_ms, (int, float)) and ret_ms > 0 else "—")
     llm_ms = meta.get("llm_ms") or meta.get("llm_time_ms")
-    col2.metric("LLM Generation Time", f"{llm_ms:.0f} ms" if isinstance(llm_ms, (int, float)) and llm_ms > 0 else "—")
+    col2.metric("Response Tokens", f"{meta.get('output_tokens', 0)} tokens" if meta.get('output_tokens') else "—")
 
     # Chapter distribution of retrieved context
     context_chunks = meta.get("context_chunks") or []
@@ -911,33 +960,33 @@ def render_ingestion_health_panel(result: dict) -> None:
     if not result:
         return
 
-    st.markdown("#### 🩺 Ingestion Health Panel")
+    st.markdown("#### Ingestion Status")
     filename = result.get("_filename") or result.get("filename") or "Document"
     skipped = bool(result.get("skipped"))
 
     if skipped:
-        st.info(f"⏭ **{filename}** is up-to-date (SHA-256 fingerprint verified). Embeddings preserved.")
+        st.info(f"**{filename}** is up-to-date (SHA-256 fingerprint verified). Embeddings preserved.")
     else:
-        st.success(f"✅ **{filename}** successfully indexed into the Knowledge Base.")
+        st.success(f"**{filename}** successfully indexed into the Knowledge Base.")
 
     c1, c2, c3, c4, c5 = st.columns(5)
     
     pages = result.get("pages_processed")
     if pages is None:
         pages = result.get("total_pages", "—")
-    c1.metric("📄 Pages", pages, help="Total pages or logical document sections processed")
+    c1.metric("Pages", pages, help="Total pages processed")
 
     ocr_pages = result.get("ocr_pages", 0)
-    c2.metric("🔍 OCR Pages", ocr_pages, help="Pages requiring OCR due to scanned or non-extractable text")
+    c2.metric("OCR Pages", ocr_pages, help="Pages requiring OCR")
 
     captions = result.get("image_captions", 0)
-    c3.metric("🖼️ Captions", captions, help="Figures, charts, and image captions detected")
+    c3.metric("Figures", captions, help="Images and captions detected")
 
     chunks_created = result.get("chunks_created", result.get("chunks", "—"))
-    c4.metric("🧩 Chunks", chunks_created, help="Total semantic text chunks created from this file")
+    c4.metric("Chunks", chunks_created, help="Total chunks created")
 
     skipped_sec = result.get("skipped_sections", 0)
-    c5.metric("⏭️ Skipped", skipped_sec, help="Empty or blank sections skipped")
+    c5.metric("Skipped", skipped_sec, help="Blank sections skipped")
 
     # Detailed metrics row
     t1, t2, t3, t4 = st.columns(4)
@@ -1012,7 +1061,15 @@ def _ingest_uploaded_file(pipeline: RAGPipeline, uploaded, rerun: bool = False):
         "message": message,
     }
 
-    render_ingestion_health_panel(result)
+    # Mark that the health panel should be shown after rerun.
+    # Rendering it here (inside the popover) would be lost on rerun,
+    # so we persist the flag and render it in the main chat area instead.
+    st.session_state.show_ingestion_panel = True
+
+    # Invalidate the status cache so sidebar chunk count refreshes after rerun
+    st.session_state.pop("pipeline_status", None)
+    st.session_state.pop("_status_ts", None)
+    st.session_state.pop("_kb_snapshot", None)
 
     if rerun:
         st.rerun()
@@ -1277,6 +1334,15 @@ def _render_mission_control(
         st.warning("The BM25 index is not available for this query.")
 
     # ----------------------------------------------------------------
+    # INGESTION HEALTH PANEL (shown once after + upload)
+    # ----------------------------------------------------------------
+    if st.session_state.pop("show_ingestion_panel", False):
+        result = st.session_state.get("last_ingestion")
+        if result:
+            render_ingestion_health_panel(result)
+            st.divider()
+
+    # ----------------------------------------------------------------
     # HISTORY
     # ----------------------------------------------------------------
     if "chat_history" not in st.session_state or st.session_state.chat_history is None:
@@ -1302,9 +1368,25 @@ def _render_mission_control(
                 "sidebar, or run: python ingest.py"
             )
 
-    for entry in st.session_state.chat_history:
+    for idx, entry in enumerate(st.session_state.chat_history):
         with st.chat_message(entry["role"]):
-            st.markdown(entry["content"])
+            # Add delete button for each message pair (user + assistant)
+            if entry["role"] == "user":
+                msg_col, del_col = st.columns([0.95, 0.05])
+                with msg_col:
+                    st.markdown(entry["content"])
+                with del_col:
+                    if st.button("🗑️", key=f"del_msg_{idx}", help="Delete this conversation"):
+                        # Remove both user message and the following assistant response
+                        to_remove = [idx]
+                        if idx + 1 < len(st.session_state.chat_history) and st.session_state.chat_history[idx + 1]["role"] == "assistant":
+                            to_remove.append(idx + 1)
+                        for i in sorted(to_remove, reverse=True):
+                            st.session_state.chat_history.pop(i)
+                        _save_persistent_chat_history(pipeline.vectorstore_path, st.session_state.chat_history)
+                        st.rerun()
+            else:
+                st.markdown(entry["content"])
 
             if entry["role"] == "assistant":
                 _render_answer_extras(entry.get("meta", {}))
@@ -1436,13 +1518,10 @@ def _render_custom_composer(pipeline: RAGPipeline):
                 )
 
             with send_col:
-                send_clicked = st.form_submit_button(
-                    "Send",
-                    help="Send question",
-                    **WIDE,
-                )
+                # Send button removed - Enter key submits automatically
+                pass
 
-    if send_clicked:
+    if send_clicked or (question and question.strip()):
         question = (question or "").strip()
 
         if not question:
@@ -3288,6 +3367,9 @@ def _render_sidebar(
 
         if st.button("Refresh Status", key="ctl_refresh", **WIDE):
             st.session_state.force_reload = True
+            st.session_state.pop("pipeline_status", None)
+            st.session_state.pop("_status_ts", None)
+            st.session_state.pop("_kb_snapshot", None)
             st.rerun()
 
         if st.button("Sync Knowledge Base", key="ctl_sync", **WIDE):
@@ -3296,6 +3378,9 @@ def _render_sidebar(
                     result = pipeline.ingest_documents()
 
                     st.session_state.force_reload = True
+                    st.session_state.pop("pipeline_status", None)
+                    st.session_state.pop("_status_ts", None)
+                    st.session_state.pop("_kb_snapshot", None)
                     st.session_state.ingestion_notice = {
                         "type": "success",
                         "message": (

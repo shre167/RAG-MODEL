@@ -202,20 +202,6 @@ class RAGPipeline:
             "using Dense + BM25 + RRF only."
         )
 
-        # --------------------------------------------------------------
-        # Automatic Sync: purge any stale chunks for files deleted from disk
-        # --------------------------------------------------------------
-        try:
-            sync_res = self.sync_deleted_files()
-            if sync_res.get("removed"):
-                logger.info(
-                    "Pipeline startup: purged %d deleted files (%d chunks total)",
-                    len(sync_res["removed"]),
-                    sync_res.get("total_chunks_deleted", 0),
-                )
-        except Exception as exc:
-            logger.warning("Pipeline startup file sync failed: %s", exc)
-
     # ==================================================================
     # DELEGATING HELPERS
     # ==================================================================
@@ -1583,15 +1569,9 @@ class RAGPipeline:
                 response_type="error",
             )
 
-        # Ensure any file deleted from disk is immediately purged from all stores
-        try:
-            self.sync_deleted_files()
-        except Exception as _sync_exc:
-            logger.debug("Automatic pre-query deleted files sync: %s", _sync_exc)
-
-        # --------------------------------------------------------------
+        # ==================================================================
         # 4. VALIDATE VECTOR STORE
-        # --------------------------------------------------------------
+        # ==================================================================
 
         try:
             collection_count = (
@@ -1657,13 +1637,13 @@ class RAGPipeline:
         import concurrent.futures as _cf
 
         from src.rag_pipeline.query import extract_page_query_info
-        page_info = extract_page_query_info(question)
+        page_info = extract_page_query_info(question, self.vector_store)
 
         # ----------------------------------------------------------
         # Chapter-specific retrieval
         # ----------------------------------------------------------
         from src.rag_pipeline.query import extract_chapter_query_info
-        chapter_info = extract_chapter_query_info(question)
+        chapter_info = extract_chapter_query_info(question, self.vector_store)
 
         chapter_candidates: dict[str, Candidate] = {}
         if chapter_info and chapter_info.get("is_chapter_query"):

@@ -45,7 +45,14 @@ class ChromaVectorStore:
                 "`pip install -r requirements.txt`. Original import error: "
                 f"{_CHROMADB_IMPORT_ERROR}"
             ) from _CHROMADB_IMPORT_ERROR
-        self.persist_directory = str(Path(persist_directory).resolve())
+        base = Path(persist_directory).resolve()
+        # chromadb 1.x PersistentClient expects a plain directory and creates
+        # chroma.sqlite3 inside it.  Use a dedicated subdirectory so it never
+        # conflicts with other files (bm25 index, manifests, etc.) stored in
+        # the parent vectorstore folder.
+        chroma_dir = base / "chroma_db"
+        chroma_dir.mkdir(parents=True, exist_ok=True)
+        self.persist_directory = str(chroma_dir)
         if hasattr(chromadb, "PersistentClient"):
             self.client = chromadb.PersistentClient(
                 path=self.persist_directory,
