@@ -233,7 +233,9 @@ def select_context_candidates(
                 candidate.filename
                 or candidate.metadata.get("filename")
                 or candidate.metadata.get("book_title")
-                or "unknown"
+                or candidate.metadata.get("source_name")
+                or candidate.metadata.get("source")
+                or f"source-{candidate.chunk_id}"
             )
             by_source.setdefault(src, []).append(candidate)
 
@@ -267,11 +269,11 @@ def select_context_candidates(
         for candidate in ranked:
             source = (
                 candidate.filename
-                or candidate.metadata.get(
-                    "filename",
-                    "unknown",
-                )
-                or "unknown"
+                or candidate.metadata.get("filename")
+                or candidate.metadata.get("book_title")
+                or candidate.metadata.get("source_name")
+                or candidate.metadata.get("source")
+                or f"source-{candidate.chunk_id}"
             )
 
             count = source_counts.get(
@@ -405,14 +407,15 @@ def build_context(
             metadata.get("book_title")
             or metadata.get("book_name")
             or metadata.get("source_name")
+            or metadata.get("source")
             or filename
-            or "Untitled document"
+            or f"Document {index}"
         )
         if book_title.lower().endswith(".pdf"):
             clean_title = book_title[:-4].replace(" (1)", "").strip()
         else:
             clean_title = book_title.replace(" (1)", "").strip()
-        clean_title = clean_title or "Untitled document"
+        clean_title = clean_title or f"Document {index}"
 
         chapter_num = metadata.get("chapter_num")
         chapter_title = (metadata.get("chapter_title") or "").strip()
@@ -420,7 +423,7 @@ def build_context(
         page_end = metadata.get("page_end") or page_start
 
         parts = []
-        if clean_title and clean_title != "Untitled document":
+        if clean_title:
             parts.append(clean_title)
         if chapter_num and int(chapter_num) > 0:
             ch_part = f"Chapter {chapter_num}"
@@ -436,7 +439,7 @@ def build_context(
         if parts:
             source_display = " — ".join(parts)
         else:
-            source_display = filename or "Untitled document"
+            source_display = filename or f"Document {index}"
 
         if source_display not in seen_sources:
             seen_sources.add(source_display)

@@ -771,9 +771,13 @@ def get_active_files(
         print(f"[KB] Knowledge base directory not found: {kb_dir}")
         return []
 
+    supported_exts = {
+        ".pdf", ".docx", ".epub", ".mobi", ".txt", ".md", ".rtf", ".rst",
+        ".html", ".htm", ".json", ".csv", ".tsv", ".doc", ".xps", ".fb2"
+    }
     files = [
         p for p in kb_dir.iterdir()
-        if p.is_file() and p.suffix.lower() in {".pdf", ".txt", ".md"}
+        if p.is_file() and p.suffix.lower() in supported_exts
     ]
 
     requested_raw = os.getenv("ACTIVE_KB_FILES", "").strip()
@@ -2692,38 +2696,14 @@ def load_documents(
                 f"from {file_path.name}"
             )
 
-        elif suffix in {
-            ".txt",
-            ".md",
-        }:
-
-            try:
-                text = file_path.read_text(
-                    encoding="utf-8",
-                    errors="ignore",
-                )
-
-            except Exception as exc:
+        else:
+            doc_pages = load_document(file_path)
+            if doc_pages:
+                all_documents.extend(doc_pages)
                 print(
-                    f"[KB] Failed to read "
-                    f"{file_path.name}: {exc}"
+                    f"[KB] Loaded {len(doc_pages)} unit(s) from "
+                    f"{file_path.name}"
                 )
-                continue
-
-            all_documents.append(
-                {
-                    "page": 1,
-                    "text": clean_text(text),
-                    "source": file_path.name,
-                    "path": str(file_path),
-                    "has_images": False,
-                }
-            )
-
-            print(
-                f"[KB] Loaded text file: "
-                f"{file_path.name}"
-            )
 
     return all_documents
 
@@ -2744,9 +2724,10 @@ def _documents_by_source(
     for document in documents:
 
         source = document.get(
-            "source",
-            "unknown",
-        )
+            "source"
+        ) or document.get(
+            "filename"
+        ) or "document"
 
         grouped.setdefault(
             source,
@@ -3273,85 +3254,371 @@ def list_txt_files(
     ]
 
 
+class DocumentPageList(list):
+    """
+    List of document page dicts that additionally exposes an ingestion .stats dict:
+    - pages_processed: total pages or logical page units extracted
+    - ocr_pages: count of pages processed with OCR
+    - image_captions: count of figures/images captioned or detected
+    - chunks_created: count of chunks created (populated during chunking)
+    - skipped_sections: count of blank pages or empty sections skipped
+    """
+    def __init__(self, items=(), stats: dict[str, Any] | None = None):
+        super().__init__(items)
+        self.stats: dict[str, Any] = stats or {
+            "pages_processed": len(self),
+            "ocr_pages": 0,
+            "image_captions": 0,
+            "chunks_created": 0,
+            "skipped_sections": 0,
+        }
+
+
+def _detect_captions_in_text(text: str) -> int:
+    """Count explicit figure / image / table captions in extracted text."""
+    if not text:
+        return 0
+    matches = re.findall(r"\b(?:Figure|Fig\.|Illustration|Image|Chart|Table)\s*[\d\.:A-Za-z]+", text, re.IGNORECASE)
+    return len(matches)
+
+
 def load_document(
     file_path: "Path | str",
     content: "bytes | None" = None,
-) -> "list[dict[str, Any]]":
+) -> DocumentPageList:
     """
-    Load pages from a single file, with OCR fallback for image-based PDFs.
-
-    Mirrors the extraction path in load_documents (plural) so that files
-    ingested via the UI (ingest_file) receive the same quality treatment as
-    files ingested via the batch ingest_documents path.
+    Universal document and ebook loader with OCR fallback and full telemetry tracking.
+    Supports PDF, DOCX, EPUB, MOBI, XPS, TXT, MD, RST, RTF, HTML, CSV, JSON, and DOC.
+    Returns a DocumentPageList exposing .stats for the Ingestion Health Panel.
     """
     file_path = Path(file_path)
     suffix = file_path.suffix.lower()
+    filename = file_path.name
 
+    # -------------------------------------------------------------------------
+    # 1. PDF DOCUMENTS
+    # -------------------------------------------------------------------------
     if suffix == ".pdf":
         try:
-            doc = fitz.open(str(file_path))
-            page_count = len(doc)
-            doc.close()
+            doc = fitz.open(str(file_path)) if file_path.exists() else fitz.open(stream=content, filetype="pdf")
+            total_doc_pages = len(doc)
         except Exception as exc:
-            print(f"[load_document] Failed to open {file_path.name}: {exc}")
-            return []
+            print(f"[load_document] Failed to open PDF {filename}: {exc}")
+            return DocumentPageList([], {"pages_processed": 0, "ocr_pages": 0, "image_captions": 0, "chunks_created": 0, "skipped_sections": 0})
 
         pages: list[dict[str, Any]] = []
-        for idx in range(page_count):
+        total_images = 0
+        total_captions = 0
+
+        for idx in range(total_doc_pages):
             try:
-                pages.append(_extract_page_native(str(file_path), idx))
+                page_data = _extract_page_native(str(file_path), idx)
+                img_list = doc[idx].get_images(full=True) if idx < len(doc) else []
+                page_data["image_count"] = len(img_list)
+                total_images += len(img_list)
+                captions_found = _detect_captions_in_text(page_data.get("text", ""))
+                total_captions += captions_found
+                pages.append(page_data)
             except Exception as exc:
-                print(f"[load_document] Page {idx + 1} failed: {exc}")
+                print(f"[load_document] Page {idx + 1} extraction failed: {exc}")
                 pages.append({
                     "page": idx + 1, "text": "", "blocks": [],
-                    "has_images": False, "native_text_chars": 0,
+                    "has_images": False, "image_count": 0, "native_text_chars": 0,
                 })
 
-        # -------------------------------------------------------------------
-        # OCR FALLBACK: same logic as load_documents (plural).
-        # Any page where native extraction yielded too few characters is sent
-        # through OCR so that scanned / image-based PDFs are not silently
-        # rejected as "No usable content".
-        # -------------------------------------------------------------------
+        try:
+            doc.close()
+        except Exception:
+            pass
+
+        # OCR fallback for pages with little or no native text
         empty_page_indexes = [
-            idx
-            for idx, page in enumerate(pages)
+            idx for idx, page in enumerate(pages)
             if len((page.get("text") or "").strip()) < OCR_MIN_TEXT_CHARS
         ]
+        ocr_performed_count = 0
 
-        if empty_page_indexes:
-            print(
-                f"[load_document] {file_path.name}: "
-                f"{len(empty_page_indexes)} page(s) need OCR "
-                f"(native text < {OCR_MIN_TEXT_CHARS} chars)"
-            )
+        if empty_page_indexes and file_path.exists():
+            print(f"[load_document] {filename}: {len(empty_page_indexes)} page(s) sent to OCR")
             try:
                 ocr_results = _ocr_pages(str(file_path), empty_page_indexes)
                 for idx, ocr_text in ocr_results.items():
                     if ocr_text.strip():
                         pages[idx]["text"] = ocr_text
                         pages[idx]["native_text_chars"] = len(ocr_text)
+                        pages[idx]["ocr_performed"] = True
+                        ocr_performed_count += 1
+                        total_captions += _detect_captions_in_text(ocr_text)
             except Exception as exc:
-                print(f"[load_document] OCR failed for {file_path.name}: {exc}")
+                print(f"[load_document] OCR failed for {filename}: {exc}")
 
+        # Clean running headers & footers
         pages = remove_running_headers_footers(pages)
-        for p in pages:
-            p["source"] = file_path.name
+        raw_page_count = len(pages)
+        valid_pages = [p for p in pages if (p.get("text") or "").strip()]
+        skipped_sections = total_doc_pages - len(valid_pages)
+
+        for p in valid_pages:
+            p["source"] = filename
             p["path"] = str(file_path)
-        return pages
 
-    if suffix in {".txt", ".md"}:
+        stats = {
+            "pages_processed": total_doc_pages,
+            "ocr_pages": ocr_performed_count,
+            "image_captions": max(total_captions, total_images),
+            "chunks_created": 0,
+            "skipped_sections": max(0, skipped_sections),
+        }
+        return DocumentPageList(valid_pages, stats)
+
+    # -------------------------------------------------------------------------
+    # 2. EBOOKS (EPUB, MOBI, XPS, FB2, CBZ)
+    # -------------------------------------------------------------------------
+    if suffix in {".epub", ".mobi", ".xps", ".oxps", ".fb2", ".cbz"}:
         try:
-            text = file_path.read_text(encoding="utf-8", errors="ignore")
+            doc = fitz.open(str(file_path)) if file_path.exists() else fitz.open(stream=content, filetype=suffix.lstrip("."))
+            total_doc_pages = len(doc)
         except Exception as exc:
-            print(f"[load_document] Failed to read {file_path.name}: {exc}")
-            return []
-        return [{"page": 1, "text": clean_text(text),
-                 "source": file_path.name, "path": str(file_path),
-                 "has_images": False}]
+            print(f"[load_document] Failed to open ebook {filename}: {exc}")
+            return DocumentPageList([], {"pages_processed": 0, "ocr_pages": 0, "image_captions": 0, "chunks_created": 0, "skipped_sections": 0})
 
-    print(f"[load_document] Unsupported type: {file_path.suffix}")
-    return []
+        pages = []
+        total_images = 0
+        total_captions = 0
+
+        for idx in range(total_doc_pages):
+            try:
+                page = doc[idx]
+                text = page.get_text()
+                text = clean_text(text)
+                img_list = page.get_images(full=True)
+                img_count = len(img_list)
+                total_images += img_count
+                captions_found = _detect_captions_in_text(text)
+                total_captions += captions_found
+                
+                if text.strip():
+                    pages.append({
+                        "page": idx + 1,
+                        "text": text,
+                        "source": filename,
+                        "path": str(file_path),
+                        "has_images": img_count > 0,
+                        "image_count": img_count,
+                        "native_text_chars": len(text),
+                    })
+            except Exception as exc:
+                print(f"[load_document] Ebook page {idx + 1} read failed: {exc}")
+
+        try:
+            doc.close()
+        except Exception:
+            pass
+
+        skipped_sections = total_doc_pages - len(pages)
+        stats = {
+            "pages_processed": total_doc_pages,
+            "ocr_pages": 0,
+            "image_captions": max(total_captions, total_images),
+            "chunks_created": 0,
+            "skipped_sections": max(0, skipped_sections),
+        }
+        return DocumentPageList(pages, stats)
+
+    # -------------------------------------------------------------------------
+    # 3. WORD DOCUMENTS (DOCX)
+    # -------------------------------------------------------------------------
+    if suffix in {".docx", ".doc"}:
+        pages = []
+        total_images = 0
+        total_captions = 0
+        doc_stream = io.BytesIO(content) if content is not None else (open(str(file_path), "rb").read() if file_path.exists() else None)
+        
+        extracted_sections: list[str] = []
+        try:
+            import docx
+            stream_obj = io.BytesIO(content) if content is not None else str(file_path)
+            doc_obj = docx.Document(stream_obj)
+            current_section_lines: list[str] = []
+            
+            for p in doc_obj.paragraphs:
+                p_text = clean_text(p.text)
+                if not p_text:
+                    continue
+                # Split logical sections at major headings
+                style_name = (p.style.name or "").lower() if p.style else ""
+                if ("heading 1" in style_name or "title" in style_name) and current_section_lines:
+                    extracted_sections.append("\n\n".join(current_section_lines))
+                    current_section_lines = [p_text]
+                else:
+                    current_section_lines.append(p_text)
+                    
+            # Extract tables as structured text
+            for table in doc_obj.tables:
+                table_rows = []
+                for row in table.rows:
+                    cells = [clean_text(cell.text) for cell in row.cells if clean_text(cell.text)]
+                    if cells:
+                        table_rows.append(" | ".join(cells))
+                if table_rows:
+                    current_section_lines.append("\n".join(table_rows))
+                    
+            if current_section_lines:
+                extracted_sections.append("\n\n".join(current_section_lines))
+                
+            # Count inline shapes / drawings as images
+            try:
+                for rel in doc_obj.part.rels.values():
+                    if "image" in rel.target_ref.lower():
+                        total_images += 1
+            except Exception:
+                pass
+
+        except Exception as docx_err:
+            print(f"[load_document] python-docx parsing failed, using XML/binary fallback: {docx_err}")
+            # Robust fallback: extract text from word/document.xml in docx zip
+            try:
+                import zipfile
+                import xml.etree.ElementTree as ET
+                stream_for_zip = io.BytesIO(content) if content is not None else open(str(file_path), "rb")
+                with zipfile.ZipFile(stream_for_zip) as z:
+                    xml_data = z.read("word/document.xml")
+                    root = ET.fromstring(xml_data)
+                    texts = [elem.text for elem in root.iter() if elem.text and elem.text.strip()]
+                    if texts:
+                        extracted_sections = [" ".join(texts)]
+            except Exception as zip_err:
+                # Binary fallback for legacy .doc
+                if doc_stream:
+                    raw_str = doc_stream.decode("utf-8", errors="ignore") if isinstance(doc_stream, bytes) else ""
+                    clean_words = re.findall(r"[A-Za-z0-9\.,;:'\"\(\)\-\?\!\s]{4,}", raw_str)
+                    if clean_words:
+                        extracted_sections = ["\n".join(clean_words)]
+
+        # Group extracted text into logical pages (~350 words per page)
+        words_per_page = 350
+        page_idx = 1
+        for sec_text in extracted_sections:
+            sec_text = clean_text(sec_text)
+            if not sec_text:
+                continue
+            total_captions += _detect_captions_in_text(sec_text)
+            sec_words = sec_text.split()
+            if len(sec_words) <= words_per_page:
+                pages.append({
+                    "page": page_idx, "text": sec_text, "source": filename,
+                    "path": str(file_path), "has_images": total_images > 0, "image_count": total_images,
+                })
+                page_idx += 1
+            else:
+                # Chunk into logical pages
+                for i in range(0, len(sec_words), words_per_page):
+                    chunk_text = " ".join(sec_words[i:i + words_per_page])
+                    pages.append({
+                        "page": page_idx, "text": chunk_text, "source": filename,
+                        "path": str(file_path), "has_images": total_images > 0, "image_count": total_images,
+                    })
+                    page_idx += 1
+
+        stats = {
+            "pages_processed": max(1, len(pages)),
+            "ocr_pages": 0,
+            "image_captions": max(total_captions, total_images),
+            "chunks_created": 0,
+            "skipped_sections": 0,
+        }
+        return DocumentPageList(pages, stats)
+
+    # -------------------------------------------------------------------------
+    # 4. PLAIN TEXT & MARKDOWN (TXT, MD, RST, RTF)
+    # -------------------------------------------------------------------------
+    if suffix in {".txt", ".md", ".markdown", ".rst", ".rtf"}:
+        try:
+            if content is not None:
+                text = content.decode("utf-8", errors="replace")
+            else:
+                text = file_path.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            try:
+                raw_b = content if content is not None else file_path.read_bytes()
+                text = raw_b.decode("latin-1", errors="ignore")
+            except Exception as exc:
+                print(f"[load_document] Failed to read {filename}: {exc}")
+                return DocumentPageList([], {"pages_processed": 0, "ocr_pages": 0, "image_captions": 0, "chunks_created": 0, "skipped_sections": 0})
+
+        text = clean_text(text)
+        captions_found = _detect_captions_in_text(text)
+        
+        # Split into logical sections by form feed, markdown headers, or size
+        sections = re.split(r"(?:\x0c|\n(?=#{1,3}\s+))", text)
+        sections = [s.strip() for s in sections if s.strip()]
+        if not sections:
+            sections = [text] if text else []
+
+        pages = []
+        for idx, sec in enumerate(sections, start=1):
+            pages.append({
+                "page": idx, "text": sec, "source": filename,
+                "path": str(file_path), "has_images": False, "image_count": 0,
+            })
+
+        stats = {
+            "pages_processed": max(1, len(pages)),
+            "ocr_pages": 0,
+            "image_captions": captions_found,
+            "chunks_created": 0,
+            "skipped_sections": 0,
+        }
+        return DocumentPageList(pages, stats)
+
+    # -------------------------------------------------------------------------
+    # 5. WEB & DATA DOCUMENTS (HTML, HTM, CSV, TSV, JSON)
+    # -------------------------------------------------------------------------
+    if suffix in {".html", ".htm"}:
+        raw_str = content.decode("utf-8", errors="ignore") if content is not None else file_path.read_text(encoding="utf-8", errors="ignore")
+        # Strip HTML tags
+        clean_html = re.sub(r"<script[^>]*>.*?</script>", "", raw_str, flags=re.DOTALL | re.IGNORECASE)
+        clean_html = re.sub(r"<style[^>]*>.*?</style>", "", clean_html, flags=re.DOTALL | re.IGNORECASE)
+        clean_html = re.sub(r"<[^>]+>", " ", clean_html)
+        clean_html = clean_text(clean_html)
+        captions_found = _detect_captions_in_text(clean_html)
+        pages = [{"page": 1, "text": clean_html, "source": filename, "path": str(file_path), "has_images": False, "image_count": 0}] if clean_html else []
+        return DocumentPageList(pages, {"pages_processed": 1, "ocr_pages": 0, "image_captions": captions_found, "chunks_created": 0, "skipped_sections": 0})
+
+    if suffix in {".csv", ".tsv"}:
+        raw_str = content.decode("utf-8", errors="ignore") if content is not None else file_path.read_text(encoding="utf-8", errors="ignore")
+        lines = [line.strip() for line in raw_str.splitlines() if line.strip()]
+        chunk_lines_count = 35
+        pages = []
+        for idx in range(0, len(lines), chunk_lines_count):
+            p_text = "\n".join(lines[idx:idx + chunk_lines_count])
+            pages.append({
+                "page": (idx // chunk_lines_count) + 1, "text": p_text,
+                "source": filename, "path": str(file_path), "has_images": False, "image_count": 0,
+            })
+        return DocumentPageList(pages, {"pages_processed": max(1, len(pages)), "ocr_pages": 0, "image_captions": 0, "chunks_created": 0, "skipped_sections": 0})
+
+    if suffix == ".json":
+        raw_str = content.decode("utf-8", errors="ignore") if content is not None else file_path.read_text(encoding="utf-8", errors="ignore")
+        try:
+            parsed_json = json.loads(raw_str)
+            clean_str = json.dumps(parsed_json, indent=2)
+        except Exception:
+            clean_str = raw_str
+        pages = [{"page": 1, "text": clean_str, "source": filename, "path": str(file_path), "has_images": False, "image_count": 0}] if clean_str else []
+        return DocumentPageList(pages, {"pages_processed": 1, "ocr_pages": 0, "image_captions": 0, "chunks_created": 0, "skipped_sections": 0})
+
+    # Fallback generic text loader
+    try:
+        raw_b = content if content is not None else file_path.read_bytes()
+        text = raw_b.decode("utf-8", errors="ignore")
+        if text.strip():
+            pages = [{"page": 1, "text": clean_text(text), "source": filename, "path": str(file_path), "has_images": False, "image_count": 0}]
+            return DocumentPageList(pages, {"pages_processed": 1, "ocr_pages": 0, "image_captions": 0, "chunks_created": 0, "skipped_sections": 0})
+    except Exception as exc:
+        print(f"[load_document] Unsupported format {suffix}: {exc}")
+
+    return DocumentPageList([], {"pages_processed": 0, "ocr_pages": 0, "image_captions": 0, "chunks_created": 0, "skipped_sections": 0})
 
 
 

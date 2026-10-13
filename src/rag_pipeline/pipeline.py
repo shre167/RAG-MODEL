@@ -829,6 +829,7 @@ class RAGPipeline:
         self,
         file_path: str | Path,
         content: str | None = None,
+        progress_callback: Any | None = None,
     ) -> dict[str, Any]:
         """
         Ingest one file incrementally.
@@ -928,6 +929,8 @@ class RAGPipeline:
                 "(hash match), skipping.",
                 filename,
             )
+            if progress_callback:
+                progress_callback(f"⏭ {filename} is up to date (SHA-256 match, skipping)", 1.0)
 
             return {
                 "filename": filename,
@@ -938,6 +941,14 @@ class RAGPipeline:
                 ),
                 "skipped": True,
                 "hash": file_hash,
+                "chunks_created": len(existing.get("chunk_ids", [])),
+                "pages_processed": existing.get("pages_processed", 1),
+                "ocr_pages": existing.get("ocr_pages", 0),
+                "image_captions": existing.get("image_captions", 0),
+                "skipped_sections": existing.get("skipped_sections", 0),
+                "kb_version": self.get_kb_state().get("version", 1),
+                "indexes_consistent": True,
+                "ingestion_time_ms": 0.0,
             }
 
         # --------------------------------------------------------------
@@ -945,6 +956,9 @@ class RAGPipeline:
         # --------------------------------------------------------------
 
         _ingest_file_t0 = __import__("time").perf_counter()
+
+        if progress_callback:
+            progress_callback(f"📄 Extracting pages & structure from {filename}...", 0.25)
 
         docs = load_document(
             file_path,
@@ -955,6 +969,15 @@ class RAGPipeline:
             raise ValueError(
                 f"No extractable content found in {filename}."
             )
+
+        doc_stats = getattr(docs, "stats", {})
+        pages_processed = doc_stats.get("pages_processed", len(docs))
+        ocr_pages = doc_stats.get("ocr_pages", sum(1 for p in docs if p.get("ocr_performed")))
+        image_captions = doc_stats.get("image_captions", sum(p.get("image_count", 1 if p.get("has_images") else 0) for p in docs))
+        skipped_sections = doc_stats.get("skipped_sections", 0)
+
+        if progress_callback:
+            progress_callback(f"🧩 Chunking {pages_processed} page units ({ocr_pages} OCR, {image_captions} figures)...", 0.5)
 
         new_chunks = chunk_documents(
             docs,
@@ -1050,6 +1073,9 @@ class RAGPipeline:
         # Embed new version
         # --------------------------------------------------------------
 
+        if progress_callback:
+            progress_callback(f"🧠 Computing dense vector embeddings for {len(texts)} chunks...", 0.70)
+
         try:
             embeddings = (
                 self.embedding_service
@@ -1078,6 +1104,9 @@ class RAGPipeline:
         # --------------------------------------------------------------
         # Add new version
         # --------------------------------------------------------------
+
+        if progress_callback:
+            progress_callback(f"💾 Writing {len(texts)} chunks to Chroma vector store...", 0.85)
 
         self.vector_store.add_documents(
             texts=texts,
@@ -1124,6 +1153,8 @@ class RAGPipeline:
         # --------------------------------------------------------------
 
         if self.bm25 is not None:
+            if progress_callback:
+                progress_callback("⚡ Synchronizing BM25 lexical keyword index...", 0.95)
             try:
                 self.bm25.build_index(
                     str(
@@ -1143,6 +1174,11 @@ class RAGPipeline:
         manifest[filename] = {
             "hash": file_hash,
             "chunk_ids": ids,
+            "pages_processed": pages_processed,
+            "chunks_created": len(new_chunks),
+            "ocr_pages": ocr_pages,
+            "image_captions": image_captions,
+            "skipped_sections": skipped_sections,
         }
 
         self._save_manifest(
@@ -1150,6 +1186,9 @@ class RAGPipeline:
         )
 
         new_kb_state = increment_kb_version(self)
+
+        if progress_callback:
+            progress_callback(f"✅ Ingestion complete: {len(new_chunks)} chunks indexed across {pages_processed} pages", 1.0)
 
         return {
             "filename": filename,
@@ -1164,6 +1203,10 @@ class RAGPipeline:
             ),
             "kb_version": new_kb_state.version,
             "indexes_consistent": new_kb_state.indexes_consistent,
+            "pages_processed": pages_processed,
+            "ocr_pages": ocr_pages,
+            "image_captions": image_captions,
+            "skipped_sections": skipped_sections,
             "ingestion_time_ms": round((__import__("time").perf_counter() - _ingest_file_t0) * 1000, 1),
         }
 

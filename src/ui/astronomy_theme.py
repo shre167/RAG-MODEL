@@ -3219,13 +3219,19 @@ def render_citation_card(citation: dict) -> str:
     """Renders a claim citation with passage excerpt and verification badge."""
     marker = html.escape(str(citation.get("marker", "")))
     claim = html.escape(str(citation.get("claim", "")))
-    filename = html.escape(str(citation.get("filename", "unknown")))
+    filename = html.escape(str(citation.get("filename") or citation.get("source_label") or "Document"))
     chunk_id = html.escape(str(citation.get("chunk_id", "")))
     passage = html.escape(str(citation.get("passage", "")))
     origin = html.escape(str(citation.get("retrieval_source", "")))
     status = citation.get("status", "supported")
     reason = html.escape(str(citation.get("verification_reason", "")))
     kb_ver = html.escape(str(citation.get("kb_version", "")))
+    
+    page_badge = ""
+    if citation.get("page_range"):
+        page_badge = f" · pp. {html.escape(str(citation.get('page_range')))}"
+    elif citation.get("page_number"):
+        page_badge = f" · p. {html.escape(str(citation.get('page_number')))}"
 
     if status == "supported":
         badge = '<span style="background: rgba(74,222,128,0.15); border: 1px solid rgba(74,222,128,0.3); color: #4ade80; padding: 0.15rem 0.5rem; border-radius: 4px; font-size: 0.7rem; font-weight: 600;">✓ Supported by retrieved evidence</span>'
@@ -3233,14 +3239,17 @@ def render_citation_card(citation: dict) -> str:
     elif status == "partially_supported":
         badge = '<span style="background: rgba(94,196,212,0.15); border: 1px solid rgba(94,196,212,0.3); color: #5ec4d4; padding: 0.15rem 0.5rem; border-radius: 4px; font-size: 0.7rem; font-weight: 600;">ℹ Partially Supported</span>'
         border_col = "rgba(94,196,212,0.25)"
+    elif status == "parser_failure":
+        badge = '<span style="background: rgba(251,191,36,0.15); border: 1px solid rgba(251,191,36,0.3); color: #fbbf24; padding: 0.15rem 0.5rem; border-radius: 4px; font-size: 0.7rem; font-weight: 600;">⚡ Citation Parser Issue</span>'
+        border_col = "rgba(251,191,36,0.35)"
     else:
-        badge = '<span style="background: rgba(239,68,68,0.15); border: 1px solid rgba(239,68,68,0.3); color: #f87171; padding: 0.15rem 0.5rem; border-radius: 4px; font-size: 0.7rem; font-weight: 600;">⚠ Unsupported Claim</span>'
+        badge = '<span style="background: rgba(239,68,68,0.15); border: 1px solid rgba(239,68,68,0.3); color: #f87171; padding: 0.15rem 0.5rem; border-radius: 4px; font-size: 0.7rem; font-weight: 600;">⚠ Unsupported Answer Claim</span>'
         border_col = "rgba(239,68,68,0.35)"
 
     return f"""
 <div style="background: rgba(14, 20, 36, 0.75); border-left: 3px solid {border_col}; border-top: 1px solid rgba(120,150,210,0.14); border-right: 1px solid rgba(120,150,210,0.14); border-bottom: 1px solid rgba(120,150,210,0.14); border-radius: 8px; padding: 0.85rem 1.1rem; margin-bottom: 0.75rem;">
     <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.4rem;">
-        <span style="font-weight: 700; color: #5ec4d4; font-size: 0.88rem;">{marker} {filename} <span style="color: #64748b; font-weight: normal; font-size: 0.8rem;">· Chunk {chunk_id} · KB v{kb_ver}</span></span>
+        <span style="font-weight: 700; color: #5ec4d4; font-size: 0.88rem;">{marker} {filename}<span style="color: #64748b; font-weight: normal; font-size: 0.8rem;">{page_badge} · Chunk {chunk_id} · KB v{kb_ver}</span></span>
         {badge}
     </div>
     <div style="color: #e2e8f0; font-size: 0.84rem; margin-bottom: 0.45rem; font-style: italic;">
@@ -3263,17 +3272,29 @@ def render_citation_coverage_badge(coverage: dict) -> str:
     has_unsupported = coverage.get("has_unsupported", False)
     total = coverage.get("total_claims", 0)
     supported = coverage.get("supported_claims", 0)
+    unsupported = coverage.get("unsupported_claims", 0)
+    parser_fails = coverage.get("parser_failure_claims", 0)
 
-    if not has_unsupported and pct >= 90.0:
+    if not has_unsupported and parser_fails == 0 and pct >= 90.0:
         color = "#4ade80"
         bg = "rgba(74,222,128,0.15)"
         border = "rgba(74,222,128,0.3)"
         text = f"✓ {pct:.0f}% Citation Coverage ({supported}/{total} claims grounded)"
+    elif unsupported > 0 and parser_fails > 0:
+        color = "#f87171"
+        bg = "rgba(239,68,68,0.15)"
+        border = "rgba(239,68,68,0.35)"
+        text = f"⚠ {pct:.0f}% Coverage ({unsupported} unsupported claim(s), {parser_fails} parser issue(s))"
+    elif parser_fails > 0:
+        color = "#fbbf24"
+        bg = "rgba(251,191,36,0.15)"
+        border = "rgba(251,191,36,0.35)"
+        text = f"⚡ {pct:.0f}% Coverage ({parser_fails} citation-parser issue(s))"
     else:
         color = "#f87171"
         bg = "rgba(239,68,68,0.15)"
         border = "rgba(239,68,68,0.35)"
-        text = f"⚠ {pct:.0f}% Citation Coverage ({coverage.get('unsupported_claims', 1)} unsupported claim(s))"
+        text = f"⚠ {pct:.0f}% Citation Coverage ({unsupported} unsupported claim(s))"
 
     return f"""
 <div style="display: inline-block; background: {bg}; border: 1px solid {border}; color: {color};

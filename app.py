@@ -695,7 +695,14 @@ def _build_meta(response: dict, requested_mode: str) -> dict:
 def _render_chunk_list(chunks: list, mode_label: str = "") -> None:
     """Render chunks exposing complete canonical metadata and clean formatting."""
     for index, chunk in enumerate(chunks, start=1):
-        book = chunk.get("book") or chunk.get("book_title") or "Unknown book"
+        book = (
+            chunk.get("book")
+            or chunk.get("book_title")
+            or chunk.get("book_name")
+            or chunk.get("filename")
+            or chunk.get("source")
+            or f"Document {index}"
+        )
         chunk_id = chunk.get("chunk_id") or f"chunk_{index}"
         ch = chunk.get("chapter") or chunk.get("chapter_num")
         ch_str = f"Chapter {ch}" if ch and int(ch) > 0 else ""
@@ -891,26 +898,94 @@ def _show_ingestion_notice() -> None:
 # INGESTION
 # ============================================================================
 
+def render_ingestion_health_panel(result: dict) -> None:
+    """
+    Ingestion Health Panel:
+    Displays real-time document telemetry:
+    - Pages processed
+    - OCR pages
+    - Image captions / figures
+    - Chunks created
+    - Skipped sections
+    """
+    if not result:
+        return
+
+    st.markdown("#### 🩺 Ingestion Health Panel")
+    filename = result.get("_filename") or result.get("filename") or "Document"
+    skipped = bool(result.get("skipped"))
+
+    if skipped:
+        st.info(f"⏭ **{filename}** is up-to-date (SHA-256 fingerprint verified). Embeddings preserved.")
+    else:
+        st.success(f"✅ **{filename}** successfully indexed into the Knowledge Base.")
+
+    c1, c2, c3, c4, c5 = st.columns(5)
+    
+    pages = result.get("pages_processed")
+    if pages is None:
+        pages = result.get("total_pages", "—")
+    c1.metric("📄 Pages", pages, help="Total pages or logical document sections processed")
+
+    ocr_pages = result.get("ocr_pages", 0)
+    c2.metric("🔍 OCR Pages", ocr_pages, help="Pages requiring OCR due to scanned or non-extractable text")
+
+    captions = result.get("image_captions", 0)
+    c3.metric("🖼️ Captions", captions, help="Figures, charts, and image captions detected")
+
+    chunks_created = result.get("chunks_created", result.get("chunks", "—"))
+    c4.metric("🧩 Chunks", chunks_created, help="Total semantic text chunks created from this file")
+
+    skipped_sec = result.get("skipped_sections", 0)
+    c5.metric("⏭️ Skipped", skipped_sec, help="Empty or blank sections skipped")
+
+    # Detailed metrics row
+    t1, t2, t3, t4 = st.columns(4)
+    chunks_added = result.get("chunks_added", "—")
+    t1.caption(f"**Chunks Added:** {chunks_added}")
+    
+    collection_count = result.get("collection_count", "—")
+    t2.caption(f"**Total Indexed:** {collection_count}")
+    
+    ingest_time = result.get("ingestion_time_ms")
+    t3.caption(f"**Latency:** {f'{ingest_time:.0f} ms' if ingest_time is not None else '—'}")
+    
+    hash_val = result.get("hash")
+    short_hash = f"{hash_val[:10]}..." if hash_val else "—"
+    t4.caption(f"**Fingerprint:** `{short_hash}`")
+
+
 def _ingest_uploaded_file(pipeline: RAGPipeline, uploaded, rerun: bool = False):
     """
-    Run the existing incremental ingestion path for an uploaded file.
-
-    Reads raw bytes so that DOCX and PDF files are hashed and extracted correctly.
-    This calls pipeline.ingest_file(...) unchanged. Existing chunks are
-    never removed by this operation.
+    Run incremental ingestion for an uploaded file with transparent real-time status steps.
     """
     raw_bytes: bytes = uploaded.getvalue()
 
-    with st.spinner(f"Ingesting {uploaded.name} "):
+    with st.status(f"Ingesting {uploaded.name}...", expanded=True) as status:
+        status.write("📄 Reading file and computing SHA-256 fingerprint...")
+
+        def _on_progress(step_message: str, frac: float):
+            status.write(step_message)
+
         try:
             result = pipeline.ingest_file(
                 file_path=uploaded.name,
                 content=raw_bytes,
+                progress_callback=_on_progress,
             )
         except Exception as exc:  # noqa: BLE001
+            status.update(label=f"❌ Ingestion failed for {uploaded.name}", state="error")
             _service_error("INGESTION SERVICE UNAVAILABLE", exc)
             st.caption("No existing data was removed.")
             return None
+
+        is_skipped = result.get("skipped")
+        complete_label = (
+            f"⏭ {uploaded.name} already up-to-date (hash match)"
+            if is_skipped
+            else f"✅ Successfully ingested {uploaded.name}!"
+        )
+        status.update(label=complete_label, state="complete", expanded=False)
 
     result = dict(result or {})
     result["_filename"] = uploaded.name
@@ -926,7 +1001,7 @@ def _ingest_uploaded_file(pipeline: RAGPipeline, uploaded, rerun: bool = False):
         notice_type = "info"
     else:
         message = (
-            f"{uploaded.name} added  "
+            f"{uploaded.name} added: "
             f"{result.get('chunks_added', 'unknown')} new chunks indexed. "
             f"Total indexed: {result.get('collection_count', 'unknown')}."
         )
@@ -936,6 +1011,8 @@ def _ingest_uploaded_file(pipeline: RAGPipeline, uploaded, rerun: bool = False):
         "type": notice_type,
         "message": message,
     }
+
+    render_ingestion_health_panel(result)
 
     if rerun:
         st.rerun()

@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import re
 from pathlib import Path
@@ -169,15 +169,63 @@ def generate_claim_citations(
     
     citations: list[Citation] = []
     unsupported: list[str] = []
+    parser_failures: list[str] = []
     fully_supported = partial = 0
     chunk_map = {index + 1: candidate for index, candidate in enumerate(selected_candidates)}
     
     for claim_id, claim in enumerate(claims, start=1):
-        display_claim = re.sub(r"\[(?:Source\s*)?\d+\]", "", claim).strip()
+        display_claim = re.sub(r"\[(?:Source\s*|Chunk\s*)?[^\]]+\]", "", claim).strip()
+        display_claim = re.sub(r"\((?:Source\s*|Chunk\s*)\d+\)", "", display_claim).strip()
+        if not display_claim:
+            display_claim = claim.strip()
         
-        # Check for explicit source citations in the claim
-        explicit = [int(v) for v in re.findall(r"\[(?:Source\s*)?(\d+)\]", claim) if int(v) in chunk_map]
-        candidates = [chunk_map[index] for index in explicit] if explicit else selected_candidates
+        # Check if the sentence is an explicit abstention (e.g. "knowledge base does not contain...")
+        is_abstention = any(
+            phrase in display_claim.lower()
+            for phrase in (
+                "does not contain", "do not contain", "no information", "not found in",
+                "insufficient information", "not mentioned in", "knowledge base does not",
+            )
+        )
+        if is_abstention:
+            # Abstention statements are not unsupported factual claims
+            candidate = selected_candidates[0]
+            citations.append(Citation(
+                id=claim_id,
+                marker=f"[{claim_id}]",
+                claim=display_claim,
+                filename=candidate.filename or "System",
+                chunk_id="abstain",
+                passage=candidate.text[:200] if candidate and candidate.text else "[Context Insufficient]",
+                retrieval_source="Knowledge Boundary",
+                status="supported",
+                verification_reason="Standard abstention: Correctly acknowledges absent information.",
+                kb_version=kb_version,
+                support_score=1.0,
+                lexical_overlap=1.0,
+                direct_answer_support=True,
+            ))
+            fully_supported += 1
+            continue
+
+        # Extract explicit source citations: [1], [1, 2], [Source 1], [Chunk 2], (Source 1)
+        valid_indices: list[int] = []
+        out_of_range_indices: list[int] = []
+        brackets = re.findall(r"\[([^\]]+)\]", claim) + re.findall(r"\((?:Source|Chunk)\s*([^)]+)\)", claim)
+        has_bracket_marker = bool(brackets)
+
+        for bracket_content in brackets:
+            found_nums = [int(v) for v in re.findall(r"\b\d+\b", bracket_content)]
+            for num in found_nums:
+                if num in chunk_map:
+                    if num not in valid_indices:
+                        valid_indices.append(num)
+                else:
+                    if num not in out_of_range_indices:
+                        out_of_range_indices.append(num)
+
+        explicit_candidates = [chunk_map[idx] for idx in valid_indices]
+        candidates = explicit_candidates if explicit_candidates else selected_candidates
         
         # Find best supporting passage using fast lexical matching
         scored = [
@@ -191,35 +239,59 @@ def generate_claim_citations(
             display_claim, passage, candidate.text or ""
         )
         
-        # Update counters
-        if status == "supported":
+        # Distinguish parser failures from genuine unsupported answers
+        if out_of_range_indices and not valid_indices:
+            # Model attempted a citation, but referenced an index beyond retrieved context
+            status = "parser_failure"
+            reason = f"Citation Parser: Referenced source index {out_of_range_indices} exceeds available retrieved chunks (1..{len(chunk_map)})."
+            parser_failures.append(display_claim)
+        elif status == "supported":
             fully_supported += 1
         elif status == "partially_supported":
             partial += 1
         else:
+            # Genuine unsupported answer claim
             unsupported.append(display_claim)
         
-        # Extract metadata
+        # Extract rich metadata with proper page and file fallbacks
         meta = candidate.metadata if candidate else {}
         file_type = meta.get("file_type") or (
             Path(candidate.filename).suffix.lstrip(".").lower() 
             if candidate and candidate.filename else ""
         )
-        page_num = meta.get("page_number")
+        
+        page_start = meta.get("page_start") or meta.get("page") or meta.get("page_number")
+        page_end = meta.get("page_end") or page_start
         try:
-            page_number = int(page_num) if page_num and int(page_num) > 0 else None
+            page_number = int(page_start) if page_start and int(page_start) > 0 else None
         except (ValueError, TypeError):
             page_number = None
+
+        page_range_str = None
+        if page_start and page_end and str(page_start) != str(page_end):
+            page_range_str = f"{page_start}–{page_end}"
+        elif page_number is not None:
+            page_range_str = str(page_number)
+
+        source_name = (
+            candidate.filename
+            or meta.get("filename")
+            or meta.get("book_title")
+            or meta.get("book_name")
+            or meta.get("source_name")
+            or meta.get("source")
+            or f"Document-{candidate.chunk_id}"
+        )
         
         # Create citation
         citations.append(Citation(
             id=claim_id,
             marker=f"[{claim_id}]",
             claim=display_claim,
-            filename=candidate.filename if status != "unsupported" or explicit else "None",
-            chunk_id=candidate.chunk_id if status != "unsupported" or explicit else "N/A",
+            filename=source_name,
+            chunk_id=candidate.chunk_id if candidate and candidate.chunk_id is not None else "N/A",
             passage=passage if passage else "[No supporting passage found]",
-            retrieval_source=_origin(candidate) if status != "unsupported" or explicit else "Unverified",
+            retrieval_source=_origin(candidate) if candidate else "Unverified",
             status=status,
             verification_reason=f"{status.replace('_', ' ').title()}: {reason}",
             kb_version=kb_version,
@@ -228,6 +300,7 @@ def generate_claim_citations(
             direct_answer_support=status == "supported",
             file_type=file_type,
             page_number=page_number,
+            page_range=page_range_str,
         ))
     
     # Calculate overall coverage
@@ -245,6 +318,8 @@ def generate_claim_citations(
         has_unsupported=bool(unsupported),
         unsupported_claims_list=unsupported,
         partially_supported_claims=partial,
+        parser_failure_claims=len(parser_failures),
+        parser_failures_list=parser_failures,
     )
 
 

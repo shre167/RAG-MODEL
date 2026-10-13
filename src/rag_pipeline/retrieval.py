@@ -107,7 +107,9 @@ def dense_retrieve(
             metadata.get("filename")
             or metadata.get("book_name")
             or metadata.get("book_title")
-            or f"document-{index}"
+            or metadata.get("source_name")
+            or metadata.get("source")
+            or f"document-{index + 1}"
         )
 
         chunk_id = metadata.get(
@@ -421,16 +423,18 @@ def bm25_retrieve(
 
         rank = index + 1
 
+        chunk_id = result.get(
+            "chunk_id",
+            index,
+        )
+
         filename = str(
             result.get("filename")
             or result.get("book_name")
             or result.get("book_title")
-            or "unknown"
-        )
-
-        chunk_id = result.get(
-            "chunk_id",
-            index,
+            or result.get("source_name")
+            or result.get("source")
+            or f"chunk-{chunk_id}"
         )
 
         text = str(

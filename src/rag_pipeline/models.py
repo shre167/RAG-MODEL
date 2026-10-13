@@ -277,7 +277,7 @@ class Citation:
     chunk_id: Any
     passage: str
     retrieval_source: str = ""
-    status: str = "supported"  # "supported" | "unsupported" | "partially_supported"
+    status: str = "supported"  # "supported" | "unsupported" | "partially_supported" | "parser_failure"
     verification_reason: str = ""
     kb_version: int | str = 1
     # Explain why a lexical match was accepted or rejected.  This makes a
@@ -289,12 +289,16 @@ class Citation:
 
     file_type: str = ""
     page_number: int | None = None
+    page_range: str | None = None
 
     @property
     def source_label(self) -> str:
-        if (self.file_type == "pdf" or self.filename.lower().endswith(".pdf")) and self.page_number and self.page_number > 0:
-            return f"{self.filename} — p. {self.page_number}"
-        return self.filename
+        page_info = ""
+        if self.page_range:
+            page_info = f" — pp. {self.page_range}"
+        elif self.page_number and self.page_number > 0:
+            page_info = f" — p. {self.page_number}"
+        return f"{self.filename}{page_info}" if self.filename else "Document"
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -313,6 +317,7 @@ class Citation:
             "direct_answer_support": self.direct_answer_support,
             "file_type": self.file_type,
             "page_number": self.page_number,
+            "page_range": self.page_range,
             "source_label": self.source_label,
         }
 
@@ -327,6 +332,8 @@ class CitationCoverage:
     has_unsupported: bool
     unsupported_claims_list: list[str] = field(default_factory=list)
     partially_supported_claims: int = 0
+    parser_failure_claims: int = 0
+    parser_failures_list: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -337,6 +344,8 @@ class CitationCoverage:
             "has_unsupported": self.has_unsupported,
             "unsupported_claims_list": self.unsupported_claims_list,
             "partially_supported_claims": self.partially_supported_claims,
+            "parser_failure_claims": self.parser_failure_claims,
+            "parser_failures_list": self.parser_failures_list,
         }
 
 
