@@ -1519,7 +1519,7 @@ def _render_custom_composer(pipeline: RAGPipeline):
 
             with send_col:
                 send_clicked = st.form_submit_button(
-                    "",
+                    "→",
                     help="Send (or press Enter)",
                     **WIDE,
                 )
@@ -4038,6 +4038,16 @@ def _save_persistent_chat_turn(vectorstore_path: Path | str | None, user_entry: 
     history = _load_persistent_chat_history(vectorstore_path)
     history.append(user_entry)
     history.append(assistant_entry)
+    try:
+        path.write_text(json.dumps(history, indent=2, ensure_ascii=False), encoding="utf-8")
+    except Exception as exc:  # noqa: BLE001
+        logging.warning("Could not write chat_history.json: %s", exc)
+
+
+def _save_persistent_chat_history(vectorstore_path: Path | str | None, history: list) -> None:
+    """Save entire chat history to file."""
+    path = Path(vectorstore_path or VECTORSTORE_DIR) / "chat_history.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
     try:
         path.write_text(json.dumps(history, indent=2, ensure_ascii=False), encoding="utf-8")
     except Exception as exc:  # noqa: BLE001
