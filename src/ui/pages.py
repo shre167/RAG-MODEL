@@ -303,9 +303,7 @@ def render_chunk_explorer(chunks: list[dict[str, Any]], pipeline: Any = None) ->
     above_max = sum(1 for c in filtered_chunks if c["token_count"] > 450)
 
     # Broken prev/next links
-    all_filtered_ids = {c["chunk_id"] for c in filtered_chunks}
-    broken_prev = sum(1 for c in filtered_chunks if c["prev_chunk_id"] and c["prev_chunk_id"] not in all_filtered_ids)
-    broken_next = sum(1 for c in filtered_chunks if c["next_chunk_id"] and c["next_chunk_id"] not in all_filtered_ids)
+    
 
     boundary_violations = 0
     for i in range(1, len(filtered_chunks)):
@@ -325,8 +323,6 @@ def render_chunk_explorer(chunks: list[dict[str, Any]], pipeline: Any = None) ->
         ("Missing page", missing_page, False),
         ("Below min tokens", below_min, below_min > 0),
         ("Above max tokens", above_max, above_max > 0),
-        ("Broken prev links", broken_prev, broken_prev > 0),
-        ("Broken next links", broken_next, broken_next > 0),
         ("Chapter boundary links", boundary_violations, boundary_violations > 0),
     ]
 

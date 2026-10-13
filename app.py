@@ -1518,10 +1518,13 @@ def _render_custom_composer(pipeline: RAGPipeline):
                 )
 
             with send_col:
-                # Send button removed - Enter key submits automatically
-                pass
+                send_clicked = st.form_submit_button(
+                    "",
+                    help="Send (or press Enter)",
+                    **WIDE,
+                )
 
-    if send_clicked or (question and question.strip()):
+    if send_clicked:
         question = (question or "").strip()
 
         if not question:
