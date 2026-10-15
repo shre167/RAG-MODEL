@@ -1,285 +1,144 @@
-# Astronomy RAG System: End-to-End Walkthrough
-
-This guide explains what the application currently does, from adding a source
-file to returning an answer. It is written as presentation notes and separates
-the implemented behavior from optional features and limitations.
-
-## 1. What the System Is
-
-This is a retrieval-augmented generation (RAG) assistant. It does not ask the
-language model to answer from memory alone. It first searches the project's
-knowledge base, selects relevant passages, then asks the model to answer using
-those passages and cite them.
-
-The main pieces are:
-- Streamlit interface: [app.py](app.py)
-- Configuration and environment loading: [src/config.py](src/config.py)
-- File extraction and chunking: [src/document_loader.py](src/document_loader.py)
-- Embedding API/local model adapter: [src/embeddings.py](src/embeddings.py)
-- Backend selector: [src/unified_vector_store.py](src/unified_vector_store.py)
-- PostgreSQL implementation selected in this environment: [src/postgres_vector_store_simple.py](src/postgres_vector_store_simple.py)
-- Lexical index: [src/bm25_retriever.py](src/bm25_retriever.py)
-- Question answering orchestration: [src/rag_pipeline/pipeline.py](src/rag_pipeline/pipeline.py)
-- Query and response inspection: [src/rag_pipeline/observatory.py](src/rag_pipeline/observatory.py)
-
-## 2. Current Runtime Snapshot
-
-These are the settings and counts checked in the local environment on
-2026-10-09. Secrets are intentionally not included.
-
-| Item | Current value |
-|---|---|
-| Vector backend | PostgreSQL (`USE_POSTGRES=true`) |
-| PostgreSQL table | `public.chunks` |
-| Rows in PostgreSQL | 890 chunks |
-| Stored embedding dimension | 1024 |
-| Embedding model | `amazon.titan-embed-text-v2:0` |
-| Chat model | `openai.gpt-5-mini` |
-| Image-analysis flag | Enabled; PDF ingestion only |
-| BM25 | Separate persistent local index under `vectorstore/` |
-| Cross-encoder reranker | Disabled by design |
-
-The old Chroma files are still present locally. With PostgreSQL selected, they
-are not the active dense vector backend. Older observation logs or older UI
-screenshots may still say “Chroma”; those can describe an earlier run and are
-not proof of the currently selected backend.
-
-## 3. Adding and Ingesting a File
-
-1. A source file is placed or uploaded into `knowledge_base/`. The loader
-supports TXT, Markdown, DOCX, and PDF inputs.
-2. `load_document()` or `load_documents()` detects the type and extracts text.
-   PDFs are read page by page, preserving page numbers. DOCX headings and
-   tables are extracted. PDF pages with weak text can use the configured OCR
-   fallback when Tesseract is available.
-3. Text is cleaned and organized into paragraphs and structure. The loader
-   detects chapter and section headings where it can, filters common front
-   matter/TOC noise, and carries file, page, chapter, section, and image
-   information forward as metadata.
-4. `chunk_documents()` groups extracted pages by source document, builds
-   structure-aware chunks, splits oversized content, and merges certain tiny
-   neighboring chunks when appropriate.
-5. Each chunk receives a stable `chunk_id`, an order value `chunk_index`, and
-   links to its previous and next chunk. The ingestion pipeline creates the
-   stored ID from the filename and chunk ID, so the same unchanged file can be
-   recognized on a later ingest.
-6. An ingestion manifest tracks file hashes and chunk IDs. If a file hash has
-   not changed, the file can be skipped. When a file changes, its old records
-   are replaced and stale chunk IDs are removed.
-7. The embedding service converts the chunk text to a numeric vector in
-   batches. For the current configuration, the stored vectors have 1024
-   numbers each.
-8. New text, vectors, IDs, and metadata are written through
-   `UnifiedVectorStore` to PostgreSQL. The same canonical chunks are also used
-   to build or refresh BM25.
-
-The command-line bulk ingestion entry point is `python ingest.py`. The UI's
-single-file flow calls `RAGPipeline.ingest_file()`. Both use the pipeline and
-the configured vector-store selector, but optional image analysis is wired in
-the single-file ingestion method; do not assume every bulk-ingestion path
-performs PDF image captioning without checking that path.
-
-## 4. What One PostgreSQL Chunk Contains
-
-Each row in `chunks` stores:
-
-- `id`: primary key used to find or replace the chunk
-- `document_text`: the searchable chunk text
-- `embedding_json`: the numeric embedding serialized as JSON
-- Common searchable columns such as filename, book title, chapter, section,
-  page range, token count, and image flag
-- `metadata_json`: the full original metadata, including `chunk_id`,
-  `chunk_index`, `prev_chunk_id`, `next_chunk_id`, file type, and optional
-  `image_description`
-
-This implementation uses ordinary PostgreSQL; it does **not** use the
-pgvector extension. For similarity search, it loads stored embeddings and
-calculates cosine similarity in Python. That is straightforward and supports
-the current embedding dimensions, but it does more work as the collection
-grows than a database-side vector index would.
-
-The migration script copies existing Chroma IDs, texts, metadata, and vectors
-without regenerating embeddings and does not delete the Chroma source. The live
-database count is currently 890; migration should be re-run only deliberately,
-not as part of normal startup.
-
-## 5. Chunking: The Important Setting Correction
-
-The low-level chunker currently reads these defaults from
-`src/document_loader.py`:
-
-- Target chunk size: 350 tokens (`CHUNK_TARGET_TOKENS`)
-- Maximum chunk size: 450 tokens (`CHUNK_MAX_TOKENS`)
-- Minimum size used by small-chunk merging/statistics: 80 tokens (`CHUNK_MIN_TOKENS`)
-- Overlap when splitting an oversized paragraph: 40 tokens
-  (`OVERSIZED_PARAGRAPH_OVERLAP`)
-
-Important: `src/config.py` also declares `CHUNK_SIZE=800` and
-`CHUNK_OVERLAP=200`, and callers pass those values to `chunk_documents()`.
-However, the current public `chunk_documents()` signature accepts extra
-keyword arguments and does not pass them into `_chunk_book()`. The low-level
-token targets above therefore control actual chunk creation today. Do not
-describe 800/200 as the active chunking behavior. Wiring the settings through
-is a separate code fix if those values are meant to control chunk sizes.
-
-The chunk index is useful for ordering chunks from a chunking run. It is not a
-permanent database-wide row number: it can restart when files are chunked in
-separate ingestion calls. Use `id` or `chunk_id` when you need a unique,
-stable identifier. Chapter totals are counts grouped by book and chapter;
-they are not the same thing as chunk indices.
-
-## 6. Optional PDF Image Understanding
-
-When image analysis is enabled and an ingested PDF page contains embedded
-images:
-
-1. PyMuPDF extracts up to three usable images from that page.
-2. The configured vision-capable chat model receives each image with a short
-   factual description prompt and optional chapter/section context.
-3. A successful caption is stored as `image_description` metadata and appended
-   to the text as `[Visual content on this page: ...]`.
-4. Dense and BM25 indexing then sees the caption as searchable text; retrieved
-   context can include it, allowing answers to use information from a diagram
-   or chart even when that information was not present in extracted text.
-
-This is not live visual question-answering over the original PDF at chat time.
-It is an ingestion-time conversion of selected PDF visuals into text. It is
-optional and failures are logged while text ingestion continues. It does not
-run for TXT, Markdown, or DOCX, and scanned-page OCR is a separate feature from
-image captioning.
-
-## 7. Asking a Question
-
-The normal question path in `RAGPipeline._answer_question_impl()` is:
-
-1. **Validate input.** Empty questions get a prompt; simple greetings get a
-   direct greeting and do not search the knowledge base.
-2. **Split some multi-part questions.** A conservative rule-based check may
-   split a question on conjunctions or multiple question marks and answer the
-   parts separately.
-3. **Prepare the query.** Text is normalized, aliases may be expanded, and
-   the original question is retained for the final answer.
-4. **Choose retrieval mode.** The interface supports vector-only, BM25-only,
-   and hybrid. Hybrid is the default when no mode is supplied.
-5. **Dense retrieval.** In vector or hybrid mode, the question is embedded
-   using the same configured embedding model, then compared to stored vectors.
-   PostgreSQL's current store calculates cosine similarities in Python.
-6. **BM25 retrieval.** In BM25 or hybrid mode, the question is tokenized and
-   matched against the persisted lexical index. BM25 is useful for exact
-   words, names, and identifiers.
-7. **Merge candidate records.** Dense and BM25 results are matched by
-   filename plus chunk ID so a chunk found by both methods remains one
-   candidate with both retrieval signals.
-8. **Fuse in hybrid mode.** Reciprocal Rank Fusion (RRF) combines ranks, not
-   raw distances and BM25 scores. With `RRF_K=60`, each retriever contributes
-   approximately `1 / (60 + rank)`. RRF scores are ranking values, not
-   probabilities or confidence percentages.
-9. **Check evidence.** The evidence gate considers the selected mode, rank
-   signals, direct/lexical text support, score separation, and retriever
-   agreement. If evidence is too weak, the pipeline abstains instead of
-   generating a knowledge-base answer.
-10. **Remove duplicates and control source balance.** Duplicate IDs/text are
-    removed and one source is limited to at most three selected chunks.
-11. **Limit context.** The current maximum is five chunks, with an 18,000
-    character cap. This keeps the prompt bounded and avoids sending the whole
-    database to the language model.
-12. **Build source-labelled context.** The selected passages are labelled
-    with source information. If image descriptions exist, they are included.
-13. **Generate.** The configured chat model is instructed to answer only from
-    the supplied context, say when it is insufficient, cite factual claims,
-    and list only source filenames present in that context.
-14. **Ground claims after generation.** The pipeline compares answer claims
-    with selected evidence, records supported/partial/unsupported citations,
-    and computes coverage and an evidence-backed confidence summary.
-15. **Return and record.** The UI receives the answer, sources, citations,
-    confidence, retrieval evaluation, and trace. Query observations are
-    appended to local JSONL storage; optional Langfuse/evaluation integrations
-    may add observability when enabled/configured.
-
-## 8. What the User Sees
-
-- **Chat/assistant view:** answer, source list, citations, and confidence
-- **Database / Chunk Inspector:** live vector rows, book/chapter hierarchy,
-  chunk text, metadata, and vector-store diagnostics
-- **Ingestion view:** add or replace a source file and see ingest counts
-- **BM25 diagnostics:** lexical index contents and synchronization information
-- **Retrieval Lab / Observations:** query trace showing which candidates came
-  from Dense, BM25, RRF, context selection, and answer generation
-
-The PostgreSQL-backed explorer uses the vector store's `get()` and `delete()`
-compatibility methods. Its labels now use the selected backend instead of
-calling PostgreSQL “Chroma.”
-
-## 9. Persistence and Synchronization
-
-| Data | Where it persists | Role |
-|---|---|---|
-| Dense text, vectors, chunk metadata | PostgreSQL `chunks` table | Dense search and live chunk inspection |
-| BM25 token/chunk index | `vectorstore/bm25_index.pkl` | Lexical search |
-| Per-file hashes and chunk IDs | `vectorstore/ingestion_manifest.json` | Skip unchanged files and replace stale chunks |
-| KB version/state | `vectorstore/kb_state.json` | Version and consistency status |
-| Query traces/observations | `vectorstore/query_observations.jsonl` | Debugging and evaluation history |
-| Uploaded/source documents | `knowledge_base/` | Authoritative source files for re-ingestion |
-
-The vector database and BM25 are distinct indexes. A healthy system should
-keep them synchronized to the same source chunks. The app has status and
-consistency checks, but an old status/trace record is a snapshot from the time
-it was written, not a live report.
-
-## 10. What Is Not Currently Enabled or Guaranteed
-
-- The cross-encoder reranker is intentionally disabled; ranking is Dense,
-  BM25, and RRF, followed by the evidence gate and context selection.
-- PostgreSQL is plain SQL storage with JSON embeddings, not pgvector. Cosine
-  ranking happens in Python and will be the main scaling bottleneck.
-- `CHUNK_SIZE=800` and `CHUNK_OVERLAP=200` are declared/passed but currently
-  ignored by the public chunking function; the 350/450/80 defaults govern
-  actual chunking.
-- `chunk_index` should not be presented as a unique database-wide number.
-  `chunk_id`/row `id` is the unique identifier.
-- Image understanding is optional, PDF-only, and runs during supported
-  ingestion. It creates text descriptions; it does not preserve image pixels
-  for later multimodal retrieval.
-- A retrieval score or a high confidence label is not a mathematical
-  probability that every generated statement is true. The evidence and
-  citation checks are safeguards, not a substitute for reviewing sources.
-
-## 11. Short Presentation Script
-
-> “This project is an astronomy knowledge assistant built with retrieval-
-> augmented generation. When we add a document, the loader extracts and cleans
-> its text, preserves page and section information, and divides the content
-> into searchable chunks. Each chunk is embedded and stored with its metadata
-> in PostgreSQL. A separate BM25 index handles exact keyword matches.
->
-> When someone asks a question, the system prepares the query and searches the
-> vector index, BM25, or both. In hybrid mode, it combines their rankings with
-> Reciprocal Rank Fusion, checks whether the evidence is strong enough, and
-> sends only a small, source-labelled set of chunks to the language model.
-> The model is instructed to stay within that evidence. The system then checks
-> claims against the selected passages and returns citations, sources, and an
-> evidence-backed confidence summary.
->
-> PostgreSQL currently contains 890 chunks with 1024-dimensional embeddings.
-> The optional image feature captions images in PDF pages during ingestion,
-> making visual information searchable as text. One detail we are correcting
-> is the chunk-size configuration: the active chunker currently uses a 350
-> token target and 450 token maximum; the separately declared 800/200 settings
-> are not wired through yet.”
-
-## 12. Useful One-Line Answers
-
-- **What is RAG?** Search first, then generate an answer grounded in the
-  selected source passages.
-- **Why have both Dense and BM25?** Dense search finds semantic matches; BM25
-  catches exact terminology and identifiers.
-- **What does RRF do?** It combines the rank positions from Dense and BM25; it
-  does not turn them into probabilities.
-- **Why can a chunk be numbered 268?** It is its order in a chunking run, not
-  “chapter 268” and not necessarily a permanent database-wide number.
-- **Where are new chunks stored?** PostgreSQL when `USE_POSTGRES=true`; BM25
-  is persisted separately as a local index.
-- **What does image analysis add?** A text caption for supported PDF visuals,
-  so retrieval can find facts conveyed by those visuals.
-- **What happens when evidence is weak?** The evidence gate can return an
-  abstention instead of asking the model to invent an answer.
+1.      Layer 7: Context Construction What it doesAssembles what the model sees: instructions, the user's question, conversation history, and the selected chunks. Models have a limited context window (the amount of text they can read at once), and more text is not always better. How it works1.    Take the top chunks.2.    Deduplicate overlapping text and merge adjacent chunks from the same page.3.    Optionally expand to the parent section.4.    Order them sensibly. Models can overlook material buried in the middle of long contexts, so place the strongest evidence prominently. [Industry]5.    Label each chunk with an ID, title and source so the model can cite it.6.    Fit within a token budget, trimming the lowest-ranked material first.7.    Wrap it in a prompt template with rules: answer only from the context, cite sources, say "I don't know" if evidence is missing.Problems and fixes     Irrelevant noise distracts the model: fewer, better chunks. [Verified] NVIDIA's reference sends only 4.     Conflicting sources: include dates and authority metadata, and instruct the model how to handle conflicts.     Prompt injection from documents: a document might contain instructions aimed at the model. Treat retrieved text as data, not commands. See Security.     Cost: every token costs money and time. Trade-offsMore context raises the chance the answer is present but raises cost and confusion.[Opinion] Start small and widen only when evaluation shows missing evidence.  2.      Layer 8: Answer Generation What it doesA large language model (LLM) writes a natural-language answer grounded in the supplied context. How it works1.    The assembled prompt goes to the LLM.2.    The model generates the answer, usually streamed token by token so users see text immediately.3.    The answer includes citations tied to chunk IDs.4.    The system returns the answer plus the sources.[Verified] In NVIDIA's blueprint, a response generation module uses an LLM inference microservice, and the user interface lets users inspect what the retriever returned. Tools     [Verified] NVIDIA NIM LLM microservices.     [Industry] Hosted models from OpenAI, Anthropic, Google and Azure OpenAI; self-hosted open models served with vLLM, TensorRT-LLM or similar.ScalingGeneration is the most expensive step. Teams use GPU autoscaling, request batching, response caching, and model routing (cheap model for easy questions, strong model for hard ones). [Industry] Problems and fixes     Hallucination (invented facts): strict grounding instructions, lower randomness, validation step.     Ignoring the context: shorter context, clearer prompt, stronger model.     Latency: streaming, smaller models, caching. Trade-offsHosted APIs are easy but send data outside your boundary. Self-hosted models give privacy and control with operating cost. [Opinion] Regulated industries often lean self-hosted or private-cloud.  3.              Layer 9: Evidence Validation What it doesChecks that the answer is actually supported by the retrieved evidence, before the user sees it. How it works (Industry)1.    Citation check: does each claim point to a real chunk?2.    Groundedness check: a second model or classifier tests whether each statement is supported by the cited text.3.    Abstain or retry: if support is weak, answer "I could not find this" or retry with broader retrieval.4.    Safety filters: block toxic or policy-violating output.[Verified] NVIDIA's blueprint can enable NeMo Guardrails on input and output. The documentation describes output guardrailing against toxicity. NVIDIA's documentation excerpts I reviewed do not show a dedicated factual-groundedness verifier, so treat that part as general industry practice.Problems and fixes     Fake citations: verify programmatically that cited IDs exist and the text supports the claim.     Over-refusal: too strict a validator rejects good answers. Tune against evaluation data.     Latency cost: validation adds a model call. Apply it selectively for high-risk topics.[Opinion] Trade-offsSafety and trust against speed and cost.  4.           Layer 10: Evaluation What it doesMeasures whether the system is good, and whether a change made it better or worse. Without it, tuning is guesswork. How it works1.    Build a golden dataset: real questions with known correct answers and source documents.2.    Run the system and score retrieval and generation separately.3.    Compare versions before release, like automated tests for software. Key metrics StageMetricPlain meaningRetrievalRecall@KDid the right chunk appear in the top K?RetrievalPrecision / MRR / nDCGAre the best chunks ranked first?GenerationFaithfulness / groundednessIs the answer supported by the context?GenerationAnswer relevance and correctnessDoes it actually answer the question? StageMetricPlain meaningSystemLatency, cost per querySpeed and spend Tools (Industry)Ragas, TruLens, DeepEval, LangSmith, and cloud-vendor evaluation features. LLM-as-judge means using a strong model to grade answers. It scales well but can be biased, so calibrate it against human labels.[Verified] NVIDIA's performance guide addresses benchmarking latency and throughput, which covers the system-performance side. Problems and fixes     Small or unrepresentative test sets: sample from real user logs.     Only measuring the final answer: you cannot tell retrieval failures from generation failures. Score them separately.     Stale test sets: refresh as documents change. Trade-offsHuman review is accurate but slow. Automated judging is fast but imperfect. [Opinion]Use automated scoring continuously and human review on samples.  5.             Layer 11: Monitoring and Observability What it doesWatches the live system, so problems are found before users complain. What teams track (Industry)     Traces: for each question, the rewritten query, retrieved chunks, scores, final prompt, answer and timing at every step.     Quality signals: thumbs up or down, citation click-through, "I don't know" rate, retries.     Operational metrics: latency by stage, error rates, queue backlog, GPU use, cost per query.     Freshness: lag between source change and index update.     Drift: are questions changing, or retrieval scores dropping over time? Tools (Industry)OpenTelemetry, Prometheus and Grafana, Datadog, LangSmith, Langfuse, Arize, plus cloud monitoring. Problems and fixes     Quality decays quietly: run scheduled evaluations on sample traffic.     Cannot debug a bad answer: full per-request traces are essential.     Logs contain sensitive data: redact, restrict access, and set retention limits.  6.             Layer 12: Security and Governance Core principleThe system must never show someone information they could not open directly in the source system. How it works1.    Authentication: who is the user (single sign-on).2.    Permission capture: ingestion stores each document's access rules as metadata.[Verified] NVIDIA's blueprint mentions fine-grained database authorization.3.    Query-time filtering: retrieval only searches chunks the user may see. Filtering before the model matters, because anything retrieved can leak through the answer.4.    Permission sync: when source permissions change, the index updates promptly.[Industry] Glean is known for permission-aware retrieval. Other threats and defenses (Industry) ThreatDefensePrompt injection (hidden instructions in documents or questions)Treat retrieved text as data, input/output guardrails, restricted tool accessSensitive data exposure (PII)Redaction at ingestion, output filters ThreatDefenseData leaving your boundaryPrivate endpoints, self-hosted models, regional deploymentTenant mixingPer-tenant collections or strict filtersComplianceEncryption at rest and in transit, audit logs, retention rules [Verified] NVIDIA's blueprint supports NeMo Guardrails at input and output. Trade-offsStrict permission filtering can reduce recall and add latency. [Opinion] It is still non-negotiable. One leak costs more than slightly worse search.  7.              Layer 13: Deployment and Operations What it doesRuns everything reliably for thousands of users. Typical production shape     Microservices on Kubernetes (a system that runs and scales containers), one service per stage. [Verified] NVIDIA's guide lists separate services: RAG server, LLM, embedding, reranking, extraction, ingestion, and vector database. It publishes sizing for GPU nodes and NVIDIA enterprise reference architectures.     Autoscaling by load, with GPU pools for models and CPU pools for orchestration.     Gateway layer for authentication, rate limits and routing.     Caching for frequent questions and embeddings.     Environments: development, staging, production, with evaluation gates before release. Scaling for thousands of concurrent users[Verified] NVIDIA's guide covers tuning for multiple concurrent requests: how many chunks to retrieve, whether to enable reranking, and when to scale reranker and search nodes. General approach (Industry): find the bottleneck stage using traces, scale onlythat stage. Safe change management (Industry)     Versioned indexes: build the new index beside the old one, compare, then switch (blue/green).     Canary releases: send a small share of traffic to a new version first.     Rollback plan for models, prompts and indexes alike. Deployment options OptionProsConsFully managed cloud (Azure, AWS, Databricks)Fast start, less operationsLess control, vendor couplingSelf-hosted on Kubernetes (e.g. NVIDIA stack)Control, privacy, GPU performanceYou operate everythingHybridSensitive data local, bursts in cloudComplexity Cost leversCaching, smaller models for easy queries, quantized vectors, tiered storage, and autoscaling to zero for idle components.  8.             End-to-End ExampleAn employee asks: "What is our parental leave policy in Germany?"1.    Offline earlier: the HR PDF was parsed, tables kept intact, split by headings, embedded, and stored with metadata: country=Germany, access=all employees.2.    Query: the question is cleaned and embedded.3.    Retrieve: hybrid search with a permission filter returns 20 chunks.4.    Rerank: the 20 are scored, the best 4 kept.5.    Context: chunks are labeled with titles and dates and placed in the prompt with grounding rules.6.    Generate: the LLM writes the answer with citations.7.    Validate: citations are checked, and the output filter runs.8.    Monitor: the trace, latency and user feedback are logged.9.    Evaluate: later, this question may join the golden set to protect against regressions.  9.              The Failure MapWhen an answer is wrong, find which layer failed: SymptomLikely layerAnswer missing facts that exist in a documentIngestion (parse) or chunkingRight document exists but never retrievedEmbeddings, retrieval, or chunkingRetrieved but ranked lowRerankingRight chunk retrieved but ignoredContext construction or generationConfident but unsupported answerGeneration or validationUser sees something they should notSecurity and ingestion permissionsGood yesterday, bad todayIndex drift, model change, stale data (monitoring) [Opinion] The most valuable habit of experienced RAG engineers is evaluating each layer separately, so they always know where to look.  10.     Key Design Principles1.    Wide net, then narrow: retrieve broadly, rerank precisely, send the model little.2.    Quality is decided early: ingestion and chunking quietly cap everything after.3.    Hybrid beats pure: combine meaning search and keyword search.4.    Permissions are part of the data: capture them at ingestion, enforce them at retrieval.5.    Modular services: swap models and databases without redesigning.6.    Measure everything: evaluation before release, monitoring after.7.    Scale the bottleneck: use traces to find it, not intuition.  11.      Source Notes and Limits[Verified] items come from NVIDIA's RAG Blueprint pages and its Enterprise RAG Deployment Guide (retrieved from build.nvidia.com, docs.nvidia.com and associated GitHub documentation). Details such as default values (20 retrieved, 4 after reranking) are reference defaults and are configurable.Statements about Microsoft, AWS, OpenAI, Perplexity, Glean and Databricks are my general understanding of their product categories, not confirmed from their documentation in this session. Product names and features change quickly, so check each vendor's current documentation before relying on specifics,. Layer 7 — Generation & LLM Orchestration How Your System Does It From rag_pipeline/pipeline.py:● Model: GPT-5-mini via OpenAI-compatible endpoint● Prompt: Grounded — "answer only from context, say when insufficient, cite claims, list only sources present in context"● Context: Max 5 chunks, 18,000 char cap, source-labelled● Post-generation: Citation verification — each LLM claim matched back to evidence chunks● Multi-part questions: Conservative rule-based splitting on conjunctions● Abstention: Evidence gate prevents generation when evidence is too weak What's excellent here: The citation verification step (grounding chain) is a real post-processing step that many production RAG systems don't do. Evidence gating (refusing to answer when evidence is weak) prevents hallucinations proactively.   How Enterprise Does It LLM Routing Enterprise RAG doesn't use one LLM — it routes queries to different models based on complexity, cost, and latency requirements:         
+    Simple factual query → Fast, cheap model (GPT-4o-mini, Claude Haiku, Gemini Flash)   
+    Complex reasoning    → Powerful model (GPT-4o, Claude Sonnet, Gemini Pro)   
+    Code generation      → Code-specialized model (Claude 3.5 Sonnet, DeepSeek Coder)   
+    Summarization        → Summarization-optimized model   
+         Routing is done by a small classifier trained on query patterns, or by a rules-based system, or by asking a fast LLM to classify the query first. Advanced Prompt Engineering at Scale TechniqueDescriptionChain-of-Thought in RAGInstruct LLM to reason step-by-step before answeringSelf-RAGLLM decides mid-generation whether to retrieve more contextCRAG (Corrective RAG)LLM evaluates each retrieved chunk's relevance; discards irrelevant ones before generationFLARELLM generates, pauses when uncertain, retrieves more, continuesRAG-FusionGenerate multiple answers, synthesize the best one  Guardrails Enterprise generation has multiple guardrails:● Input guardrails: Detect and block jailbreaks, prompt injections, inappropriate queries● Output guardrails: Detect hallucinations, PII in output, harmful content● Tools: Guardrails.ai, NVIDIA NeMo Guardrails, Llama Guard, custom classifiers Streaming All enterprise chat interfaces stream tokens. Your Streamlit app can likely be adapted to stream, but production systems invest heavily in streaming architecture since it dramatically improves perceived latency (user sees the first word in 200ms, not the full answer in 3s). Caching ● Semantic cache: Cache answers to semantically similar questions (not just exact matches). If "What is a black hole?" and "Define a black hole" are 95% cosine similar, serve the cached answer.● Prefix cache: KV cache for the system prompt portion (same for every user), reusing expensive computation● Tools: GPTCache, Redis, Momento   9. Layer 8 — Evaluation & Observability How Your System Does It This is where your project genuinely punches above its weight: ComponentWhat it doesDeepEvalLLM-judge metrics: faithfulness, relevancy, contextual precision/recall, groundednessLangfuseDistributed tracing per query with latency waterfallJSONL observation logEvery query trace stored locallyCitation verificationPost-generation claim-to-chunk matchingEvidence-backed confidence0-100 score per answerRetrieval LabFull visual trace: query prep → dense → BM25 → RRF → evidence → context → generation → groundingQuery ComparisonSide-by-side comparison of two queries across all metrics  Most university projects and many production systems skip most of this. Your observability stack is genuinely production-grade in design.   How Enterprise Does It RAGAS — The Standard Evaluation Framework The industry-standard open-source RAG evaluation framework. Measures:● Faithfulness: Does the answer only contain facts from the retrieved context?● Answer Relevance: Is the answer relevant to the question?● Context Recall: Did the retriever fetch all necessary information?● Context Precision: Was the retrieved context precise (no irrelevant noise)? Your DeepEval metrics map closely to these RAGAS dimensions. Online vs Offline Evaluation TypeWhenMethodOffline (batch)During developmentGolden dataset Q&A pairs with expected answers and sourcesOnline (live)In productionUser feedback signals, LLM-as-judge on sampled queries  Enterprise companies maintain golden evaluation datasets — hundreds to thousands of curated question-answer-source triples that serve as ground truth. Every code change is evaluated against this dataset before deployment. A/B Testing RAG Enterprise RAG changes are rolled out via A/B tests:● 10% of users get the new chunking strategy● 90% get the old one● Compare downstream metrics (answer quality, user satisfaction, click-through on sources)● Statistical significance determines rollout LLM-as-Judge at Scale DeepEval's metrics use an LLM to evaluate. At 1M queries/day, you can't run LLM evaluation on every query — it costs too much. Companies:1. Sample 1-5% of queries for LLM evaluation2. Use faster, cheaper models for evaluation (GPT-4o-mini as judge)3. Build custom evaluation models trained on human judgments The Missing Metric: Latency SLA Your system logs latency per query. Enterprise systems have strict SLAs:● P50 latency < 500ms● P95 latency < 2000ms● P99 latency < 5000ms When a deployment violates the SLA, automatic rollback fires. Your current PostgreSQL cosine-in-Python approach will violate P95 latency at ~50,000 chunks.   10. Scaling: How Big Companies Do It The Scaling Bottlenecks in Your System (Ordered by Impact) 1. Cosine similarity in Python — for every query. At 10K chunks you'll notice. At 100K chunks it's unusable.2. BM25 as a pickle file — Entire index loaded into RAM. At 1M documents this is hundreds of GB.3. Single PostgreSQL instance — Single point of failure, no horizontal scaling.4. Synchronous ingestion — Adding documents blocks queries.5. Single embedding model call at query time — No caching of frequent query embeddings. The Scaling Playbook Phase 1: 0–10K chunks (You are here)● Plain PostgreSQL + cosine in Python ✅● Local BM25 pickle ✅● Single Streamlit app ✅● Manual ingestion ✅ Phase 2: 10K–500K chunks● Add pgvector extension to PostgreSQL — HNSW index replaces Python cosine● Replace local BM25 with Elasticsearch (single node)● Add Redis for embedding cache and semantic query cache● Move ingestion to async background jobs (Celery + Redis queue)● Add connection pooling (PgBouncer) Phase 3: 500K–10M chunks● Migrate to managed vector DB (Pinecone / Qdrant Cloud / Weaviate Cloud)● Elasticsearch cluster (3+ nodes, replicated)● Add cross-encoder re-ranking as a separate microservice● Containerize with Docker, orchestrate with Kubernetes● Horizontal scaling of the API layer (FastAPI + multiple replicas behind a load balancer)● CDN for static assets, API gateway (Kong / Nginx) Phase 4: 10M+ chunks● Distributed vector database with sharding and replication● Event-driven ingestion (Kafka / Pub/Sub)● Multiple embedding models per content type● Fine-tuned domain embeddings● Learned fusion weights (trained re-ranker)● Multi-region deployment● GraphRAG or knowledge graph augmentation● LLM routing (different models for different query types)● A/B testing infrastructure● Golden eval dataset, continuous evaluation CI/CD What Specific Big Companies Do Notion AI● Chunks are Notion blocks (natural semantic units — paragraphs, headings, list items)● Embeddings generated at block-write time (not batch)● Pinecone for vector storage● Cohere Rerank for re-ranking● Fine-tuned summarization model for context compression● Personal context: retrieves from your workspace, not everyone's — requires multi-tenant isolation at the index level Glean● Separate connector microservice per enterprise tool (50+ connectors)● Content extracted, normalized, PII-scrubbed before embedding● User-level permission filtering at query time (can't retrieve docs you don't have access to)● Elasticsearch for lexical, proprietary vector engine for dense● Full knowledge graph of entities and relationships● Query understanding model classifies intent before retrieval Microsoft 365 Copilot (via Azure AI Search)● Azure AI Search handles all vector + lexical hybrid search● Integrated with Microsoft Graph (knows your role, your files, your emails)● Cross-tenant isolation by design (no data leakage between orgs)● Semantic Ranker (uses LLM to re-score top results)● Context grounding includes Office Graph metadata (doc modified date, author, view count)● Guardrails via Azure AI Content Safety GitHub Copilot● Code-specific embedding model (trained on code)● Context window filled with: open files, recently edited files, imports, related tests● Not classical RAG: more of a "context assembly" problem● Tree-sitter for AST-level code parsing (function-level chunks)● Prefix prediction rather than Q&A generation   11. Tools & Technology Landscape The Full Enterprise RAG Stack (2025)         
+    Document Sources   
+    ├── File Systems: S3, GCS, Azure Blob, SharePoint, local disk   
+    ├── Databases: PostgreSQL, MySQL, MongoDB, BigQuery   
+    ├── APIs: Confluence, Notion, Google Drive, Salesforce, Jira   
+    ├── Streams: Kafka, Pub/Sub, Kinesis   
+    └── Web: Scrapers (Playwright, Scrapy), RSS feeds   
+        
+    Ingestion Pipelines   
+    ├── Orchestration: Apache Airflow, Prefect, Dagster, AWS Glue   
+    ├── ETL: Fivetran, dbt, custom Python workers   
+    ├── Parsing: Unstructured.io, LlamaParse, PyMuPDF, Docling   
+    ├── OCR: Tesseract, AWS Textract, Google Document AI, Azure Form Recognizer   
+    └── PII: Microsoft Presidio, AWS Comprehend, Nightfall   
+        
+    Chunking & Embedding   
+    ├── Frameworks: LangChain, LlamaIndex, Haystack   
+    ├── Embedding APIs: OpenAI, Cohere, Voyage AI, Amazon Titan, Google Vertex   
+    ├── Local Models: BGE, E5, Nomic-Embed, Jina Embeddings (via HuggingFace)   
+    └── Fine-tuning: sentence-transformers, Qdrant's fine-tuning API   
+        
+    Vector Storage   
+    ├── Managed: Pinecone, Weaviate Cloud, Zilliz Cloud   
+    ├── Self-hosted: Qdrant, Milvus, Weaviate, pgvector   
+    ├── Integrated: Elasticsearch kNN, Redis Vector, Azure AI Search   
+    └── Embedded: Chroma (your original), LanceDB   
+        
+    Lexical Search   
+    ├── Elasticsearch / OpenSearch   
+    ├── Apache Solr   
+    ├── Typesense   
+    └── BM25s (pure Python, like yours but more optimized)   
+        
+    Re-Ranking   
+    ├── APIs: Cohere Rerank v3, Jina Reranker, Voyage Rerank   
+    ├── Open-source: Cross-encoders (ms-marco), BGE Reranker, ColBERT   
+    └── Custom: Fine-tuned on domain-specific relevance data   
+        
+    LLM Generation   
+    ├── APIs: OpenAI GPT series, Anthropic Claude, Google Gemini, Mistral   
+    ├── Open-source: Llama 3, Mistral, Gemma, Phi   
+    ├── Specialized: Code (DeepSeek, StarCoder), Math (Qwen-Math), Multilingual   
+    └── Routing: LiteLLM, PortKey, custom routers   
+        
+    Caching   
+    ├── Semantic cache: GPTCache, Momento   
+    ├── KV cache: vLLM prefix caching, TensorRT-LLM   
+    └── General: Redis, Memcached   
+        
+    Orchestration Frameworks   
+    ├── LangChain — most popular, huge ecosystem, sometimes over-engineered   
+    ├── LlamaIndex — better for complex document hierarchies   
+    ├── Haystack — production-focused, strong eval tooling   
+    ├── DSPy — programmatic prompt optimization   
+    └── Custom — what truly mature teams often end up with   
+        
+    Evaluation   
+    ├── RAGAS — standard framework   
+    ├── DeepEval — your choice, excellent   
+    ├── TruLens — TruEra's framework   
+    ├── Langsmith — LangChain's tracing + eval   
+    ├── Langfuse — your choice for tracing, open-source   
+    ├── Arize Phoenix — open-source LLM observability   
+    └── Custom golden datasets   
+        
+    Infrastructure   
+    ├── Containerization: Docker, Kubernetes (EKS, GKE, AKS)   
+    ├── Serving: FastAPI, Ray Serve, vLLM, TGI (HuggingFace)   
+    ├── Monitoring: Grafana, Prometheus, Datadog, OpenTelemetry   
+    ├── CI/CD: GitHub Actions, Jenkins, ArgoCD   
+    └── Cloud: AWS (Bedrock, SageMaker), GCP (Vertex AI), Azure (AI Studio)   
+        
+    Guardrails   
+    ├── Guardrails.ai   
+    ├── NVIDIA NeMo Guardrails   
+    ├── Llama Guard   
+    └── Azure AI Content Safety   
+           12. Positives & Negatives: Your Project vs Enterprise ✅ What Your System Gets Right (Genuinely) StrengthWhy It MattersHybrid retrieval (Dense + BM25)Most prototypes do dense-only. You have both. This is the baseline for production retrieval.RRF fusionRank-based fusion is robust and well-researched. Better than naive score averaging.Evidence gate (abstention)Refusing to answer when evidence is weak is critical for trustworthiness. Many production systems skip this.Citation verificationPost-generation grounding chain is real work that directly fights hallucinations.Neighbor linking (prev_chunk_id / next_chunk_id)Enables context expansion — a pattern used in production hierarchical retrieval.File hash deduplicationIncremental ingestion preventing re-embedding unchanged files is a production pattern.Source diversity capLimiting 3 chunks per source prevents one document dominating the context.Langfuse tracingDistributed traces for every query. This is production-grade observability.DeepEval integrationLLM-judge evaluation with 10+ metrics. Rare in student/demo projects.Structure-aware chunkingChapter/section heading detection. Better than naive fixed-size splitting.Ingestion manifestFile state tracking for incremental updates.  ❌ What Your System Lacks vs Enterprise GapImpactFix Python cosine similarityFatal at >50K chunks; query latency explodesAdd pgvector HNSW indexBM25 as a pickle fileNot scalable; entire index in RAM; no concurrent accessReplace with ElasticsearchNo re-rankingLower retrieval quality vs systems with cross-encodersEnable existing cross-encoder or add Cohere Rerank APISynchronous ingestionAdding docs blocks queries; no parallelismAsync workers (Celery / background threads)No PII handlingRegulatory risk for any real-world deploymentAdd Presidio or similarNo access control / multi-tenancyOne user can see another's data (if multiple users existed)Metadata filtering by user ID at query timeNo semantic cachingSame question asked twice does full retrieval+generation both timesRedis + GPTCacheConfig driftCHUNK_SIZE=800 declared but 350 used — silent misconfigurationWire config values through properlyNo HyDE or query expansionQuery phrasing doesn't match document language → missed retrievalAdd hypothetical document generation or multi-querySingle embedding modelOne model for all content typesDomain-specific or multi-modal embeddingsNo streamingUser waits for full responseStream tokens via Streamlit's st.write_streamNo CI/CD pipelineManual testing onlyAdd pytest CI, eval regression suiteNo load testingUnknown capacity limitsk6 or Locust load testsLocal file storageNot deployable to cloud without refactoringObject storage (S3/GCS) for knowledge_base/No user authenticationNo access control at the app levelAuth0 / Supabase Auth / FastAPI JWT  The Config Drift Issue — A Real Lesson Your README itself identifies this: CHUNK_SIZE=800 and CHUNK_OVERLAP=200 in config.py are not wired through to chunk_documents(). The actual chunk sizes are 350/450 tokens. This is a textbook example of configuration drift — a constant problem in real systems. At enterprise scale, this kind of silent misconfiguration causes:● Different environments using different settings without knowing● A/B tests comparing systems that aren't actually different● Documentation that's wrong● Debugging sessions that waste hours Enterprise solutions: config validation on startup (Pydantic settings), integration tests that verify the active configuration, and config management systems (HashiCorp Vault, AWS Parameter Store).   13. The Road from 890 Chunks to 890 Million The Migration Path — Concrete Steps Step 0 (Now): Fix Config DriftWire CHUNK_SIZE and CHUNK_OVERLAP from config.py through chunk_documents(). This is a one-day fix that improves correctness immediately. Step 1 (10K–50K chunks): pgvector        
+    -- Add pgvector extension   
+    CREATE EXTENSION vector;   
+        
+    -- Change embedding column from JSON to vector   
+    ALTER TABLE chunks ADD COLUMN embedding vector(1024);   
+        
+    -- Create HNSW index   
+    CREATE INDEX ON chunks USING hnsw (embedding vector_cosine_ops)   
+    WITH (m = 16, ef_construction = 64);   
+        
+    -- Query (replaces Python cosine loop)   
+    SELECT id, document_text, 1 - (embedding <=> $1) AS similarity   
+    FROM chunks   
+    ORDER BY embedding <=> $1   
+    LIMIT 10;   
+         This single change converts your Python loop into a sub-millisecond indexed ANN search, with zero infrastructure change. Keep everything else the same. Step 2 (50K–500K chunks): Enable Re-RankingYour src/re_ranker.py with cross-encoder/ms-marco-MiniLM-L-12-v2 already exists — it's just disabled. Enable it on the top-20 RRF results. This improves quality without any new dependencies. Step 3 (500K+ chunks): Async IngestionAdd Celery + Redis to handle ingestion as background tasks:        
+    # Instead of blocking on ingestion:   
+    @celery.task   
+    def ingest_document_task(file_path: str):   
+        pipeline.ingest_file(file_path)   
+         Step 4 (1M+ chunks): Managed Vector DBMigrate to Pinecone or Qdrant Cloud. Your UnifiedVectorStore abstraction already exists (src/unified_vector_store.py) — add a PineconeVectorStore implementation behind the same interface. Step 5 (Multi-tenant): Access ControlAdd user_id or org_id to every chunk's metadata. Filter all queries by user_id before returning results.   Architecture Comparison Diagram         
+    YOUR SYSTEM (890 chunks)                    ENTERPRISE (890M chunks)   
+    ─────────────────────────────               ─────────────────────────────────────   
+                                                   
+      PDF/DOCX/TXT                                 50+ Data Connectors (Kafka streams)   
+          │                                               │   
+      document_loader.py                          Parser Microservices (per format)   
+      (synchronous, single-threaded)                     │   
+          │                                        PII Scrubber → OCR → Cleaner   
+      chunk_documents()                                   │   
+      350 tokens, structure-aware                  Chunking Service (parallelized)   
+          │                                        (Semantic / Hierarchical / AST-aware)   
+      Amazon Titan embed-text-v2:0                       │   
+      (1 model, 1024-dim)                          Multiple Embedding Models   
+          │                                        (text, code, image, multilingual)   
+      PostgreSQL (plain SQL)                             │   
+      + bm25_index.pkl                             Distributed Vector DB (HNSW sharded)   
+                                                   + Elasticsearch cluster   
+          │                                               │   
+      Query → embed query                          Query → Intent classifier   
+      cosine in Python (O(n))                      → Query expansion / HyDE   
+          │                                        → ANN search (sub-ms, 100 candidates)   
+      BM25 from pickle                             → Elasticsearch (100 candidates)   
+          │                                        → Merge → Cross-encoder re-rank (top 20)   
+      RRF fusion                                          │   
+      Evidence gate                                 Semantic cache check   
+      Context selection (5 chunks)                 Access control filter   
+          │                                        Token optimizer   
+      GPT-5-mini                                          │   
+      Grounding chain                               LLM Router → Model selection   
+      Citation verification                        → Streaming generation   
+          │                                        → Guardrails (input + output)   
+      Streamlit UI                                 → Citation verification   
+      DeepEval + Langfuse                                 │   
+      JSONL observation log                         React/Next.js UI   
+                                                   A/B testing   
+                                                   LLM-judge eval (sampled)   
+                                                   Golden dataset regression   
+                                                   SLA monitoring (P95 < 2s)   
+                                                   Kubernetes + auto-scaling   
+           Summary: Where You Stand Your Astronomy RAG Helpdesk is not a toy. It implements patterns that many deployed RAG systems lack:● Hybrid retrieval with RRF● Evidence gating● Citation verification● Structured observability (Langfuse traces + DeepEval)● Incremental ingestion with deduplication The gap to enterprise is mostly infrastructure and scale — not conceptual architecture. The core RAG patterns you've implemented are the right ones. The path forward is: 1. Fix the silent config drift2. Add pgvector (drop-in replacement, same Postgres)3. Enable the cross-encoder you already have4. Replace the BM25 pickle with Elasticsearch5. Async ingestion6. Then — only if the use case demands — distributed vector DBs, multi-tenancy, and LLM routing The design is sound. The scale-up is engineering work, not a redesign.  COMBINE AND WRIT EIT FOR MY REPORT
